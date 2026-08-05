@@ -1,1 +1,5 @@
+# Runtime is stdlib-only -- the routing/masking logic needs no third-party deps.
+# `-e .` installs this sample's own package so `python -m two_brain_router`
+# and `import two_brain_router` work from anywhere in the venv.
+-e .
 pytest>=7.0                # tests/

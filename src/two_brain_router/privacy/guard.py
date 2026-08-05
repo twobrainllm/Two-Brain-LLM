@@ -13,15 +13,9 @@ gap closes in this environment.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
-_PATTERNS: dict[str, re.Pattern[str]] = {
-    "EMAIL": re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),
-    "PHONE": re.compile(r"\b(?:\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b"),
-    "SSN": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
-    "CREDIT_CARD": re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
-}
+from two_brain_router.privacy.patterns import PATTERNS
 
 
 @dataclass
@@ -39,7 +33,7 @@ class PIIGuard:
     def detect(self, text: str) -> list[tuple[str, str]]:
         """Return [(entity_type, matched_value), ...] in match order."""
         hits: list[tuple[int, str, str]] = []
-        for entity_type, pattern in _PATTERNS.items():
+        for entity_type, pattern in PATTERNS.items():
             for m in pattern.finditer(text):
                 hits.append((m.start(), entity_type, m.group(0)))
         hits.sort(key=lambda h: h[0])

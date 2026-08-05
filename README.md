@@ -69,7 +69,8 @@ See [`docs/GAPS.md`](docs/GAPS.md) for the full writeup. Summary:
    client device, when called directly over MCP (`quad-client detect`
    works around this with a local static probe).
 2. **G8** -- the real `quad.privacy` PII guardrail (`[G8 - DELIVERED]` in
-   QUAD's private core repo) isn't present in this checkout. `privacy_mask.py`
+   QUAD's private core repo) isn't present in this checkout.
+   `src/two_brain_router/privacy/`
    mocks its detect/mask/rehydrate contract so the router logic is real and
    testable; swap it in once this environment has access to that component.
 3. **`convert_model`'s compiler is broken on two independent execution
@@ -84,15 +85,15 @@ See [`docs/GAPS.md`](docs/GAPS.md) for the full writeup. Summary:
 
 ## What's real code (not mocked)
 
-`privacy_mask.py` and `router.py` are fully working Python -- only the
-*model artifacts and hardware probes they consume* are mocked (via
-`data/`), not the routing/masking logic itself:
+Everything under `src/two_brain_router/` is fully working Python -- only the
+*model artifacts and hardware probes it consumes* are mocked (via `data/`),
+not the routing/masking logic itself:
 
-- **`privacy_mask.PIIGuard`** -- regex-based detect/mask/rehydrate with a
+- **`privacy.PIIGuard`** -- regex-based detect/mask/rehydrate with a
   masked-token invariant check (`assert_masked_token_invariant`): no raw
   entity value may survive in masked text, and `rehydrate(mask(x)) == x`
   exactly. Mock stand-in for gap G8 (see above).
-- **`router.TwoBrainRouter`** -- masks PII *before* any routing decision is
+- **`routing.TwoBrainRouter`** -- masks PII *before* any routing decision is
   made, scores query difficulty, and either answers locally or escalates:
   compresses + masks context, calls the (stubbed) deep brain with masked
   text only, then rehydrates PII in the final answer before it reaches the
@@ -102,9 +103,16 @@ See [`docs/GAPS.md`](docs/GAPS.md) for the full writeup. Summary:
 Run the demo:
 
 ```powershell
-.\run.ps1                                    # one-time venv + deps
-.venv\Scripts\python.exe router.py            # 3 example queries: easy/local, hard/cloud, PII/cloud
+.\run.ps1                                     # one-time venv + deps (installs the package with -e .)
+.venv\Scripts\python.exe -m two_brain_router  # 3 example queries: easy/local, hard/cloud, PII/cloud
 .venv\Scripts\python.exe -m pytest tests/ -q  # masking invariant + routing behavior
+```
+
+Other entry points:
+
+```powershell
+.venv\Scripts\python.exe -m two_brain_router --tier mobile          # route as the 1B mobile tier
+.venv\Scripts\python.exe -m two_brain_router --query "..." --json   # one query, machine-readable
 ```
 
 Sample output (query 3 shows the privacy guarantee end-to-end -- masked
@@ -121,20 +129,68 @@ text is what actually leaves the device, the final answer is rehydrated):
 
 ## Directory layout
 
+**All source code lives under `src/two_brain_router/`** -- a `src/` layout,
+matching the parent repo's own `src/quad_mcp_client/`. Each subpackage is one
+replaceable seam, so a mock can be swapped for the real thing without touching
+anything above it.
+
 ```
 two_brain_privacy_router/
-  privacy_mask.py           # G8 mock: PII detect/mask/rehydrate + invariant
-  router.py                 # Two-Brain orchestrator (fast brain / deep brain / routing policy)
+  pyproject.toml            # package metadata; `-e .` puts src/ on the path
   requirements.txt
-  run.ps1
-  tests/test_router.py
-  data/
+  run.ps1                   # generic uv venv bootstrap (repo convention)
+  src/two_brain_router/
+    __init__.py             # public API re-exports + package map
+    __main__.py             # `python -m two_brain_router`
+    cli.py                  # arg parsing + demo output
+    privacy/                # SEAM: swap for quad.privacy once G8 lands
+      patterns.py           #   regex table -- add entity types here
+      guard.py              #   PIIGuard.detect/mask/rehydrate + invariant
+    signals/                # what the four QUAD tools tell the router
+      loader.py             #   TierSignals: reads data/<tool>/<name>.json
+      difficulty.py         #   SEAM: swap for a real logprob/entropy signal
+    routing/
+      policy.py             #   RoutePolicy (thresholds, compression) + RouteDecision
+      brains.py             #   SEAM: LocalFastBrain / CloudDeepBrain -> real inference
+      router.py             #   TwoBrainRouter: mask -> decide -> answer -> rehydrate
+  tests/
+    conftest.py             # puts src/ on sys.path (no install needed)
+    test_privacy.py         # masking invariant
+    test_routing.py         # routing behavior + policy
+  data/                     # captured tool responses -- real and mocked, each logged
     hardware_detect/{ai_pc,mobile,cloud_ai100}.json
     convert_model/{mobile_1b,pc_3b,cloud_large}.json + _real_attempts_log.md
     profile_workload/{mobile_1b,pc_3b,cloud_large}.json + _real_call_log.md
     orchestrate_workload/{mobile_1b,pc_3b}.json + _real_call_log.md
   docs/GAPS.md
 ```
+
+### Where new code goes
+
+| You're adding... | Put it in |
+|---|---|
+| A new PII entity type | `src/two_brain_router/privacy/patterns.py` |
+| The real `quad.privacy` guardrail | replace `privacy/guard.py`; keep the `PIIGuard` contract |
+| A real fast/deep brain (once `convert_model` works) | a new `Brain` implementation in `routing/brains.py` |
+| A different escalation rule | `routing/policy.py` -- `should_escalate` is pure and unit-tested |
+| A new tier (e.g. a second PC SKU) | a `data/<tool>/<name>.json` set + an entry in `routing/router.py`'s `_TIER_FILES` |
+| A new tool response to consume | `signals/loader.py` |
+| A new CLI flag | `cli.py` |
+
+`data/` is pointed at by `signals/loader.DATA_DIR`; override it with the
+`TWO_BRAIN_DATA_DIR` env var to run against a different capture set (e.g. real
+responses recorded once the server-side blockers are fixed).
+
+### Version control
+
+This sample is its own git repository, rooted at this directory -- the
+surrounding `QUAD-Client-main/` is a GitHub ZIP download with no `.git`, so
+nothing tracks it from above. If `QUAD-Client-main` is later turned into a
+proper clone (see the workspace `CLAUDE.md`), fold this in as a subtree or
+submodule rather than leaving a nested `.git` inside a tracked tree.
+
+Per the workspace convention, commit messages here carry **no AI-assistant
+attribution trailer or footer**.
 
 ## What's still needed to go further
 
@@ -143,7 +199,8 @@ two_brain_privacy_router/
   `libpython3.10.so.1.0`, gap #3) -- either would unblock real
   `convert_model` for the Mobile/PC tiers -> real
   `profile_workload`/`orchestrate_workload` numbers -> a real
-  `_local_answer` in `router.py` instead of a labeled stub. Both are
+  `LocalFastBrain.answer` in `routing/brains.py` instead of a labeled stub.
+  Both are
   reported with exact repro steps; neither is fixable from this client.
 - **Real calibration data (representative prompts) for INT4 static QDQ
   quantization** would sharpen the Mobile-tier conversion once a compiler

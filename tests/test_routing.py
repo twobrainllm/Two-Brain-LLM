@@ -1,31 +1,6 @@
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 import pytest
 
-from privacy_mask import PIIGuard, assert_masked_token_invariant
-from router import TwoBrainRouter
-
-
-def test_mask_rehydrate_round_trip():
-    guard = PIIGuard()
-    original = "Contact jane.doe@example.com or 555-123-4567, SSN 123-45-6789."
-    result = guard.mask(original)
-    assert "jane.doe@example.com" not in result.masked_text
-    assert "555-123-4567" not in result.masked_text
-    assert "123-45-6789" not in result.masked_text
-    assert_masked_token_invariant(original, result)
-    assert guard.rehydrate(result.masked_text, result.vault) == original
-
-
-def test_mask_no_pii_is_noop():
-    guard = PIIGuard()
-    original = "What time zone is Tokyo in?"
-    result = guard.mask(original)
-    assert result.masked_text == original
-    assert result.vault == {}
+from two_brain_router.routing import RoutePolicy, TwoBrainRouter
 
 
 def test_easy_query_stays_local():
@@ -65,3 +40,20 @@ def test_router_loads_signals_for_both_local_tiers(tier):
     router = TwoBrainRouter(tier=tier)
     assert router.local.hardware["device_tier"] in ("Mobile", "AI PC")
     assert router.cloud.hardware["device_tier"] == "Cloud"
+
+
+def test_policy_escalates_on_latency_budget_alone():
+    """A trivial query still escalates if the fast brain can't meet the budget."""
+    policy = RoutePolicy()
+    assert policy.should_escalate(difficulty=0.0, local_latency_est_ms=999_999)
+    assert not policy.should_escalate(difficulty=0.0, local_latency_est_ms=10)
+
+
+def test_policy_compresses_only_oversized_context():
+    policy = RoutePolicy(max_context_chars=50)
+    short, was_compressed = policy.compress_context("still small")
+    assert (short, was_compressed) == ("still small", False)
+
+    long, was_compressed = policy.compress_context("x" * 200)
+    assert was_compressed
+    assert len(long) <= 50

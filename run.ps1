@@ -14,7 +14,7 @@
     .\run.ps1
 
     # Run the Two-Brain router demo
-    .venv\Scripts\python.exe router.py
+    .venv\Scripts\python.exe -m two_brain_router
 
     # Run the test suite
     .venv\Scripts\python.exe -m pytest tests/ -q
@@ -73,6 +73,6 @@ Write-Ok "All dependencies installed"
 Write-Host ""
 Write-Host "  Setup complete.  Run the router demo:" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "    .venv\Scripts\python.exe router.py"
+Write-Host "    .venv\Scripts\python.exe -m two_brain_router"
 Write-Host "    .venv\Scripts\python.exe -m pytest tests/ -q"
 Write-Host ""

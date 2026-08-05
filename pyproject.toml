@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "two-brain-router"
+version = "0.1.0"
+description = "Privacy- and power-aware routing between a local fast brain (Snapdragon NPU) and a Cloud AI 100 deep brain. QUAD sample application."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "QUAD Contributors" }]
+keywords = ["quad", "snapdragon", "npu", "llm", "privacy", "pii", "routing"]
+
+# Runtime is stdlib-only on purpose: every model artifact and hardware probe
+# this sample consumes is a captured JSON response under data/, so the routing
+# and masking logic runs anywhere with no SDK installed.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+two-brain-router = "two_brain_router.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/two_brain_router"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]

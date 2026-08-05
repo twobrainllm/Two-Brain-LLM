@@ -27,11 +27,12 @@ wired into a chat product elsewhere. A full-repo search of
 `quad.privacy` module -- it lives in the private `QUAD` core repo, which
 per this workspace's `CLAUDE.md` is not checked out on this machine.
 **Workaround applied (per the documented gap note): mocked the same
-detect/mask/rehydrate contract in `privacy_mask.py`**, real Python with a
-regex-based detector, so the routing logic around it is genuinely testable.
-Swap `privacy_mask.PIIGuard` for the real `quad.privacy` client once this
-environment has access to that gap's delivered component, and re-run
-`tests/test_router.py::test_escalated_pii_never_reaches_cloud_unmasked`
+detect/mask/rehydrate contract in `src/two_brain_router/privacy/`**, real
+Python with a regex-based detector, so the routing logic around it is
+genuinely testable. Swap `privacy.guard.PIIGuard` for the real `quad.privacy`
+client once this environment has access to that gap's delivered component, and
+re-run
+`tests/test_routing.py::test_escalated_pii_never_reaches_cloud_unmasked`
 against it unchanged -- the contract (`mask`/`rehydrate`/invariant) is
 designed to match.
 
