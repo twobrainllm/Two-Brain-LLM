@@ -1,0 +1,16 @@
+{
+  "_mock": true,
+  "_reason": "No real artifact to profile (convert_model blocked, see ../convert_model/_real_attempts_log.md). Envelope shape and measurement_notes convention copied from the real profile_workload call in _real_call_log.md; values are plausible estimates for a QDQ-int4 1.5B model on Hexagon v79 (45 TOPS).",
+  "model_id": "qwen2.5-1.5b-instruct",
+  "device_tier": "Mobile",
+  "platform": "android",
+  "runtime": "npu",
+  "latency_ms": {"ttft_mean": 180, "ttft_p95": 260, "per_token_mean": 27.5},
+  "throughput_tokens_per_s": 36.4,
+  "power_mw": {"npu_active": 1850, "idle": 90},
+  "energy_per_1k_tokens_mj": 761,
+  "token_cost_usd_per_1k": 0.0,
+  "memory_peak_mb": 1120,
+  "utilization": {"npu": 0.78, "cpu": 0.15, "gpu": 0.0},
+  "measurement_notes": {"all_fields": "mocked:no_real_artifact -- see _real_call_log.md"}
+}

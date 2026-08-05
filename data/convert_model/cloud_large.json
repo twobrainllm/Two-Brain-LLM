@@ -1,0 +1,20 @@
+{
+  "_mock": true,
+  "_reason": "target_sdk is Literal['qnn','snpe','nwaios','executorch'] -- none of these target a datacenter AI100 serving stack (vLLM/AIC-serve style), so this tier was never going through convert_model's NPU-compile path in the first place, real server bug or not. Modeled as a cloud batch-serving deployment, not an on-device compile.",
+  "model_id": "qwen2.5-32b-instruct",
+  "model_source": {"kind": "huggingface", "repo_id": "Qwen/Qwen2.5-32B-Instruct", "license": "apache-2.0"},
+  "device_tier": "Cloud",
+  "target_platform": "cloud-ai100",
+  "serving_stack": "Cloud AI 100 Ultra AIC-serve (batched, KV-cache resident on-card)",
+  "source_format": "onnx",
+  "target_sdk": null,
+  "quantization": "int8",
+  "quant_format": "QDQ",
+  "original_size_mb": 65536,
+  "output_size_mb": 32768,
+  "compression_ratio": 2.0,
+  "conversion_time_s_estimated": 1500,
+  "download_url": null,
+  "local_path": null,
+  "aihub": "n/a -- no aihub_device slug exists for AI100"
+}

@@ -1,0 +1,16 @@
+{
+  "_mock": true,
+  "_reason": "No real artifact to profile (convert_model blocked, see ../convert_model/_real_attempts_log.md). Envelope shape and measurement_notes convention copied from the real profile_workload call in _real_call_log.md; values are plausible estimates for a QDQ-int8 3B model on Hexagon v73 (45 TOPS, this machine's real detected NPU).",
+  "model_id": "qwen2.5-3b-instruct",
+  "device_tier": "AI PC",
+  "platform": "windows",
+  "runtime": "npu",
+  "latency_ms": {"ttft_mean": 140, "ttft_p95": 210, "per_token_mean": 44.8},
+  "throughput_tokens_per_s": 22.3,
+  "power_mw": {"npu_active": 3400, "idle": 210},
+  "energy_per_1k_tokens_mj": 2005,
+  "token_cost_usd_per_1k": 0.0,
+  "memory_peak_mb": 3760,
+  "utilization": {"npu": 0.71, "cpu": 0.22, "gpu": 0.0},
+  "measurement_notes": {"all_fields": "mocked:no_real_artifact -- see _real_call_log.md"}
+}

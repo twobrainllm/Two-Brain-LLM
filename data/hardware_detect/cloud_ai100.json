@@ -1,0 +1,16 @@
+{
+  "_mock": true,
+  "_reason": "hardware_detect's platform enum is Literal['windows','linux','android','gateway','robotics'] -- there is no 'cloud'/AI100 value anywhere in quad_mcp_client.client or the MCP server schema. Cloud AI 100 only appears as prose in one unrelated deliverable doc in this repo (deliverables/sewa-snapdragon-requirements). This profile is hand-authored from Qualcomm's public Cloud AI 100 Ultra datasheet, not probed.",
+  "chipset": "Qualcomm Cloud AI 100 Ultra",
+  "platform": "cloud-ai100",
+  "device_tier": "Cloud",
+  "form_factor": "PCIe Gen4 dual-slot card, data-center host",
+  "ai_cores": 64,
+  "npu_model": "Cloud AI 100 Ultra AI Core array",
+  "npu_tops_int8": 870,
+  "on_card_memory_gb": 128,
+  "memory_type": "LPDDR4x",
+  "tdp_w": 150,
+  "sdk_status": "not wired -- no target_sdk/aihub_device value maps to this card anywhere in QUAD-Client-main",
+  "role": "deep brain -- large model, only reached for queries the fast brain escalates"
+}

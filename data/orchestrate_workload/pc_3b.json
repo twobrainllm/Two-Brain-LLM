@@ -1,0 +1,15 @@
+{
+  "_mock": true,
+  "_reason": "No real artifact to orchestrate (convert_model blocked). Shape copied from the real orchestrate_workload call in _real_call_log.md.",
+  "model_id": "qwen2.5-3b-instruct",
+  "device_tier": "AI PC",
+  "power_mode": "balanced",
+  "allocation": {"embed": "npu", "attn_blocks": "npu", "lm_head": "npu"},
+  "npu_utilization_pct": 91.0,
+  "cpu_utilization_pct": 9.0,
+  "gpu_utilization_pct": 0.0,
+  "fallback_layers": [],
+  "decisions": [
+    {"category": "power_mode", "choice": "balanced", "reason": "Plugged-in AI PC tier -- no unsupported ops for this checkpoint, full NPU placement."}
+  ]
+}

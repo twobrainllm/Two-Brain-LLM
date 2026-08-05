@@ -1,0 +1,16 @@
+{
+  "_mock": true,
+  "_reason": "No real artifact to orchestrate (convert_model blocked). Shape copied from the real orchestrate_workload call in _real_call_log.md.",
+  "model_id": "qwen2.5-1.5b-instruct",
+  "device_tier": "Mobile",
+  "power_mode": "efficiency",
+  "allocation": {"embed": "npu", "attn_blocks": "npu", "rotary_embedding": "cpu", "lm_head": "npu"},
+  "npu_utilization_pct": 82.0,
+  "cpu_utilization_pct": 18.0,
+  "gpu_utilization_pct": 0.0,
+  "fallback_layers": ["rotary_embedding"],
+  "decisions": [
+    {"category": "power_mode", "choice": "efficiency", "reason": "Battery-constrained tier -- caps DSP clock to hold power under the phone's sustained thermal budget."},
+    {"category": "op_allocation", "choice": "1 op(s) forced to CPU", "reason": "RotaryEmbedding uses a non-standard axis layout the HTP compiler doesn't lower -- matches convert_model's unsupported_ops for this tier."}
+  ]
+}

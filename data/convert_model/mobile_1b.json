@@ -1,0 +1,23 @@
+{
+  "_mock": true,
+  "_reason": "Blocked by the hosted server's broken qairt-converter (missing libpython3.10.so.1.0) -- see _real_attempts_log.md attempt 4. Shape mirrors QUAD's real convert_model response envelope; numbers are estimates from the model's published HF config + QDQ-int4 compression ratio, not a real compile.",
+  "model_id": "qwen2.5-1.5b-instruct",
+  "model_source": {"kind": "huggingface", "repo_id": "Qwen/Qwen2.5-1.5B-Instruct", "license": "apache-2.0"},
+  "device_tier": "Mobile",
+  "target_platform": "android-8elite",
+  "source_format": "onnx",
+  "target_sdk": "qnn",
+  "quantization": "int4",
+  "quant_format": "QDQ",
+  "runtime": "qnn-htp",
+  "original_size_mb": 6178,
+  "output_size_mb": 890,
+  "compression_ratio": 6.94,
+  "supported_ops_pct": 97.2,
+  "unsupported_ops": ["RotaryEmbedding(non-standard-axis)"],
+  "conversion_time_s_estimated": 210,
+  "image_format_notes": null,
+  "download_url": null,
+  "local_path": null,
+  "aihub": "auto"
+}

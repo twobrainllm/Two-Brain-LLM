@@ -1,0 +1,22 @@
+{
+  "_mock": false,
+  "_source": "real -- quad-client.exe detect --json (client-local-static probe, registry-enriched detect not used because the server's own hardware_detect self-reports its container, not this device -- see docs/GAPS.md #1)",
+  "chipset": "Snapdragon(R) X Elite - X1E80100 - Qualcomm(R) Oryon(TM) CPU",
+  "platform": "windows",
+  "device_tier": "AI PC",
+  "cpu_cores": 12,
+  "cpu_arch": "ARM64",
+  "cpu_freq_ghz": 3.417,
+  "gpu_model": "Adreno X1-85",
+  "gpu_tflops": 4.6,
+  "npu_model": "Hexagon NPU (v73)",
+  "npu_tops": 45.0,
+  "ram_gb": 31.6,
+  "storage_gb": 475.6,
+  "os_version": "Microsoft Windows 11 Pro",
+  "sdk_path": "C:\\Qualcomm\\AIStack\\QAIRT\\2.38.0.250901",
+  "sdk_version": "2.38.0.250901",
+  "available_runtimes": ["cpu", "npu"],
+  "discovery_source": "client-local-static",
+  "role": "fast brain -- 3B local model, escalates hard queries to Cloud AI 100"
+}

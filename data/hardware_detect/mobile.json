@@ -1,0 +1,20 @@
+{
+  "_mock": false,
+  "_source": "real -- adb shell getprop / cat /proc/meminfo directly against the attached device (R3CXC0804XN). NOT from `quad-client detect --platform android --json`: that command ran (discovery_source=client-local-static, so it did reach the device) but returned placeholder/wrong values (chipset='unknown', cpu_cores=1, ram_gb=0.1, storage_gb=475.6 -- the last one is this PC's own disk size, not the phone's). See docs/GAPS.md #5b -- the client's android probe path is itself broken/unimplemented, independent of the earlier adb-authorization blocker.",
+  "chipset": "Qualcomm SM8750 (Snapdragon 8 Elite for Galaxy)",
+  "device_model": "Samsung Galaxy S25 Ultra (SM-S938U1)",
+  "manufacturer": "samsung",
+  "platform": "android",
+  "device_tier": "Mobile",
+  "cpu_cores": 8,
+  "cpu_arch": "ARM64",
+  "gpu_model": "Adreno (Snapdragon 8 Elite for Galaxy family -- exact model not exposed via getprop)",
+  "npu_model": "Hexagon NPU",
+  "npu_tops": null,
+  "npu_tops_note": "TOPS not exposed via adb getprop and not in quad-client's SoC hint table for this platform (see _source) -- unlike the AI PC tier, where the client's hint table does resolve Hexagon v73 @ 45 TOPS for X Elite.",
+  "ram_gb": 10.86,
+  "ram_source": "adb shell cat /proc/meminfo -> MemTotal: 11381324 kB",
+  "os_version": "Android 16 (API 36)",
+  "adb_serial": "R3CXC0804XN",
+  "role": "fast brain -- 1B local model for the phone tier, escalates hard queries to Cloud AI 100"
+}

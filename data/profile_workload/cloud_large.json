@@ -1,0 +1,16 @@
+{
+  "_mock": true,
+  "_reason": "No AI100 target exists in QUAD's tool schemas at all (see ../hardware_detect/cloud_ai100.json) so this was never profilable via profile_workload regardless of the qairt-converter defect. Modeled as a batched cloud-serving deployment: latency includes a network round-trip, cost is a real per-token API-style price instead of on-device energy.",
+  "model_id": "qwen2.5-32b-instruct",
+  "device_tier": "Cloud",
+  "platform": "cloud-ai100",
+  "runtime": "aic-serve",
+  "latency_ms": {"network_rtt_mean": 45, "ttft_mean": 320, "per_token_mean": 12.4},
+  "throughput_tokens_per_s_per_request": 80.6,
+  "power_mw": null,
+  "energy_per_1k_tokens_mj": null,
+  "token_cost_usd_per_1k": 1.8,
+  "memory_peak_mb": null,
+  "utilization": null,
+  "measurement_notes": {"all_fields": "mocked:no_cloud_ai100_plumbing_exists"}
+}
