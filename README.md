@@ -11,6 +11,11 @@ compressed before anything crosses the device boundary.
 **Target tiers:** Mobile (Snapdragon 8 Elite, 1B model) · AI PC (Snapdragon X
 Elite, 3B model, this machine) · Cloud AI 100 (large model, escalation-only).
 
+**Docs:** [`docs/WALKTHROUGH.md`](docs/WALKTHROUGH.md) — step-by-step
+implementation walkthrough, a worked trace of a routed query, and prioritized
+next steps · [`docs/GAPS.md`](docs/GAPS.md) — the five gaps with verbatim error
+strings · [`CLAUDE.md`](CLAUDE.md) — working agreement for agents.
+
 ## Workflow order actually driven
 
 `hardware_detect -> convert_model -> profile_workload -> orchestrate_workload`
@@ -193,6 +198,10 @@ Per the workspace convention, commit messages here carry **no AI-assistant
 attribution trailer or footer**.
 
 ## What's still needed to go further
+
+Summarized here; the prioritized version with owners, dependencies, and
+done-when criteria is in
+[`docs/WALKTHROUGH.md` § Next steps](docs/WALKTHROUGH.md#next-steps).
 
 - **A fixed QAIRT `ReshapeOp::calculateShape`** (the uninitialized-memory
   bug found locally, gap #3b) or a fixed hosted-server install (missing

@@ -10,6 +10,11 @@ MCP connectivity triage). The `README.md` here is the user-facing description â€
 read it for the archetype, the real-vs-mocked table, and the layout; this file
 is the working agreement.
 
+Before starting non-trivial work here, read
+[`docs/WALKTHROUGH.md`](docs/WALKTHROUGH.md) â€” it has the build history, a
+worked trace of a routed query, and the prioritized next steps with their
+dependencies. Picking up an item from that list is usually the right default.
+
 ---
 
 ## What this project is
