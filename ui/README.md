@@ -6,108 +6,92 @@ color to show which brain answered — **Lochmara `#007CC0`** for the local
 fast brain, **Supernova `#FFC20E`** for the Cloud AI 100 deep brain.
 
 Plain HTML/CSS/JS, no build step, no dependencies. Lives entirely under
-`ui/` — nothing under `src/`, `data/`, `docs/`, or `tests/` was touched, so
-this merges cleanly regardless of what lands on `main` in the meantime.
+`ui/` — the backend it talks to (`src/two_brain_router/api.py`) is one new
+file, so this still merges cleanly; nothing existing under `src/` was
+changed to accommodate it.
+
+**Now wired to the real router**, verified end-to-end in a browser
+(real routing, real PII masking display, escalation, and the offline
+fallback below) — this section used to describe a wiring plan; that plan is
+done, see "How it actually works" below for what shipped instead of what
+was proposed.
 
 ## Running it
 
-```
+Two servers, both stdlib-only:
+
+```powershell
+# 1. The router API (from the sample root, not ui/)
+.venv\Scripts\python.exe -m two_brain_router.api          # pc tier, stub brains
+# add --tier mobile, or set TWO_BRAIN_NPU_BRAIN=1 / TWO_BRAIN_PHONE_BRAIN=1
+# first -- see ../docs/ORCHESTRATOR.md
+
+# 2. The UI itself, in a second terminal
 cd ui
 python -m http.server 8000
 ```
 
-Then open `http://localhost:8000`. (Opening `index.html` directly by
-double-clicking also works in most browsers — the app only uses
-`localStorage`, no `fetch` calls yet.)
+Then open `http://localhost:8000`. The sidebar's "● Live — routing as \<tier\>"
+line confirms the API is reachable. **The API server is optional** — see
+"Offline fallback" below; the UI still works, clearly labeled, without it.
 
-## Real vs. mocked
+## How it actually works
 
-**Real:** the entire UI shell — sidebar, date-grouped chat history (Today /
-Yesterday / Previous 7 Days / Previous 30 Days / Older), live search over
-titles and message text, per-chat delete, the composer, and the robot
-avatar's color/animation logic.
+**Real, end-to-end:** sending a message calls
+`TwoBrainRouter.route(query, context)`
+(`src/two_brain_router/routing/router.py`) through `/route`
+(`src/two_brain_router/api.py`) and renders the actual `RouteDecision` --
+which tier answered, the real answer text, the real difficulty score,
+latency, cost, and escalation notes, and (per query) which PII entity types
+were masked before anything left the device. The "thinking" avatar animation
+now paces off the real call's actual duration instead of a canned guess.
 
-**Mocked:** the reply itself. `mockRespond()` in `app.js` returns a canned
-string; no model runs and no query leaves the browser tab. Which color the
-next reply's avatar gets is **not** a routing decision — it's whatever the
-"Simulated brain" toggle in the sidebar footer is set to. This was a
-deliberate call, not a placeholder we forgot to wire up: this UI was built
-in an environment that can't reach the X-Elite box's NPU runtime, so there
-was nothing real to call. The toggle exists to let you preview the color
-swap without a backend.
+**Also real, but a *different* real thing than the router:** the sidebar's
+color-swap logic, chat history/search/persistence, and the robot avatar
+itself were already real before this was wired up and are unaffected.
 
-Each message stores its own `tier` at send time, so switching the toggle
-later doesn't repaint history — old messages keep the color of whatever
-tier "answered" them, same as the real router would.
+## Offline fallback
+
+If `/route` is unreachable (server not started, wrong port, killed
+mid-session), the UI does **not** error -- it falls back to a simulated
+reply, labeled "(offline preview)" in that message's badge, with the
+sidebar status line switching to "○ API offline". This is `mockRespond()` /
+`profiler.js`'s `computeMetrics()` from the UI's original mock-only version
+-- kept intentionally rather than deleted once the real path landed, so the
+UI still demos cleanly with no backend running (e.g. showing it to someone
+without starting Python). The sidebar's "Preview tier" toggle only affects
+this fallback path; it has no effect at all when the API is reachable, since
+tier is then always the server's real decision.
+
+Each message remembers whether it was answered live or by the fallback
+(`msg.live`), so a mid-session backend restart never repaints history --
+verified: an offline-preview reply keeps its label even after the API comes
+back and the next message answers for real.
 
 ## Query profiler
 
 The pill in the top-right of the header (click to expand, Dynamic-Island
 style) shows per-query telemetry: difficulty score against the escalation
 threshold, PII/privacy detection, estimated latency and cost, the router's
-own escalation reasoning, and the AI PC's real captured hardware context.
+own escalation reasoning, and the answering tier's real captured hardware
+context.
 
-**Real:** the formulas and constants. `ui/profiler.js` is a line-for-line
-port of `signals/difficulty.py`'s `DifficultyEstimator`,
-`privacy/patterns.py`'s `PATTERNS` + `privacy/guard.py`'s `PIIGuard.detect`,
-`routing/policy.py`'s latency estimate and `routing/brains.py`'s cost
-formula, and `routing/policy.py`'s escalation/local note text — with the
-same profiled constants (`data/profile_workload/pc_3b.json`,
-`cloud_large.json`) and the same captured hardware string
-(`data/hardware_detect/ai_pc.json`), cited inline in `profiler.js`. Given
-the same query, it produces the same difficulty score, PII count, and
-latency/cost estimate the real router would.
+**Live path:** every field is the real `RouteDecision`, adapted into this
+card's shape by `metricsFromRouteResponse()` in `app.js` -- not
+recomputed. The one addition beyond what `RouteDecision` itself carries is
+`pii_entities` (a per-type breakdown), which `api.py` computes separately,
+read-only, purely for this display -- see its docstring for why that can't
+affect routing.
 
-**Mocked:** the *invocation*. Nothing in `profiler.js` calls the Python
-router — it's a JS re-implementation run against whatever tier the sidebar
-toggle is set to, not a real routing decision. The "actual" latency shown
-alongside the estimate is the mock thinking choreography's own measured
-wall-clock duration, not a real model's.
+**Offline-fallback path:** `ui/profiler.js`'s ported formulas -- still a
+line-for-line port of `signals/difficulty.py`, `privacy/patterns.py` +
+`privacy/guard.py`, and `routing/policy.py`/`routing/brains.py`'s cost
+formula, cited inline in `profiler.js`. Both paths produce the exact same
+field shape, so `renderProfiler()` doesn't know or care which one answered.
 
 Each assistant message stores its own `metrics` snapshot (same pattern as
-`tier`), so the profiler always reflects whichever message last answered —
-switching chats or tiers later doesn't recompute history.
-
-## Wiring it to the real router
-
-`TwoBrainRouter.route(query, context)`
-(`src/two_brain_router/routing/router.py`) already returns exactly the
-signal this UI needs: a `RouteDecision` with `tier_answered: "local" |
-"cloud"` and `answer`. Nothing about the routing/masking logic needs to
-change for this UI — it's a pure consumer.
-
-To wire it up on the target device:
-
-1. **Add a thin API server** (new file, e.g. `ui/server.py` or
-   `src/two_brain_router/api.py` — a new module either way, not an edit to
-   an existing one). A single `FastAPI`/`Flask` endpoint is enough:
-
-   ```python
-   router = TwoBrainRouter(tier="pc")  # set TWO_BRAIN_NPU_BRAIN=1 for the real NPU brain
-
-   @app.post("/route")
-   def route(body: dict):
-       decision = router.route(body["query"], body.get("context", ""))
-       return {"tier": decision.tier_answered, "answer": decision.answer}
-   ```
-
-2. **Replace `mockRespond()`** in `app.js` with a `fetch("/route", ...)`
-   call, and use the response's `tier` field instead of
-   `state.currentTier`.
-3. **Remove the sidebar toggle** once tier is a real routing decision
-   instead of a manual override — at that point it's dead UI, not a
-   feature.
-4. Keep the per-message `tier_badge`/dot — it's useful even once real,
-   since color alone isn't an accessible signal.
-5. **Retire `profiler.js`'s ported formulas** in favor of the real
-   `RouteDecision` fields the same `/route` response already carries
-   (`difficulty_score`, `est_latency_ms`, `est_cost_usd`,
-   `pii_entities_masked`, `notes`) — at that point the JS port becomes a
-   second, divergence-prone source of truth instead of a stand-in for one.
-
-Until step 1 exists on a machine that can actually run it, this stays
-labeled mock, per this repo's own rule: nothing gets to look real without
-a receipt.
+`tier`/`live`), so the profiler always reflects whichever message last
+answered -- switching chats later doesn't recompute history.
 
 ## Persistence
 

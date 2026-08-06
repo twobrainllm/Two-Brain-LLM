@@ -1,13 +1,29 @@
 /**
  * Two-Brain Chat -- UI shell.
  *
- * MOCK NOTICE: `mockRespond()` below is the only simulated piece. Everything
- * else (history, search, persistence, rendering) is real. See README.md for
- * what "wiring this for real" means later.
+ * Wired to the real router: `sendToRouter()` POSTs to
+ * `src/two_brain_router/api.py`'s `/route` endpoint (see ui/README.md for
+ * how to start it). `mockRespond()` / `profiler.js`'s `computeMetrics()`
+ * are kept, not deleted -- they're now the **offline fallback**: if the API
+ * is unreachable (server not started, wrong port), a reply still renders,
+ * labeled "(offline preview)" rather than failing silently or throwing an
+ * error at the user. Every message remembers which path answered it
+ * (`msg.live`), so switching backend availability later never repaints
+ * history -- same principle this file already used for `tier`/`metrics`.
  */
 
 const STORAGE_KEY = "twoBrainChats";
 const GROUP_ORDER = ["Today", "Yesterday", "Previous 7 Days", "Previous 30 Days", "Older"];
+
+//: `src/two_brain_router/api.py`'s default bind address/port.
+const API_BASE_URL = "http://127.0.0.1:8765";
+
+// data/hardware_detect/{ai_pc,mobile}.json -- real quad-client detect /
+// adb shell captures, matching profiler.js's own DEVICE_CONTEXT convention.
+const DEVICE_CONTEXT_BY_TIER = {
+  pc: "AI PC · Snapdragon® X Elite X1E80100 · Hexagon NPU v73 @ 45 TOPS · 12 cores",
+  mobile: "Mobile · Snapdragon® 8 Elite (SM8750) · 8 cores · ~10.9 GB RAM · Android 16",
+};
 
 const els = {
   chatList: document.getElementById("chat-list"),
@@ -36,6 +52,7 @@ const els = {
   profilerCostValue: document.getElementById("profiler-cost-value"),
   profilerNotes: document.getElementById("profiler-notes"),
   profilerFooter: document.getElementById("profiler-footer"),
+  backendStatus: document.getElementById("backend-status"),
 };
 
 const LOOK_DIRECTIONS = ["left", "right", "up", "down"];
@@ -48,12 +65,12 @@ for (const name of EXPRESSIONS) {
 }
 
 /**
- * "Thinking" choreography for the mock reply delay -- not a real signal,
- * just personality. Cloud gets a longer, more deliberate look-around
- * (bigger brain, harder problem); local gets a quick glance. Real wiring
- * (see README.md) would replace this whole rhythm with a genuine
- * "waiting on the model" state, which has no natural sub-beats to loop
- * through.
+ * "Thinking" choreography for the *offline-fallback* reply delay only --
+ * not a real signal, just personality. Cloud gets a longer, more deliberate
+ * look-around (bigger brain, harder problem); local gets a quick glance.
+ * The live path (routing through /route for real) doesn't use this at all
+ * -- see `playThinkingLooksUntilSettled`, which paces off the actual
+ * network call instead of a canned guess.
  */
 const THINK_MS_BY_TIER = { local: 900, cloud: 2800 };
 const THINK_RHYTHM_MS = 480;
@@ -90,6 +107,29 @@ async function playThinkingLooks(avatarEl, budgetMs, rhythmMs) {
 }
 
 /**
+ * Same loop as `playThinkingLooks`, but for a real network call whose
+ * duration isn't known up front: loops until `pending` settles instead of
+ * for a fixed budget, so the animation actually reflects how long the
+ * router took rather than a canned per-tier guess. At least one full beat
+ * always plays, so a very fast reply doesn't skip the "thinking" state
+ * entirely.
+ */
+async function playThinkingLooksUntilSettled(avatarEl, pending, rhythmMs) {
+  const order = shuffled(LOOK_EXPRESSIONS);
+  let settled = false;
+  pending.then(
+    () => (settled = true),
+    () => (settled = true)
+  );
+  let i = 0;
+  do {
+    playExpression(avatarEl, order[i % order.length], rhythmMs);
+    i++;
+    await sleep(rhythmMs);
+  } while (!settled);
+}
+
+/**
  * Plays a one-off expression on an avatar, then reverts to its normal
  * idle breathing/blink. `name` must be one of EXPRESSIONS.
  *
@@ -123,8 +163,12 @@ function activePreviewAvatar() {
 const state = {
   chats: loadChats(),
   activeChatId: null,
+  // Only consulted on the offline-fallback path now (see mockRespond /
+  // computeMetrics below) -- when the API answers for real, tier comes back
+  // in the response (`tier_answered`), it is not chosen up front.
   currentTier: "local",
   searchQuery: "",
+  backendLive: null, // null = not checked yet, true/false after checkBackend()
 };
 
 function loadChats() {
@@ -301,9 +345,15 @@ function renderMessageEl(msg) {
     const badge = document.createElement("div");
     badge.className = "tier-badge";
     const tier = msg.tier || "local";
+    // `msg.live` is undefined for the "…" placeholder row (no verdict yet)
+    // and for any chat saved before this field existed -- treat both as
+    // "don't claim either way" rather than defaulting to "(simulated)",
+    // which would mislabel old real-seeming history that predates this field.
+    const suffix = msg.live === true ? "" : msg.live === false ? " (offline preview)" : "";
     badge.innerHTML =
       `<span class="tier-dot" data-tier="${tier}"></span>` +
-      (tier === "local" ? "Local brain (simulated)" : "Cloud brain (simulated)");
+      (tier === "local" ? "Local brain" : "Cloud brain") +
+      suffix;
     bubble.appendChild(badge);
   }
 
@@ -407,16 +457,76 @@ function toggleProfilerCard() {
 }
 
 /**
- * MOCK: stands in for TwoBrainRouter.route(query, context). The tier is
- * whatever the sidebar toggle is set to, not a real routing decision -- see
- * README.md for the real contract this needs to match.
+ * Real call: POSTs to `two_brain_router.api`'s `/route`. Throws (network
+ * error, non-2xx, bad JSON) rather than returning a sentinel -- callers
+ * decide what "the API is unreachable" means for them; here that means
+ * `handleSend` falls back to `mockRespond`/`computeMetrics`.
+ */
+async function sendToRouter(query, context) {
+  const res = await fetch(`${API_BASE_URL}/route`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, context }),
+  });
+  const body = await res.json();
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
+/** Adapts a /route response into the metrics shape `renderProfiler` and
+ * `formatPrivacy` already consume (same field names `computeMetrics` in
+ * profiler.js produces) -- so neither of those needs to know or care
+ * whether the numbers came from a real call or the offline fallback. */
+function metricsFromRouteResponse(body) {
+  return {
+    difficulty: body.difficulty_score,
+    escalateThreshold: body.escalate_threshold,
+    wouldEscalate: body.tier_answered === "cloud",
+    piiEntities: body.pii_entities,
+    piiCount: body.pii_entities_masked,
+    estLatencyMs: body.est_latency_ms,
+    estCostUsd: body.est_cost_usd,
+    notes: body.notes,
+    deviceContext: DEVICE_CONTEXT_BY_TIER[body.tier] ?? body.tier,
+  };
+}
+
+/** Pings /health once (on load, and again after any failed /route call) so
+ * the sidebar can say plainly whether replies are live or falling back --
+ * rather than the user discovering it only from a subtle badge change. */
+async function checkBackend() {
+  try {
+    const res = await fetch(`${API_BASE_URL}/health`, { method: "GET" });
+    const body = await res.json();
+    setBackendStatus(res.ok, body.tier);
+  } catch {
+    setBackendStatus(false);
+  }
+}
+
+function setBackendStatus(live, tier) {
+  state.backendLive = live;
+  if (!els.backendStatus) return;
+  els.backendStatus.textContent = live
+    ? `● Live — routing as ${tier}`
+    : "○ API offline — replies use the offline preview";
+  els.backendStatus.dataset.live = String(live);
+}
+
+/**
+ * OFFLINE FALLBACK: stands in for TwoBrainRouter.route(query, context) when
+ * `sendToRouter` fails. `tier` is whatever the sidebar's preview toggle is
+ * set to -- a deliberate preview choice in this path, unlike the live path
+ * where tier is always a real decision returned by the server.
  */
 function mockRespond(query, tier) {
   const tierLabel = tier === "cloud" ? "Cloud AI 100 (simulated)" : "local fast brain (simulated)";
   return (
     `This is a simulated reply from the ${tierLabel}.\n\n` +
-    `Mock mode: no model ran and no query left this browser tab. ` +
-    `Flip the "Simulated brain" toggle in the sidebar before sending to preview the other tier's color.`
+    `Offline preview: the /route API wasn't reachable at ${API_BASE_URL}, so no model ran ` +
+    `and no query left this browser tab. Start it with ` +
+    `"python -m two_brain_router.api" and resend to get a real answer. ` +
+    `Use the "Preview tier" toggle in the sidebar to see the other color while offline.`
   );
 }
 
@@ -438,32 +548,57 @@ async function handleSend(e) {
   autoGrow();
   updateSendState();
 
-  const tier = state.currentTier;
-  const thinkingStartedAt = performance.now();
-  const thinkingRow = renderMessageEl({ role: "assistant", content: "…", tier });
+  // Placeholder tier for the thinking avatar only -- real tier isn't known
+  // until the response comes back (or the fallback kicks in below).
+  const thinkingRow = renderMessageEl({ role: "assistant", content: "…", tier: "local" });
   const thinkingAvatar = thinkingRow.querySelector(".robot-avatar");
   thinkingAvatar?.classList.add("thinking");
   els.messages.appendChild(thinkingRow);
   scrollToBottom();
+  const thinkingStartedAt = performance.now();
 
   const isLongQuery = query.length > LONG_QUERY_CHARS;
-  const surpriseMs = isLongQuery ? EXPRESSION_HOLD_MS.surprised : 0;
   if (isLongQuery) {
     playExpression(thinkingAvatar, "surprised");
-    await sleep(surpriseMs);
+    await sleep(EXPRESSION_HOLD_MS.surprised);
   }
 
-  const thinkMs = THINK_MS_BY_TIER[tier] ?? THINK_MS_BY_TIER.local;
-  const lookBudgetMs = Math.max(thinkMs - surpriseMs, 0);
-  await playThinkingLooks(thinkingAvatar, lookBudgetMs, THINK_RHYTHM_MS);
+  // In flight immediately; the animation below just watches it settle.
+  const routed = sendToRouter(query, "");
+  const looping = playThinkingLooksUntilSettled(thinkingAvatar, routed, THINK_RHYTHM_MS);
+
+  let tier, answer, metrics, live;
+  try {
+    const body = await routed;
+    await looping; // let the current beat finish instead of cutting it off
+    tier = body.tier_answered;
+    answer = body.answer;
+    metrics = metricsFromRouteResponse(body);
+    live = true;
+    setBackendStatus(true, body.tier);
+  } catch (err) {
+    console.warn("two-brain-router API unreachable, using offline preview:", err);
+    // `routed` rejects fast (a refused connection, not a real wait), so
+    // `looping` already stopped -- swap to the personality-paced budget
+    // loop instead of a near-instant reply, same rhythm the mock always had.
+    const fallbackTier = state.currentTier;
+    await playThinkingLooks(
+      thinkingAvatar,
+      THINK_MS_BY_TIER[fallbackTier] ?? THINK_MS_BY_TIER.local,
+      THINK_RHYTHM_MS
+    );
+    tier = fallbackTier;
+    answer = mockRespond(query, tier);
+    metrics = computeMetrics(query, tier);
+    live = false;
+    setBackendStatus(false);
+  }
 
   playExpression(thinkingAvatar, "happy", HAPPY_LEAD_MS);
   await sleep(HAPPY_LEAD_MS);
 
-  const answer = mockRespond(query, tier);
-  const metrics = computeMetrics(query, tier);
   metrics.actualLatencyMs = performance.now() - thinkingStartedAt;
-  chat.messages.push({ role: "assistant", content: answer, tier, timestamp: Date.now(), metrics });
+  chat.messages.push({ role: "assistant", content: answer, tier, live, timestamp: Date.now(), metrics });
   chat.updatedAt = Date.now();
   saveChats();
   renderMessages(chat);
@@ -481,6 +616,9 @@ function updateSendState() {
   els.sendBtn.disabled = els.composerInput.value.trim().length === 0;
 }
 
+// Picks the tier for the OFFLINE-FALLBACK reply only (see mockRespond) --
+// when the API is reachable, tier is always the server's real decision and
+// this selection is never consulted.
 function setTier(tier) {
   state.currentTier = tier;
   for (const seg of els.brainToggle.querySelectorAll(".segment")) {
@@ -539,3 +677,4 @@ document.addEventListener("keydown", (e) => {
 renderChatList();
 showEmptyState();
 updateSendState();
+checkBackend();

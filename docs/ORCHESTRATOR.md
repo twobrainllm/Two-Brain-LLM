@@ -155,6 +155,20 @@ deliberate opt-in rather than a silent default.
 
 ---
 
+## The chat UI
+
+`ui/` (merged from `origin/(hollowbyte)-feat/chat_app`) is a plain HTML/JS
+chat interface, now wired to a real `/route` endpoint
+(`src/two_brain_router/api.py`) instead of its original mock. See
+`ui/README.md` for how to run both pieces and how the offline fallback
+works (the API is optional -- the UI still demos cleanly without it, just
+clearly labeled as a preview). Verified end-to-end in a real browser: live
+routing, PII masking visible in the profiler, cloud escalation, offline
+fallback, and recovery after a backend restart, all without repainting
+chat history that already rendered under a different state.
+
+---
+
 ## What this changed, and what it didn't
 
 **Unchanged:** all four invariants in `../CLAUDE.md`, `routing/policy.py`
