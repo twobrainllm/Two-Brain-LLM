@@ -26,15 +26,53 @@ const els = {
 
 const LOOK_DIRECTIONS = ["left", "right", "up", "down"];
 const LOOK_VARIANTS = ["look", "shrink-look", "expand-look"];
-const EXPRESSIONS = [
-  "happy",
-  "wink",
-  "surprised",
-  ...LOOK_VARIANTS.flatMap((variant) => LOOK_DIRECTIONS.map((dir) => `${variant}-${dir}`)),
-];
+const LOOK_EXPRESSIONS = LOOK_VARIANTS.flatMap((variant) => LOOK_DIRECTIONS.map((dir) => `${variant}-${dir}`));
+const EXPRESSIONS = ["happy", "wink", "surprised", ...LOOK_EXPRESSIONS];
 const EXPRESSION_HOLD_MS = { happy: 500, wink: 900, surprised: 700 };
 for (const name of EXPRESSIONS) {
   if (!(name in EXPRESSION_HOLD_MS)) EXPRESSION_HOLD_MS[name] = 1600;
+}
+
+/**
+ * "Thinking" choreography for the mock reply delay -- not a real signal,
+ * just personality. Cloud gets a longer, more deliberate look-around
+ * (bigger brain, harder problem); local gets a quick glance. Real wiring
+ * (see README.md) would replace this whole rhythm with a genuine
+ * "waiting on the model" state, which has no natural sub-beats to loop
+ * through.
+ */
+const THINK_MS_BY_TIER = { local: 900, cloud: 2800 };
+const THINK_RHYTHM_MS = 480;
+const HAPPY_LEAD_MS = 450;
+const LONG_QUERY_CHARS = 120;
+
+function shuffled(arr) {
+  const copy = [...arr];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Cycles the avatar through look/shrink-look/expand-look in random order,
+ * for as many complete rhythmMs-length ticks as fit in budgetMs (at least
+ * one). Awaits every tick fully -- whatever runs next (e.g. "happy") only
+ * ever starts once the last look has actually finished its beat, instead
+ * of cutting it off mid-animation at an arbitrary elapsed-time cutoff.
+ */
+async function playThinkingLooks(avatarEl, budgetMs, rhythmMs) {
+  const order = shuffled(LOOK_EXPRESSIONS);
+  const steps = Math.max(Math.floor(budgetMs / rhythmMs), 1);
+  for (let i = 0; i < steps; i++) {
+    playExpression(avatarEl, order[i % order.length], rhythmMs);
+    await sleep(rhythmMs);
+  }
 }
 
 /**
@@ -314,13 +352,26 @@ async function handleSend(e) {
   autoGrow();
   updateSendState();
 
-  const thinkingRow = renderMessageEl({ role: "assistant", content: "…", tier: state.currentTier });
-  thinkingRow.querySelector(".robot-avatar")?.classList.add("thinking");
+  const tier = state.currentTier;
+  const thinkingRow = renderMessageEl({ role: "assistant", content: "…", tier });
+  const thinkingAvatar = thinkingRow.querySelector(".robot-avatar");
+  thinkingAvatar?.classList.add("thinking");
   els.messages.appendChild(thinkingRow);
   scrollToBottom();
 
-  const tier = state.currentTier;
-  await new Promise((r) => setTimeout(r, 700));
+  const isLongQuery = query.length > LONG_QUERY_CHARS;
+  const surpriseMs = isLongQuery ? EXPRESSION_HOLD_MS.surprised : 0;
+  if (isLongQuery) {
+    playExpression(thinkingAvatar, "surprised");
+    await sleep(surpriseMs);
+  }
+
+  const thinkMs = THINK_MS_BY_TIER[tier] ?? THINK_MS_BY_TIER.local;
+  const lookBudgetMs = Math.max(thinkMs - surpriseMs, 0);
+  await playThinkingLooks(thinkingAvatar, lookBudgetMs, THINK_RHYTHM_MS);
+
+  playExpression(thinkingAvatar, "happy", HAPPY_LEAD_MS);
+  await sleep(HAPPY_LEAD_MS);
 
   const answer = mockRespond(query, tier);
   chat.messages.push({ role: "assistant", content: answer, tier, timestamp: Date.now() });
