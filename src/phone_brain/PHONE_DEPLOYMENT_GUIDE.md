@@ -107,7 +107,7 @@ the calling side needs to know ADB is involved at all.
 ## Part 7 — Smoke test from the dev machine
 
 ```bash
-python test_phone_brain.py --base-url http://localhost:8000 --model llama-3.2-3b-instruct
+python bench_phone_brain.py --base-url http://localhost:8000 --model llama-3.2-3b-instruct
 ```
 
 What "working" looks like: coherent text back, no errors, and a
@@ -148,7 +148,7 @@ to fix it purely by rewording the prompt.
 - [ ] Runtime installed on the phone
 - [ ] Bundle pushed to `/data/local/tmp/genie_bundle_l`
 - [ ] Server running, reachable at `localhost:8000` via the dev machine
-- [ ] `test_phone_brain.py` runs clean with a real, recorded tokens/sec number
+- [ ] `bench_phone_brain.py` runs clean with a real, recorded tokens/sec number
 - [ ] `confidence_estimator.py --strategy self_reported` runs against the
       real device and the `CONFIDENCE:` line actually parses
 

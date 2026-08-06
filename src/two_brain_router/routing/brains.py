@@ -4,13 +4,21 @@ The cloud brain is still a stub: the Cloud AI 100 has no plumbing in
 QUAD-Client at all (gap #4), so it returns a *labeled* stub answer with
 latency/cost estimated from `profile_workload`'s envelope shape.
 
-The `pc_3b` local tier is no longer a stub. `NpuFastBrain` runs a real
-Phi-3.5-mini-instruct artifact on this machine's Hexagon NPU via Qualcomm's
-Genie SDK (`Genie.dll`, called through `ctypes` -- not ONNX Runtime GenAI;
-see `data/npu_model/phi-3.5-mini-instruct/_real_download_log.md` for why).
-`LocalFastBrain` remains the stub used for the mobile tier, which is still
-blocked (gap #3/#3b + #5b) -- see
-`superpowers/deploy-local-brain-npu.md`'s Non-goals.
+Neither local tier is a stub any more:
+
+- **AI PC (`pc_3b`)** -- `NpuFastBrain` runs a real Phi-3.5-mini-instruct
+  artifact on this machine's Hexagon NPU via Qualcomm's Genie SDK
+  (`Genie.dll`, called through `ctypes` -- not ONNX Runtime GenAI; see
+  `data/npu_model/phi-3.5-mini-instruct/_real_download_log.md` for why).
+  In-process by design -- `docs/npu-deployment.md`.
+- **Mobile (`mobile_1b`)** -- `PhoneFastBrain` talks to the on-device Genie
+  server built in `src/phone_brain/` over the OpenAI-shaped contract in
+  `src/phone_brain/L_INTERFACE_CONTRACT.md`. Off-process by necessity: the
+  model runs on a physically separate device.
+
+`LocalFastBrain` remains as the labeled-stub fallback both tiers use when
+their real runtime isn't wired up, so the package still runs anywhere with
+no SDK and no hardware.
 
 This is the seam to replace with real inference: implement `Brain.answer` and
 keep the returned `BrainResponse` shape, and the router, policy, and privacy
@@ -26,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from two_brain_router.signals.confidence import SELF_REPORT_SUFFIX, parse_self_reported
 from two_brain_router.signals.loader import DATA_DIR, TierSignals
 
 
@@ -36,10 +45,29 @@ class BrainResponse:
     text: str
     latency_ms: float
     cost_usd: float = 0.0
+    #: The brain's own confidence in this answer, `[0.0, 1.0]`, or None when
+    #: this brain emits no such signal (every stub, and NpuFastBrain). See
+    #: signals/confidence.py for why None and 0.0 mean different things.
+    confidence: float | None = None
+    #: Set when the brain could not be reached or misbehaved. The router
+    #: surfaces this in RouteDecision.notes rather than raising -- per
+    #: L_INTERFACE_CONTRACT.md, a failed fast brain is an escalate signal, not
+    #: a user-visible error.
+    error: str | None = None
 
 
 class Brain(Protocol):
     """Implement this to plug a real runtime in behind the router."""
+
+    #: Whether `answer()` populates `BrainResponse.confidence`.
+    #:
+    #: This flips the *order* of the router's decision, so it is part of the
+    #: contract rather than an implementation detail. When False the router
+    #: scores difficulty first and only calls this brain if it decides to stay
+    #: local. When True the brain's own confidence *is* the difficulty signal
+    #: and arrives with the answer, so the router must call it before deciding
+    #: -- see router.py's `route()` and docs/ORCHESTRATOR.md.
+    reports_confidence: bool
 
     def answer(self, masked_query: str, context: str = "") -> BrainResponse: ...
 
@@ -56,6 +84,8 @@ class LocalFastBrain:
     data/convert_model/_real_attempts_log.md). Latency is estimated from
     profile_workload's real envelope shape (data/profile_workload/<tier>.json).
     """
+
+    reports_confidence = False
 
     def __init__(self, tier: str, signals: TierSignals) -> None:
         self.tier = tier
@@ -79,6 +109,8 @@ class CloudDeepBrain:
     (data/hardware_detect/cloud_ai100.json). Latency and cost are estimated
     from data/profile_workload/cloud_large.json, network RTT included.
     """
+
+    reports_confidence = False
 
     def __init__(self, signals: TierSignals) -> None:
         self.signals = signals
@@ -166,6 +198,13 @@ class NpuFastBrain:
     this class does not rely on the model's own EOS behavior alone; it sets
     an explicit stop sequence and additionally bounds output length itself.
     """
+
+    #: This model is not asked to self-rate. Genie exposes no logprobs through
+    #: the C API used here, and a self-report suffix would change the prompt
+    #: the real numbers in data/profile_workload/pc_3b.json were measured
+    #: against. The router therefore keeps scoring difficulty itself for this
+    #: tier -- see docs/ORCHESTRATOR.md's "per-tier signal" table.
+    reports_confidence = False
 
     _MAX_NEW_TOKENS = 48
     _STOP_SEQUENCES = ["<|end|>", "<|user|>", "<|system|>"]
@@ -325,3 +364,164 @@ class NpuFastBrain:
             self.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+#: Hosts that mean "this device". The phone is reached over
+#: `adb reverse tcp:8000 tcp:8000`, which is precisely what makes it appear on
+#: loopback -- so loopback is the honest test for "the masked query is not
+#: traversing a network", not a proxy for it.
+_ON_DEVICE_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+class RemoteBrainRefused(ValueError):
+    """A fast brain was pointed at a host that is not on-device."""
+
+
+class PhoneFastBrain:
+    """Fast brain served over an OpenAI-shaped HTTP endpoint (Mobile tier).
+
+    Speaks the contract in `src/phone_brain/L_INTERFACE_CONTRACT.md`
+    (`POST /v1/chat/completions`), so it is identical against
+    `mock_phone_brain_server.py` and against the real Genie/GenieX server on
+    the Galaxy S25 -- only the base URL changes. Deliberately **not**
+    phone-specific: any OpenAI-shaped endpoint works, which is why a future
+    hosted AI-PC or cloud tier can reuse this class rather than copy it.
+
+    Two things make this different from the other brains here:
+
+    1. **It self-rates.** `reports_confidence = True`, so the router asks it
+       *before* deciding local-vs-cloud and uses the returned confidence as
+       the difficulty signal (one inference call, not two). See
+       signals/confidence.py.
+    2. **It is off-process.** Unlike `NpuFastBrain`, which is in-process by
+       design (docs/npu-deployment.md), the mobile model genuinely runs on a
+       separate device. That makes the base URL a privacy-relevant input, so
+       it is checked -- see `_assert_on_device`.
+
+    Latency is *measured*, not estimated from `data/profile_workload/`: this
+    makes a real call, so there is a real number to report.
+    """
+
+    reports_confidence = True
+
+    #: `adb reverse tcp:8000 tcp:8000` puts the phone here (L contract).
+    #:
+    #: `127.0.0.1`, not `localhost`, and this is measured rather than
+    #: stylistic: on this Windows host `localhost` resolves to `::1` first,
+    #: the server binds IPv4 only, and the failed IPv6 attempt costs **~2s per
+    #: call** before the fallback succeeds (measured 2778-3117ms via
+    #: `localhost` vs. 742-1153ms via `127.0.0.1`, same server, same prompt).
+    #: For most clients that is an annoyance; here it is a correctness bug,
+    #: because `RoutePolicy.local_latency_budget_ms` is 3000ms and the router
+    #: decides local-vs-cloud on this exact number -- a phantom 2s would
+    #: escalate queries the phone could comfortably have answered.
+    DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+    DEFAULT_MODEL = "llama-3.2-3b-instruct"
+
+    #: Matches confidence_estimator.py's request shape exactly -- the L
+    #: contract pins these four fields.
+    _MAX_TOKENS = 256
+    _TEMPERATURE = 0.2
+    _TIMEOUT_S = 120.0
+
+    def __init__(
+        self,
+        tier: str,
+        signals: TierSignals,
+        base_url: str | None = None,
+        model: str | None = None,
+        allow_remote: bool = False,
+        timeout_s: float | None = None,
+    ) -> None:
+        self.tier = tier
+        self.signals = signals
+        self.base_url = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
+        self.model = model or self.DEFAULT_MODEL
+        self.timeout_s = timeout_s if timeout_s is not None else self._TIMEOUT_S
+        self._assert_on_device(self.base_url, allow_remote)
+
+    @staticmethod
+    def _assert_on_device(base_url: str, allow_remote: bool) -> None:
+        """Refuse a non-loopback endpoint unless explicitly allowed.
+
+        Defense in depth for `docs/PHONE_BRAIN.md` reconciliation point 1. The
+        router only ever hands this class *masked* text, so this is not the
+        thing standing between the user and a leak -- but `--base-url` is a
+        plain string, and the difference between "the model runs on my phone"
+        and "the model runs on someone's server" is exactly one typo. A query
+        that leaves the device is a different privacy posture than the one this
+        project advertises, so it takes a deliberate opt-in rather than a
+        silent default.
+        """
+        import urllib.parse
+
+        host = urllib.parse.urlsplit(base_url).hostname
+        if allow_remote or host in _ON_DEVICE_HOSTS:
+            return
+        raise RemoteBrainRefused(
+            f"refusing to send queries to non-on-device host {host!r}: the mobile "
+            f"fast brain is reached over loopback (adb reverse). Pass "
+            f"allow_remote=True (or set TWO_BRAIN_PHONE_ALLOW_REMOTE=1) if the "
+            f"model really is meant to run off-device."
+        )
+
+    def _post_chat_completion(self, prompt: str) -> dict:
+        """One `POST /v1/chat/completions`, stdlib only.
+
+        `urllib` rather than `requests` on purpose: this package declares zero
+        runtime dependencies (pyproject.toml), and the phone brain's own
+        tooling is stdlib-only for the same reason.
+        """
+        import urllib.request
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self._MAX_TOKENS,
+            "temperature": self._TEMPERATURE,
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+        """Answer `masked_query`, and report how sure the model is about it.
+
+        Never raises on a transport failure. Per L_INTERFACE_CONTRACT.md's
+        error-handling section, a timeout or non-200 means "L failed" and
+        should escalate rather than block the user -- so that path returns
+        `confidence=0.0` (a definite escalate once inverted to difficulty) with
+        `error` set for the audit trail, instead of propagating an exception
+        the router would have to special-case.
+        """
+        prompt = f"{context}\n\n{masked_query}" if context else masked_query
+        start = time.perf_counter()
+        try:
+            body = self._post_chat_completion(prompt + SELF_REPORT_SUFFIX)
+            raw_text = body["choices"][0]["message"]["content"]
+        except Exception as exc:  # noqa: BLE001 -- any failure is an escalate signal
+            return BrainResponse(
+                text="",
+                latency_ms=(time.perf_counter() - start) * 1000,
+                cost_usd=0.0,
+                confidence=0.0,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        answer, confidence = parse_self_reported(raw_text)
+        return BrainResponse(
+            text=answer,
+            latency_ms=latency_ms,
+            cost_usd=0.0,
+            confidence=confidence,
+            error=(
+                None
+                if confidence is not None
+                else "no parseable CONFIDENCE line in the response"
+            ),
+        )

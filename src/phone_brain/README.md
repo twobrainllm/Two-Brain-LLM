@@ -39,7 +39,7 @@ Or run `./verify_confidence_estimator.sh` for a scripted comparison across
 all three strategies on an easy and a hard prompt — this is what
 demonstrated the actual cost tradeoff (self-consistency: fixed 3 calls
 regardless of difficulty; hybrid: 1 call on the easy prompt, 2 on the hard
-one). Once real device numbers come in from `test_phone_brain.py`, revisit
+one). Once real device numbers come in from `bench_phone_brain.py`, revisit
 which strategy is affordable.
 
 ## 1. One-time setup (dev machine)
@@ -87,14 +87,14 @@ adb shell geniex serve --bundle /data/local/tmp/genie_bundle_l --port 8000
 Against the real device once it's up:
 
 ```bash
-python test_phone_brain.py --base-url http://localhost:8000 --model llama-3.2-3b-instruct
+python bench_phone_brain.py --base-url http://localhost:8000 --model llama-3.2-3b-instruct
 ```
 
 Against the mock, right now, no device needed:
 
 ```bash
 python mock_phone_brain_server.py --port 8000 &
-python test_phone_brain.py --base-url http://localhost:8000 --model llama-3.2-3b-instruct
+python bench_phone_brain.py --base-url http://localhost:8000 --model llama-3.2-3b-instruct
 ```
 
 Check for on your S25 before moving on:

@@ -78,7 +78,7 @@ cost lands on L: **every single user query now means 2-3 sequential
 on-device inference calls before O even knows whether to escalate.** On a
 phone, that's 2-3x the latency and battery draw of a single answer, not a
 rounding error. Whether this is affordable depends entirely on L's
-measured tokens/sec on the real device (see `test_phone_brain.py`) — this
+measured tokens/sec on the real device (see `bench_phone_brain.py`) — this
 is a real number to check, not an assumption.
 
 **Option 2 — single-call self-reported confidence (chosen).**

@@ -11,10 +11,14 @@ compressed before anything crosses the device boundary.
 **Target tiers:** Mobile (Snapdragon 8 Elite, 1B model) · AI PC (Snapdragon X
 Elite, 3B model, this machine) · Cloud AI 100 (large model, escalation-only).
 
-**Docs:** [`docs/WALKTHROUGH.md`](docs/WALKTHROUGH.md) — step-by-step
-implementation walkthrough, a worked trace of a routed query, and prioritized
-next steps · [`docs/GAPS.md`](docs/GAPS.md) — the five gaps with verbatim error
-strings · [`CLAUDE.md`](CLAUDE.md) — working agreement for agents.
+**Docs:** [`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md) — how the router
+decides, and the two brains behind it ·
+[`docs/WALKTHROUGH.md`](docs/WALKTHROUGH.md) — step-by-step implementation
+walkthrough, a worked trace of a routed query, and prioritized next steps ·
+[`docs/GAPS.md`](docs/GAPS.md) — the five gaps with verbatim error strings ·
+[`docs/npu-deployment.md`](docs/npu-deployment.md) /
+[`docs/PHONE_BRAIN.md`](docs/PHONE_BRAIN.md) — the AI-PC and Mobile fast
+brains · [`CLAUDE.md`](CLAUDE.md) — working agreement for agents.
 
 ## Workflow order actually driven
 
@@ -134,6 +138,19 @@ Other entry points:
 .venv\Scripts\python.exe -m two_brain_router --query "..." --json   # one query, machine-readable
 ```
 
+Both real brains are opt-in, so the demo above runs anywhere with no hardware.
+To route against the real mobile fast brain -- no phone needed, the mock
+server speaks the same contract:
+
+```powershell
+.venv\Scripts\python.exe src\phone_brain\mock_phone_brain_server.py --port 8000
+$env:TWO_BRAIN_PHONE_BRAIN=1
+.venv\Scripts\python.exe -m two_brain_router --tier mobile
+```
+
+See [`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md) for the full env-var table
+and how the two routing paths differ.
+
 Sample output (query 3 shows the privacy guarantee end-to-end -- masked
 text is what actually leaves the device, the final answer is rehydrated):
 
@@ -167,15 +184,19 @@ two_brain_privacy_router/
       guard.py              #   PIIGuard.detect/mask/rehydrate + invariant
     signals/                # what the four QUAD tools tell the router
       loader.py             #   TierSignals: reads data/<tool>/<name>.json
-      difficulty.py         #   SEAM: swap for a real logprob/entropy signal
+      difficulty.py         #   surface-feature score (brains that don't self-rate)
+      confidence.py         #   self-report parsing + confidence -> difficulty
     routing/
       policy.py             #   RoutePolicy (thresholds, compression) + RouteDecision
-      brains.py             #   SEAM: NpuFastBrain (real, pc_3b) / LocalFastBrain (mobile stub) / CloudDeepBrain (stub)
+      brains.py             #   NpuFastBrain (real, pc_3b) / PhoneFastBrain (real, mobile)
+                            #   / LocalFastBrain (stub fallback) / CloudDeepBrain (stub)
       router.py             #   TwoBrainRouter: mask -> decide -> answer -> rehydrate
   tests/
     conftest.py             # puts src/ on sys.path (no install needed)
     test_privacy.py         # masking invariant
     test_routing.py         # routing behavior + policy
+    test_orchestrator.py    # confidence routing + PhoneFastBrain, vs a real loopback server
+    test_npu_brain.py       # real-NPU verification (skips without the hardware stack)
   data/                     # captured tool responses -- real and mocked, each logged
     hardware_detect/{ai_pc,mobile,cloud_ai100}.json
     convert_model/{mobile_1b,pc_3b,cloud_large}.json + _real_attempts_log.md
@@ -223,14 +244,15 @@ done-when criteria is in
   artifact instead of a self-compiled one); see
   `superpowers/deploy-local-brain-npu.md`. `convert_model` itself is still
   broken.
-- **The Mobile tier's real fast brain is in progress, not yet merged in.**
-  `src/phone_brain/` (branch `local_brain`) has a working Genie/QNN server
-  for Llama-3.2-3B-Instruct on a Galaxy S25 and a confidence-estimation
-  reference implementation, built as a standalone package rather than a
-  `Brain` implementation. `docs/PHONE_BRAIN.md` audits it against this
-  project's actual code and lists what has to change before it's absorbed --
-  most importantly, it currently sends the raw, unmasked query off-device
-  before any routing decision, which is not this project's privacy guarantee.
+- **The Mobile tier now has a real fast brain too (`PhoneFastBrain`)** --
+  `src/phone_brain/`'s Genie/QNN server for Llama-3.2-3B-Instruct on a Galaxy
+  S25, wired in behind the `Brain` seam over the OpenAI-shaped contract in
+  `src/phone_brain/L_INTERFACE_CONTRACT.md`. It is the first brain that
+  *self-rates*, so the mobile tier routes on the model's own confidence
+  instead of the keyword heuristic -- see
+  [`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md). Still open: the real S25
+  numbers, so `data/profile_workload/mobile_1b.json` is still a mock
+  describing a different model (`docs/PHONE_BRAIN.md` point 4).
 - **A fixed QAIRT `ReshapeOp::calculateShape`** (the uninitialized-memory
   bug found locally, gap #3b) or a fixed hosted-server install (missing
   `libpython3.10.so.1.0`, gap #3) -- either would unblock real

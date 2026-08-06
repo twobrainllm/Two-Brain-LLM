@@ -103,5 +103,5 @@ rather than working around it in O.
   end-to-end, not for predicting real accuracy or escalation rates.
 - Latency is randomly simulated (0.4–1.2s per call), not calibrated to the
   real S25's throughput.
-- Once real numbers exist from `test_phone_brain.py` on the actual device,
+- Once real numbers exist from `bench_phone_brain.py` on the actual device,
   expect to retune whatever temperature/threshold values you land on now.

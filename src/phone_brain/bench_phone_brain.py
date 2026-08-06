@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_phone_brain.py
+bench_phone_brain.py
 
 Smoke-tests the on-device "L" (fast brain) model once it's being served
 locally on the phone via an OpenAI-compatible endpoint (e.g. GenieX's
@@ -14,7 +14,7 @@ Typical setup before running this:
 
 Then from your dev machine:
 
-    python test_phone_brain.py --base-url http://localhost:8000 \
+    python bench_phone_brain.py --base-url http://localhost:8000 \
         --model llama-3.2-3b-instruct
 
 It sends a small battery of prompts spanning easy / medium / hard

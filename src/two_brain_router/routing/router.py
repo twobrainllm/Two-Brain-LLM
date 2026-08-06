@@ -10,6 +10,13 @@ The ordering here is the privacy guarantee, and it is deliberate:
 
 Only masked text ever reaches `CloudDeepBrain`. The vault never leaves this
 process.
+
+Step 3 has two shapes, depending on what the tier's fast brain can tell us --
+see `docs/ORCHESTRATOR.md`. When the brain self-rates
+(`Brain.reports_confidence`), its confidence *is* the difficulty signal and
+arrives attached to the answer, so the brain has to be asked before the
+decision instead of after it. Masking still happens first either way: step 1
+is ahead of step 3 in both shapes, which is the invariant that matters.
 """
 from __future__ import annotations
 
@@ -17,9 +24,17 @@ import os
 from typing import Literal
 
 from two_brain_router.privacy import MaskResult, PIIGuard, assert_masked_token_invariant
-from two_brain_router.routing.brains import Brain, CloudDeepBrain, LocalFastBrain, NpuFastBrain
+from two_brain_router.routing.brains import (
+    Brain,
+    BrainResponse,
+    CloudDeepBrain,
+    LocalFastBrain,
+    NpuFastBrain,
+    PhoneFastBrain,
+)
 from two_brain_router.routing.policy import RouteDecision, RoutePolicy
 from two_brain_router.signals import DifficultyEstimator, TierSignals
+from two_brain_router.signals.confidence import confidence_to_difficulty
 
 Tier = Literal["mobile", "pc"]
 
@@ -30,17 +45,45 @@ _TIER_FILES: dict[str, tuple[str, str]] = {
     "pc": ("ai_pc", "pc_3b"),
 }
 
-#: Opt-in switch for the real on-device NPU brain (pc tier only -- mobile
-#: stays a stub, see brains.py). Unset by default so the base package's test
-#: suite and CLI demo stay stdlib-only and fast; set to "1" from the
-#: .venv-npu environment that actually has the runtime + hardware for it
-#: (see superpowers/deploy-local-brain-npu.md Phase 1).
+#: Opt-in switch for the real on-device NPU brain (pc tier). Unset by default
+#: so the base package's test suite and CLI demo stay stdlib-only and fast;
+#: set to "1" from the .venv-npu environment that actually has the runtime +
+#: hardware for it (see superpowers/deploy-local-brain-npu.md Phase 1).
 _NPU_BRAIN_ENV_VAR = "TWO_BRAIN_NPU_BRAIN"
+
+#: Opt-in switch for the real phone fast brain (mobile tier), plus where to
+#: reach it. Same rationale as the NPU switch: unset by default so nothing in
+#: the base suite depends on a served endpoint being up. The URL defaults to
+#: the `adb reverse` loopback address from L_INTERFACE_CONTRACT.md.
+_PHONE_BRAIN_ENV_VAR = "TWO_BRAIN_PHONE_BRAIN"
+_PHONE_URL_ENV_VAR = "TWO_BRAIN_PHONE_URL"
+_PHONE_MODEL_ENV_VAR = "TWO_BRAIN_PHONE_MODEL"
+#: Escape hatch for PhoneFastBrain's on-device host check. Deliberately
+#: separate from the enable switch so pointing the brain off-device is always
+#: a distinct, deliberate act.
+_PHONE_ALLOW_REMOTE_ENV_VAR = "TWO_BRAIN_PHONE_ALLOW_REMOTE"
+
+#: `RoutePolicy.should_escalate` ORs a difficulty test with a latency test.
+#: The confidence path has to evaluate those two at *different moments* -- the
+#: budget before spending an inference, the difficulty only after the brain has
+#: answered -- so each call passes a neutral value for the term it is not
+#: asking about. Doing it this way keeps `policy.py` pure and unmodified, which
+#: WALKTHROUGH next-step #4 asked for explicitly.
+_NO_DIFFICULTY_SIGNAL_YET = 0.0
+_BUDGET_ALREADY_CHECKED = 0.0
 
 
 def _build_fast_brain(tier: Tier, signals: TierSignals) -> Brain:
     if tier == "pc" and os.environ.get(_NPU_BRAIN_ENV_VAR) == "1":
         return NpuFastBrain(tier, signals)
+    if tier == "mobile" and os.environ.get(_PHONE_BRAIN_ENV_VAR) == "1":
+        return PhoneFastBrain(
+            tier,
+            signals,
+            base_url=os.environ.get(_PHONE_URL_ENV_VAR),
+            model=os.environ.get(_PHONE_MODEL_ENV_VAR),
+            allow_remote=os.environ.get(_PHONE_ALLOW_REMOTE_ENV_VAR) == "1",
+        )
     return LocalFastBrain(tier, signals)
 
 
@@ -75,9 +118,14 @@ class TwoBrainRouter:
             )
 
         # 3. Decide.
-        difficulty = self.difficulty.score(query)
         local_latency_est = self.policy.estimate_local_latency_ms(self.local.profile, query)
 
+        if self.fast_brain.reports_confidence:
+            return self._route_on_confidence(
+                guard, masked_query_result, query, context, local_latency_est, notes
+            )
+
+        difficulty = self.difficulty.score(query)
         if self.policy.should_escalate(difficulty, local_latency_est):
             notes.append(self.policy.escalation_note(difficulty, local_latency_est))
             return self._escalate(guard, masked_query_result, context, difficulty, notes)
@@ -85,14 +133,89 @@ class TwoBrainRouter:
         notes.append(self.policy.local_note(difficulty, local_latency_est))
         return self._answer_locally(guard, masked_query_result, difficulty, notes)
 
+    def _route_on_confidence(
+        self,
+        guard: PIIGuard,
+        masked_query: MaskResult,
+        query: str,
+        context: str,
+        local_latency_est: float,
+        notes: list[str],
+    ) -> RouteDecision:
+        """Ask the fast brain first, then route on the confidence it returns.
+
+        Used when the tier's brain self-rates. The answer and the confidence
+        arrive together (one inference, not two -- see
+        `signals/confidence.py`), which means the brain is asked *before* the
+        local-vs-cloud decision and its answer is discarded if the decision
+        goes to the cloud. That cost is the accepted trade for a real signal
+        instead of a keyword heuristic.
+
+        Two details that are easy to get wrong, both load-bearing:
+
+        - **The latency budget is checked before the call, not after.** Its job
+          is to avoid *starting* a local inference that cannot finish in time.
+          Re-applying it once the answer is already in hand would be actively
+          harmful: escalating at that point adds the cloud's latency on top of
+          the local time already spent, so it can only make the total worse.
+        - **Masking still happens first.** This runs after step 1-2 in
+          `route()`, so the brain -- which for the mobile tier is a *separate
+          device* over HTTP -- only ever sees masked text.
+        """
+        if self.policy.should_escalate(_NO_DIFFICULTY_SIGNAL_YET, local_latency_est):
+            difficulty = self.difficulty.score(query)
+            notes.append(
+                f"skipped the fast brain: its profiled latency estimate "
+                f"({local_latency_est:.0f}ms) already exceeds the "
+                f"{self.policy.local_latency_budget_ms:.0f}ms budget, so a local "
+                f"answer would have been discarded anyway"
+            )
+            notes.append(self.policy.escalation_note(difficulty, local_latency_est))
+            return self._escalate(guard, masked_query, context, difficulty, notes)
+
+        local = self.fast_brain.answer(masked_query.masked_text)
+        if local.error:
+            notes.append(f"fast brain reported a problem: {local.error}")
+
+        if local.confidence is None:
+            difficulty = self.difficulty.score(query)
+            notes.append(
+                "no usable confidence signal -- fell back to the surface-feature heuristic"
+            )
+        else:
+            difficulty = confidence_to_difficulty(local.confidence)
+            notes.append(
+                f"fast brain self-reported confidence={local.confidence:.2f} "
+                f"-> difficulty={difficulty:.2f}"
+            )
+
+        if self.policy.should_escalate(difficulty, _BUDGET_ALREADY_CHECKED):
+            # Not `policy.escalation_note`: that one describes both terms of the
+            # OR, and quoting a latency-vs-budget comparison here would be
+            # misleading -- the budget was settled before the call and cannot be
+            # what fired.
+            notes.append(
+                f"escalating: difficulty={difficulty:.2f} >= threshold "
+                f"{self.policy.escalate_threshold} "
+                f"(the local answer took {local.latency_ms:.0f}ms and was not used)"
+            )
+            return self._escalate(guard, masked_query, context, difficulty, notes, discarded=local)
+
+        notes.append(self.policy.local_note(difficulty, local.latency_ms))
+        return self._answer_locally(guard, masked_query, difficulty, notes, response=local)
+
     def _answer_locally(
         self,
         guard: PIIGuard,
         masked_query: MaskResult,
         difficulty: float,
         notes: list[str],
+        response: BrainResponse | None = None,
     ) -> RouteDecision:
-        response = self.fast_brain.answer(masked_query.masked_text)
+        # `response` is already populated on the confidence path -- reusing it
+        # is what keeps that path to a single inference call.
+        if response is None:
+            response = self.fast_brain.answer(masked_query.masked_text)
         return RouteDecision(
             tier_answered="local",
             difficulty_score=difficulty,
@@ -110,6 +233,7 @@ class TwoBrainRouter:
         context: str,
         difficulty: float,
         notes: list[str],
+        discarded: BrainResponse | None = None,
     ) -> RouteDecision:
         # 4. Context crosses the boundary too, so it is masked and compressed.
         masked_context = guard.mask(context) if context else MaskResult(masked_text="", vault={})
@@ -124,11 +248,23 @@ class TwoBrainRouter:
             notes.append(f"sent off-device (masked): {masked_query.masked_text!r}")
 
         response = self.deep_brain.answer(masked_query.masked_text, compressed)
+
+        # A speculative local answer that lost is still time the user waited
+        # for, so the reported latency includes it. Hiding it would make the
+        # confidence path look free when it is not.
+        est_latency_ms = response.latency_ms
+        if discarded is not None:
+            est_latency_ms += discarded.latency_ms
+            notes.append(
+                f"discarded the local answer after {discarded.latency_ms:.0f}ms; "
+                f"reported latency includes it"
+            )
+
         # 5. Rehydrate only now, on-device, after the answer is back.
         return RouteDecision(
             tier_answered="cloud",
             difficulty_score=difficulty,
-            est_latency_ms=response.latency_ms,
+            est_latency_ms=est_latency_ms,
             est_cost_usd=response.cost_usd,
             pii_entities_masked=len(masked_query.vault),
             answer=guard.rehydrate(response.text, vault),

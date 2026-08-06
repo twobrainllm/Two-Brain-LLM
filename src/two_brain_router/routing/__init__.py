@@ -7,6 +7,8 @@ from two_brain_router.routing.brains import (
     CloudDeepBrain,
     LocalFastBrain,
     NpuFastBrain,
+    PhoneFastBrain,
+    RemoteBrainRefused,
 )
 from two_brain_router.routing.policy import RouteDecision, RoutePolicy
 from two_brain_router.routing.router import Tier, TwoBrainRouter
@@ -17,6 +19,8 @@ __all__ = [
     "CloudDeepBrain",
     "LocalFastBrain",
     "NpuFastBrain",
+    "PhoneFastBrain",
+    "RemoteBrainRefused",
     "RouteDecision",
     "RoutePolicy",
     "Tier",

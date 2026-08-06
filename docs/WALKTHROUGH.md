@@ -351,14 +351,21 @@ changed — the seam held. `tests/test_npu_brain.py` has the Phase 6
 verification suite (skips without the real runtime/artifact, passes for
 real under `.venv-npu`).
 
-**This closes the AI-PC tier only.** The Mobile tier's fast brain is a
-separate, still-open effort — `src/phone_brain/` on branch `local_brain`
-has a working Genie/QNN server for Llama-3.2-3B-Instruct on a Galaxy S25,
-but it isn't wired into `Brain`/`TwoBrainRouter` yet and has real issues to
-resolve first (it currently sends the raw, unmasked query off-device before
-any routing decision). See `docs/PHONE_BRAIN.md`.
+**The Mobile tier is closed too, on branch `js/orchestrator`.**
+`PhoneFastBrain` wires `src/phone_brain/`'s Genie/QNN server for
+Llama-3.2-3B-Instruct on a Galaxy S25 in behind the same `Brain` seam, over
+the OpenAI-shaped contract in `src/phone_brain/L_INTERFACE_CONTRACT.md`.
+Enabled with `TWO_BRAIN_PHONE_BRAIN=1`; testable against the mock server with
+no phone attached. See [`ORCHESTRATOR.md`](ORCHESTRATOR.md) and
+[`PHONE_BRAIN.md`](PHONE_BRAIN.md).
 
-### 4. Replace the difficulty heuristic with a real confidence signal (P2 — depends on 3)
+What's still mocked for mobile is the *fixture*, not the brain:
+`data/profile_workload/mobile_1b.json` still describes Qwen2.5-1.5B int4
+rather than the Llama-3.2-3B w4a16 that actually runs, so the latency budget
+pre-check reasons about the wrong model until a real `bench_phone_brain.py`
+run against an S25 replaces it.
+
+### 4. Replace the difficulty heuristic with a real confidence signal (P2 — depends on 3) — DONE for mobile
 
 Once the fast brain runs, `DifficultyEstimator.score()` becomes obsolete:
 escalate on the fast brain's own logprob entropy or margin instead of on the
@@ -366,6 +373,26 @@ presence of the word "derive". Keep the `score(query) -> float` signature so
 `policy.py` is untouched. This is the single biggest quality improvement
 available — surface features misfire in both directions (the demo's query 3
 scores 0.40 for a genuinely easy request).
+
+**Done for the mobile tier** via `signals/confidence.py` — not logprobs
+(unavailable, and `L_INTERFACE_CONTRACT.md` says explicitly not to depend on
+them) but the model's own self-reported confidence, inverted into the same
+difficulty scale so `policy.py` really is untouched, exactly as this item
+asked. The predicted misfire is now observable: with a real signal, demo
+query 3 scores **0.08** and stays on-device, where the heuristic escalated it.
+
+Two follow-ups this opened rather than closed:
+
+- **The AI PC tier still uses the heuristic.** `NpuFastBrain` doesn't
+  self-rate — Genie exposes no logprobs through its C API, and adding a
+  self-report suffix would change the prompt `data/profile_workload/pc_3b.json`
+  was measured against. Giving it the confidence path is a prompt change plus
+  a re-profile, not a router change.
+- **Calibration is unverified on real hardware.** Self-reported confidence is
+  not guaranteed well-calibrated; the mock always emits a number by
+  construction, so only a real S25 run can show whether it tracks correctness.
+  `confidence_estimator.py`'s `hybrid()` is the documented fallback and would
+  be a `signals/confidence.py`-only change.
 
 ### 5. Compress context with the fast brain instead of truncating (P2 — depends on 3)
 
