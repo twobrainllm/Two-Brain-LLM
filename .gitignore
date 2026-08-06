@@ -21,3 +21,19 @@ htmlcov/
 
 # Secrets -- never commit
 .env
+
+# NPU deployment work (superpowers/deploy-local-brain-npu.md)
+# Dedicated ARM64 runtime venv -- keep separate from the router's own
+# stdlib-only .venv (see run.ps1); not vendored.
+.venv-npu/
+# Model artifacts are large binaries fetched from public URLs, not vendored --
+# the _real_*_log.md receipt in each data/npu_model/<model>/ dir documents
+# exactly what was downloaded, from where, and with what checksum, so the
+# fetch is reproducible without committing gigabytes of weights.
+data/npu_model/**/raw/
+data/npu_model/**/*.zip
+data/npu_model/**/*.bin
+data/npu_model/**/*.dll
+data/npu_model/**/*.so
+data/npu_model/**/*.cat
+data/npu_model/**/*.onnx

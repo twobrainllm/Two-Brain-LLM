@@ -13,10 +13,11 @@ process.
 """
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 from two_brain_router.privacy import MaskResult, PIIGuard, assert_masked_token_invariant
-from two_brain_router.routing.brains import CloudDeepBrain, LocalFastBrain
+from two_brain_router.routing.brains import Brain, CloudDeepBrain, LocalFastBrain, NpuFastBrain
 from two_brain_router.routing.policy import RouteDecision, RoutePolicy
 from two_brain_router.signals import DifficultyEstimator, TierSignals
 
@@ -28,6 +29,19 @@ _TIER_FILES: dict[str, tuple[str, str]] = {
     "mobile": ("mobile", "mobile_1b"),
     "pc": ("ai_pc", "pc_3b"),
 }
+
+#: Opt-in switch for the real on-device NPU brain (pc tier only -- mobile
+#: stays a stub, see brains.py). Unset by default so the base package's test
+#: suite and CLI demo stay stdlib-only and fast; set to "1" from the
+#: .venv-npu environment that actually has the runtime + hardware for it
+#: (see superpowers/deploy-local-brain-npu.md Phase 1).
+_NPU_BRAIN_ENV_VAR = "TWO_BRAIN_NPU_BRAIN"
+
+
+def _build_fast_brain(tier: Tier, signals: TierSignals) -> Brain:
+    if tier == "pc" and os.environ.get(_NPU_BRAIN_ENV_VAR) == "1":
+        return NpuFastBrain(tier, signals)
+    return LocalFastBrain(tier, signals)
 
 
 class TwoBrainRouter:
@@ -43,7 +57,7 @@ class TwoBrainRouter:
         self.local = TierSignals.load(tier_name, hw_file)
         self.cloud = TierSignals.load("cloud_large", "cloud_ai100")
         self.difficulty = DifficultyEstimator()
-        self.fast_brain = LocalFastBrain(tier, self.local)
+        self.fast_brain = _build_fast_brain(tier, self.local)
         self.deep_brain = CloudDeepBrain(self.cloud)
 
     def route(self, query: str, context: str = "") -> RouteDecision:
