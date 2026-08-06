@@ -90,7 +90,9 @@ Three details in Shape B are load-bearing:
 
 - **`None`** — the model ignored the `CONFIDENCE:` output format. A real,
   expected failure mode of a small quantized model (`PHONE_DEPLOYMENT_GUIDE.md`
-  Part 8). O does **not** fall back to a different signal (the surface-feature
+  Part 8), and observed on the AI PC tier too: one of eight real queries came
+  back `'Jane Austen, 95'`, the number supplied but the label dropped. O does
+  **not** fall back to a different signal (the surface-feature
   heuristic) for this — it treats "no number" as `difficulty = 1.0`, maximally
   uncertain, and says so in the notes. A brain that formats badly is not the
   same claim as "the surface features say this is hard"; conflating the two
@@ -156,15 +158,43 @@ constructing a router directly should too.
 
 | Tier | Fast brain | "Not confident" goes to | Transport | Self-rates? | Difficulty signal |
 |---|---|---|---|---|---|
-| AI PC (`pc_3b`) | `NpuFastBrain` — Phi-3.5-mini-instruct on Hexagon NPU | Cloud (Shape A has no escalation brain) | in-process `ctypes`/Genie | No | surface-feature heuristic |
+| AI PC (`pc_3b`) | `NpuFastBrain` — Phi-3.5-mini-instruct on Hexagon NPU | Cloud (no escalation brain on this tier) | in-process `ctypes`/Genie | **Yes** | model's own self-report |
 | Mobile (`mobile_1b`) | `PhoneFastBrain` — Llama-3.2-3B on a Galaxy S25 | **The AI PC's `NpuFastBrain`** (if `TWO_BRAIN_NPU_BRAIN=1`), else cloud | HTTP to loopback (`adb reverse`) | **Yes** | model's own self-report |
 | Cloud | `CloudDeepBrain` (stub) | — | — | No | n/a — escalation target |
 
-`NpuFastBrain` does not self-rate for two concrete reasons: Genie exposes no
-logprobs through the C API it uses, and adding a self-report suffix would
-change the prompt that the real numbers in `data/profile_workload/pc_3b.json`
-were measured against. Giving it Shape B is a real option — it needs a
-prompt change plus a re-profile, not a router change.
+`NpuFastBrain` self-rates as of the Shape B change. As predicted, that took a
+prompt change plus a re-profile and **no** router change — `route()`,
+`policy.py`, and `signals/confidence.py` were untouched; only `brains.py` and
+`data/profile_workload/pc_3b.json` moved. `LocalFastBrain` and `CloudDeepBrain`
+still use Shape A, so `signals/difficulty.py` remains the signal for the default
+stdlib-only path.
+
+Two honest caveats, both measured rather than assumed (receipts:
+`data/npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md`, Attempt 5):
+
+- **It is a prompted self-report, not a logprob.** Genie still exposes no token
+  probabilities through the C API this brain uses. The number is the model's own
+  claim about itself.
+- **Its discrimination is weak.** Across 8 real queries the parsed values were
+  0.85–1.00 — a merge-sort derivation self-rated the same 0.95 as "What is the
+  capital of France?". Inverted, that is difficulty 0.00–0.15, all far below the
+  0.55 threshold, so in practice this tier's escalations are driven almost
+  entirely by the latency budget pre-check rather than by the confidence. The
+  signal reliably separates "produced a number" from "didn't"; it does not yet
+  separate easy from hard. This is the calibration risk `WALKTHROUGH.md`
+  next-step #4(b) flagged, now confirmed on real hardware instead of predicted.
+
+The threshold was deliberately **not** retuned to compensate. Moving it to fit
+seven samples of a weak signal would hide the finding rather than fix it.
+
+Getting the prompt to behave was itself measured, not guessed. Left alone the
+model emits the answer, the `CONFIDENCE:` line, and then paragraphs of
+unrequested rationale until the token cap — tripling latency and leaving
+truncated prose in the answer. `NpuFastBrain._STOP_SEQUENCES` therefore includes
+`"\n\n"`, which is safe only because `_render_prompt`'s system message forbids
+blank lines inside the reply; a blank line can then only follow the confidence
+number. Asking the model to lead with the confidence was faster still but
+sometimes returned a number and **no answer at all**, so it was rejected.
 
 ---
 

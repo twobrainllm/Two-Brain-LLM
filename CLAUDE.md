@@ -74,11 +74,24 @@ captures. Full build history, real bugs found and fixed, and every receipt:
 (the finished version) and [`docs/npu-deployment.md`](docs/npu-deployment.md)
 (short architecture summary). See also [next step #3](docs/WALKTHROUGH.md#next-steps).
 
+**`NpuFastBrain` now self-rates as well** (Shape B), so the AI PC tier routes on
+the model's own confidence rather than the keyword heuristic. As
+`ORCHESTRATOR.md` predicted, this needed a prompt change plus a re-profile and
+**no** router change — `route()` and `policy.py` were untouched. Three real
+defects turned up while getting there and are fixed and logged in
+`data/npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md` (Attempt 5):
+`_check` treated Genie *warnings* as fatal (so the class's own token cap crashed
+the call it was meant to truncate), `close()` was not idempotent (double-free
+corrupting the next session), and `genie-t2t-run.exe` hits Windows MAX_PATH in a
+deep checkout. **Read Attempt 5's calibration finding before trusting this
+tier's confidence number** — it separates "answered" from "didn't", not easy
+from hard.
+
 **The Mobile tier's fast-brain seam is closed too**, on branch
 `js/orchestrator`. `PhoneFastBrain` (`routing/brains.py`) speaks the
 OpenAI-shaped contract in `src/phone_brain/L_INTERFACE_CONTRACT.md` and is
-wired into `TwoBrainRouter` behind `TWO_BRAIN_PHONE_BRAIN=1`. It is the first
-brain that **self-rates**, which flips the order of the routing decision —
+wired into `TwoBrainRouter` behind `TWO_BRAIN_PHONE_BRAIN=1`. It was the first
+brain to **self-rate**, which flips the order of the routing decision —
 read **[`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md)** before changing
 `route()`; it explains the two decision shapes and why the latency budget is
 checked before the call and never after.
@@ -175,7 +188,9 @@ behind its own env var. Don't split it into a `routing/brains/` subpackage —
 that was proposed once and the codebase went the other way.
 
 `signals/difficulty.py` (the surface-feature heuristic) is still the signal for
-any brain with `reports_confidence = False`, so it is not dead code. **It is
+any brain with `reports_confidence = False`, so it is not dead code — but that
+set is now **only the stubs** (`LocalFastBrain`, `CloudDeepBrain`), i.e. the
+default stdlib-only path. Both real brains self-rate. **It is
 no longer the fallback for an unparseable confidence** — that used to be true
 but isn't any more: `route()`'s confidence path now treats "no parseable
 number" the same as "definitely not confident" (`difficulty = 1.0`), not a

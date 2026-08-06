@@ -65,9 +65,9 @@ Qualcomm's own pre-built Genie/QNN artifact for Phi-3.5-mini-instruct,
 downloaded from Hugging Face and run for real on this machine's Hexagon
 NPU. See [`superpowers/deploy-local-brain-npu.md`](superpowers/deploy-local-brain-npu.md)
 for the full workflow and `data/npu_model/phi-3.5-mini-instruct/` for the
-receipts -- real per-token latency (~94.5 ms/token, ~2.1x slower than the
-old mock's guess), real `QnnGraph_execute` HTP-execution evidence, and a
-real QNN profiler capture.
+receipts -- real per-token latency (~74.2 ms/token, ~13.5 tok/s, re-measured
+across 8 queries through the brain itself), real `QnnGraph_execute`
+HTP-execution evidence, and a real QNN profiler capture.
 
 **Mobile hardware_detect:** `adb` was missing entirely (installed Android
 SDK platform-tools mid-session after winget's own package failed a hash
@@ -158,7 +158,7 @@ text is what actually leaves the device, the final answer is rehydrated):
 > My email is jane.doe@example.com and my phone is 555-123-4567 -- can you draft a reply telling the sender their SSN 123-45-6789 was found in an old backup and needs to be rotated?
   routed to: cloud | difficulty=0.40 | est_latency_ms=1159 | est_cost_usd=0.11520
   - masked 3 PII entities before any routing decision
-  - escalating: difficulty=0.40 (threshold 0.55) or local_latency_est=6190ms > budget 3000ms
+  - escalating: difficulty=0.40 (threshold 0.55) or local_latency_est=4855ms > budget 3000ms
   - sent off-device (masked): 'My email is [PII_EMAIL_1] and my phone is [PII_PHONE_1] -- can you draft a reply telling the sender their SSN [PII_SSN_1] was found in an old backup and needs to be rotated?'
   answer: [cloud:ai100 mock deep-brain response to: 'My email is jane.doe@example.com and my phone is 555-123-4567 -- can you draft a reply telling the sender their SSN 123-45-6789 was found in an old backup and needs to be rotated?' | context_used='']
 ```
@@ -243,12 +243,15 @@ done-when criteria is in
   routing around `convert_model` entirely (Qualcomm's pre-built Genie/QNN
   artifact instead of a self-compiled one); see
   `superpowers/deploy-local-brain-npu.md`. `convert_model` itself is still
-  broken.
+  broken. It **self-rates** as of the Shape B change, so this tier routes on
+  the model's own confidence rather than the keyword heuristic -- with a
+  measured caveat that the number's discrimination is weak, recorded in
+  [`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md) rather than tuned away.
 - **The Mobile tier now has a real fast brain too (`PhoneFastBrain`)** --
   `src/phone_brain/`'s Genie/QNN server for Llama-3.2-3B-Instruct on a Galaxy
   S25, wired in behind the `Brain` seam over the OpenAI-shaped contract in
-  `src/phone_brain/L_INTERFACE_CONTRACT.md`. It is the first brain that
-  *self-rates*, so the mobile tier routes on the model's own confidence
+  `src/phone_brain/L_INTERFACE_CONTRACT.md`. It was the first brain to
+  *self-rate*, so the mobile tier routes on the model's own confidence
   instead of the keyword heuristic -- see
   [`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md). Still open: the real S25
   numbers, so `data/profile_workload/mobile_1b.json` is still a mock

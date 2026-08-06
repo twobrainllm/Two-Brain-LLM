@@ -381,18 +381,29 @@ difficulty scale so `policy.py` really is untouched, exactly as this item
 asked. The predicted misfire is now observable: with a real signal, demo
 query 3 scores **0.08** and stays on-device, where the heuristic escalated it.
 
-Two follow-ups this opened rather than closed:
+Two follow-ups this opened. The first is now closed; the second got *worse* news
+than expected:
 
-- **The AI PC tier still uses the heuristic.** `NpuFastBrain` doesn't
-  self-rate — Genie exposes no logprobs through its C API, and adding a
-  self-report suffix would change the prompt `data/profile_workload/pc_3b.json`
-  was measured against. Giving it the confidence path is a prompt change plus
-  a re-profile, not a router change.
-- **Calibration is unverified on real hardware.** Self-reported confidence is
-  not guaranteed well-calibrated; the mock always emits a number by
-  construction, so only a real S25 run can show whether it tracks correctness.
-  `confidence_estimator.py`'s `hybrid()` is the documented fallback and would
-  be a `signals/confidence.py`-only change.
+- ~~**The AI PC tier still uses the heuristic.**~~ **DONE.** `NpuFastBrain` now
+  self-rates too. It cost exactly what was predicted — a prompt change plus a
+  re-profile, no router change (`route()` and `policy.py` untouched; only
+  `brains.py` and `data/profile_workload/pc_3b.json` moved). Both real brains
+  are now Shape B, so `DifficultyEstimator` is the signal only for the stub
+  brains, i.e. the default stdlib-only path. Receipts, including three real
+  defects found and fixed on the way:
+  `data/npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md` Attempt 5.
+- **Calibration is unverified on real hardware** — now **partly verified, and
+  the answer is not encouraging.** On the AI PC tier, across 8 real queries the
+  self-report came back 0.85–1.00 with one unparseable: a merge-sort derivation
+  rated itself the same 0.95 as "What is the capital of France?". Inverted, that
+  is difficulty 0.00–0.15, all far under the 0.55 threshold — so this tier's
+  escalations are in practice decided by the latency budget pre-check, not by
+  the confidence. The signal reliably separates "produced a number" from
+  "didn't"; it does not yet separate easy from hard, which is most of what this
+  item was after. The threshold was deliberately not retuned to compensate.
+  `confidence_estimator.py`'s `hybrid()` remains the documented fallback and is
+  still a `signals/confidence.py`-only change. The **mobile** tier's calibration
+  is still unverified — that needs the real S25.
 
 ### 5. Compress context with the fast brain instead of truncating (P2 — depends on 3)
 

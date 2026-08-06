@@ -13,11 +13,14 @@ Run with:
 """
 from __future__ import annotations
 
+import contextlib
 import glob
 import os
 import subprocess
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
@@ -65,6 +68,47 @@ def _find_genie_cli() -> str | None:
     return candidates[-1] if candidates else None
 
 
+#: Windows' classic path ceiling. `genie-t2t-run.exe` (QAIRT 2.38) is not
+#: manifested long-path-aware, so it resolves the relative `ctx-bins` names in
+#: genie_config.json through the MAX_PATH-limited API and fails with
+#: `NSPModel: Can't access model file : ...` when the checkout sits deep enough
+#: that artifact_dir + filename exceeds this -- even with the machine-wide
+#: LongPathsEnabled=1 registry flag set. `NpuFastBrain` itself is unaffected
+#: (Python *is* long-path aware, and it passes absolute paths), which is why
+#: only this CLI-based test hits it.
+_MAX_PATH = 260
+
+
+@contextlib.contextmanager
+def _short_path_to(directory: Path):
+    """Yield a path to `directory` that is short enough for a non-long-path-aware
+    exe, via a temporary junction when the real one is too long.
+
+    A junction (`mklink /J`) rather than a symlink: it needs no elevation and no
+    Developer Mode. Skipping instead would quietly drop the only automatable
+    on-HTP execution receipt this suite has, purely because of where the repo
+    was cloned.
+    """
+    longest = max((len(f.name) for f in directory.iterdir()), default=0)
+    if len(str(directory)) + 1 + longest < _MAX_PATH:
+        yield directory
+        return
+
+    link = Path(tempfile.gettempdir()) / f"tbnpu{os.getpid()}"
+    if link.exists():
+        link.unlink()
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(directory)],
+        check=True,
+        capture_output=True,
+    )
+    try:
+        yield link
+    finally:
+        # rmdir removes the junction itself, never the files it points at.
+        subprocess.run(["cmd", "/c", "rmdir", str(link)], capture_output=True)
+
+
 @pytest.fixture
 def npu_brain():
     """Function-scoped, not module-scoped: a real run showed a second live
@@ -99,6 +143,30 @@ def test_real_inference_smoke(npu_brain):
     assert response.cost_usd == 0.0
 
 
+def test_self_reported_confidence_is_parsed_and_stripped(npu_brain):
+    """The real model emits a usable `CONFIDENCE:` number for an easy factual
+    query, and it is removed from the answer the user sees.
+
+    This is what makes the AI PC tier route on Shape B at all -- if the number
+    stops parsing, `route()` treats the query as maximally uncertain and
+    escalates everything, which is safe but silently useless. Asserted against
+    an easy question because the interesting failure is "no number", not "a low
+    number"; calibration is a separate, still-open question (see the Attempt 5
+    calibration note in _real_inference_smoke_log.md)."""
+    assert npu_brain.reports_confidence is True
+
+    response = npu_brain.answer("What is the capital of France?")
+
+    assert response.confidence is not None, (
+        f"no parseable CONFIDENCE line -- raw text was {response.text!r}"
+    )
+    assert 0.0 <= response.confidence <= 1.0
+    assert response.error is None
+    # The self-report is routing metadata, not part of the answer.
+    assert "CONFIDENCE" not in response.text.upper()
+    assert response.text.strip()
+
+
 def test_npu_ep_assignment():
     """Inference nodes ran on the QnnHtp (Hexagon NPU) backend, not a CPU
     fallback -- verified from Genie's own real execution log. This is the
@@ -116,24 +184,28 @@ def test_npu_ep_assignment():
     env = dict(os.environ)
     env["PATH"] = os.pathsep.join([lib_dir, cli_dir, env.get("PATH", "")])
 
-    sample_prompt = _NPU_ARTIFACT_DIR / "sample_prompt.txt"
-    result = subprocess.run(
-        [
-            genie_cli,
-            "-c", "genie_config.json",
-            "--prompt_file", str(sample_prompt),
-            "--log", "info",
-            "--action", "ABORT",
-            "--sleep", "5000",
-        ],
-        cwd=str(_NPU_ARTIFACT_DIR),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
+    with _short_path_to(_NPU_ARTIFACT_DIR) as artifact_dir:
+        result = subprocess.run(
+            [
+                genie_cli,
+                "-c", "genie_config.json",
+                "--prompt_file", str(artifact_dir / "sample_prompt.txt"),
+                "--log", "info",
+                "--action", "ABORT",
+                "--sleep", "5000",
+            ],
+            cwd=str(artifact_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
 
     log = result.stdout + result.stderr
+    assert "Can't access model file" not in log, (
+        "Genie could not open the weight binaries -- if this is a long path, "
+        "_short_path_to did not shorten it enough"
+    )
     assert "QnnGraph_execute started" in log
     assert "QnnGraph_execute done" in log
     assert "QnnHtp" in log

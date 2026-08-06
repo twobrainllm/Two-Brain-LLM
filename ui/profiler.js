@@ -51,8 +51,11 @@ function detectPII(text) {
 const PROFILE = {
   local: {
     source: "data/profile_workload/pc_3b.json",
-    ttftMeanMs: 142,
-    perTokenMeanMs: 94.5,
+    // Re-ported after the Shape B re-profile (n=8 through NpuFastBrain itself).
+    // Previously 142 / 94.5, measured on a different prompt and a runaway
+    // generation that drifted into larger context buckets.
+    ttftMeanMs: 105.9,
+    perTokenMeanMs: 74.2,
     tokenCostUsdPer1k: 0.0,
   },
   cloud: {

@@ -199,15 +199,37 @@ class NpuFastBrain:
     an explicit stop sequence and additionally bounds output length itself.
     """
 
-    #: This model is not asked to self-rate. Genie exposes no logprobs through
-    #: the C API used here, and a self-report suffix would change the prompt
-    #: the real numbers in data/profile_workload/pc_3b.json were measured
-    #: against. The router therefore keeps scoring difficulty itself for this
-    #: tier -- see docs/ORCHESTRATOR.md's "per-tier signal" table.
-    reports_confidence = False
+    #: This model self-rates: it answers and reports its own confidence in one
+    #: call, so the router uses that number as the difficulty signal instead of
+    #: `signals/difficulty.py`'s surface-feature heuristic (Shape B --
+    #: docs/ORCHESTRATOR.md). Same mechanism as `PhoneFastBrain`, so both real
+    #: brains report the same way and `routing/policy.py` stays untouched.
+    #:
+    #: Honest caveat: this is a *prompted self-report*, not a logprob. Genie
+    #: still exposes no token probabilities through the C API used here, so the
+    #: number is the model's own claim about itself. Measured discrimination on
+    #: this artifact is weak -- see the calibration note in
+    #: data/npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md
+    #: (Attempt 5); it separates "can't answer" from "can", not easy from hard.
+    reports_confidence = True
 
-    _MAX_NEW_TOKENS = 48
-    _STOP_SEQUENCES = ["<|end|>", "<|user|>", "<|system|>"]
+    #: Raised from 48 when the self-report was added: the answer *plus* the
+    #: `CONFIDENCE:` line has to fit, and a cap that truncates the line away
+    #: silently turns every query into an escalation. This is a runaway guard,
+    #: not a target -- measured answers land well under it (mean ~1.8s / query,
+    #: Attempt 5), because `_STOP_SEQUENCES` ends generation first.
+    _MAX_NEW_TOKENS = 96
+
+    #: `"\n\n"` is load-bearing, not cosmetic. Left to itself this model emits
+    #: the answer, the `CONFIDENCE:` line, a blank line, and then paragraphs of
+    #: unasked-for rationale until the token cap -- which tripled latency
+    #: (~5.7s vs ~1.8s per query) and left truncated mid-word prose in the
+    #: answer. `_render_prompt`'s system message forbids blank lines *inside*
+    #: the reply, so a blank line can only occur after the confidence number,
+    #: which makes it a safe place to stop. If the model disobeys and puts one
+    #: earlier, generation stops before the number, nothing parses, and the
+    #: query escalates -- the safe direction.
+    _STOP_SEQUENCES = ["<|end|>", "<|user|>", "<|system|>", "\n\n"]
 
     def __init__(self, tier: str, signals: TierSignals, artifact_dir: Path | None = None) -> None:
         self.tier = tier
@@ -264,7 +286,24 @@ class NpuFastBrain:
 
     @staticmethod
     def _check(status: int, what: str) -> None:
-        if status != 0:  # GENIE_STATUS_SUCCESS
+        """Raise on a Genie *error*, not on a Genie *warning*.
+
+        GenieCommon.h splits the status space by sign: 0 is
+        GENIE_STATUS_SUCCESS, negatives are errors
+        (GENIE_STATUS_ERROR_GENERAL = -1 ... GENIE_STATUS_ERROR_BOUND_HANDLE
+        = -14), and positives are warnings -- GENIE_STATUS_WARNING_ABORTED = 1,
+        _BOUND_HANDLE = 2, _PAUSED = 3.
+
+        Treating `status != 0` as fatal was a real bug: `answer()` signals
+        GENIE_DIALOG_ACTION_ABORT itself once `_MAX_NEW_TOKENS` is hit, and
+        Genie then returns WARNING_ABORTED(1) from `GenieDialog_query` -- so
+        the token cap this class relies on to bound output length crashed the
+        very call it was meant to truncate. It went unnoticed because every
+        earlier recorded run stopped on the `<|end|>` stop sequence well before
+        the cap (see data/npu_model/phi-3.5-mini-instruct/
+        _real_inference_smoke_log.md, Attempt 5).
+        """
+        if status < 0:
             raise GenieError(f"{what} failed with Genie_Status_t={status}")
 
     def _create_config(self) -> ctypes.c_void_p:
@@ -309,10 +348,34 @@ class NpuFastBrain:
 
     @staticmethod
     def _render_prompt(query: str, context: str) -> str:
-        system = "You are a helpful, concise assistant. Answer in one or two sentences."
+        """Phi-3.5's chat template, with the self-report asked for in the user
+        turn.
+
+        The strict two-line instruction is what makes `_STOP_SEQUENCES`'
+        `"\\n\\n"` safe (see there) and is worth keeping verbatim -- looser
+        phrasings were measured and lost. Asking the model to lead with the
+        confidence instead ("output CONFIDENCE first, then answer") was faster
+        still but sometimes returned the number *and no answer at all*, so it
+        was rejected: an empty answer is worse than a slow one.
+
+        `SELF_REPORT_SUFFIX` goes inside the `<|user|>` block, before its
+        `<|end|>`, so the stop sequence cannot fire before the model has read
+        the instruction. It is imported rather than restated so this brain and
+        `PhoneFastBrain` ask for the number in identical words.
+        """
+        system = (
+            "You are a helpful, concise assistant. Reply with exactly two lines "
+            "and nothing else: line 1 is your answer in one or two sentences; "
+            "line 2 is 'CONFIDENCE: <number>'. Do not use blank lines. Do not "
+            "explain the number."
+        )
         if context:
             system += f" Context: {context}"
-        return f"<|system|>\n{system}<|end|>\n<|user|>\n{query}<|end|>\n<|assistant|>\n"
+        return (
+            f"<|system|>\n{system}<|end|>\n"
+            f"<|user|>\n{query}{SELF_REPORT_SUFFIX}<|end|>\n"
+            f"<|assistant|>\n"
+        )
 
     def answer(self, masked_query: str, context: str = "") -> BrainResponse:
         prompt = self._render_prompt(masked_query, context)
@@ -351,11 +414,41 @@ class NpuFastBrain:
         )
         latency_ms = (time.perf_counter() - start) * 1000
 
-        return BrainResponse(text="".join(chunks).strip(), latency_ms=latency_ms, cost_usd=0.0)
+        # Same tail as PhoneFastBrain.answer, deliberately: both real brains
+        # self-rate, so both must report the number (and the absence of one) the
+        # same way for the router's Shape B path to treat them alike.
+        answer, confidence = parse_self_reported("".join(chunks).strip())
+        return BrainResponse(
+            text=answer,
+            latency_ms=latency_ms,
+            cost_usd=0.0,
+            confidence=confidence,
+            error=(
+                None
+                if confidence is not None
+                else "no parseable CONFIDENCE line in the response"
+            ),
+        )
 
     def close(self) -> None:
-        self._lib.GenieDialog_free(self._dialog_handle)
-        self._lib.GenieDialogConfig_free(self._config_handle)
+        """Release the Genie dialog + config. Idempotent.
+
+        The handles are cleared as they are freed because `__del__` also calls
+        this: without the guard, an explicit `close()` followed by garbage
+        collection frees the same native handles twice. That is not a harmless
+        double-free -- a real run showed it corrupting Genie's internal state so
+        that the *next* session created in the same process failed with
+        GENIE_STATUS_ERROR_INVALID_HANDLE(-5) on `GenieDialog_reset`, even
+        though the two sessions never overlapped. `__del__` swallowing
+        exceptions did not (and could not) catch it, since freeing a stale
+        handle returns a status code rather than raising.
+        """
+        if self._dialog_handle is not None:
+            self._lib.GenieDialog_free(self._dialog_handle)
+            self._dialog_handle = None
+        if self._config_handle is not None:
+            self._lib.GenieDialogConfig_free(self._config_handle)
+            self._config_handle = None
 
     def __del__(self) -> None:
         # Best-effort: interpreter shutdown may have already torn down ctypes

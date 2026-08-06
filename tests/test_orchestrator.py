@@ -38,7 +38,13 @@ class _FakeNpuFastBrain:
     """
 
     instances: list["_FakeNpuFastBrain"] = []
-    reports_confidence = False
+    #: Mirrors the real NpuFastBrain, which self-rates. Behaviour-neutral for
+    #: these tests -- as an *escalation* brain it is only ever asked to answer,
+    #: never consulted for `reports_confidence` (that check in
+    #: `_build_escalation_brain` reads the mobile tier's *fast* brain) -- but
+    #: a stand-in that disagrees with the class it stands in for is a trap for
+    #: the next person.
+    reports_confidence = True
 
     def __init__(self, tier, signals):
         self.tier = tier

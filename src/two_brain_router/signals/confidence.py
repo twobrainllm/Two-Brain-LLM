@@ -46,8 +46,11 @@ def parse_self_reported(text: str) -> tuple[str, float | None]:
 
     - **None** means *no signal* -- the model ignored the instruction format.
       `src/phone_brain/PHONE_DEPLOYMENT_GUIDE.md` Part 8 flags this as a real,
-      expected failure mode of a small quantized model, so the router falls
-      back to the surface-feature heuristic rather than inventing a number.
+      expected failure mode of a small quantized model, and it is observed on
+      the AI PC tier too (one real query returned `'Jane Austen, 95'` -- the
+      number without its label). The router treats this as `difficulty = 1.0`,
+      maximally uncertain, rather than inventing a number *or* scoring the query
+      with a different signal -- see `docs/ORCHESTRATOR.md`.
     - **0.0** means the brain (or its transport) is telling us it cannot answer
       this -- a definite escalate.
 
