@@ -103,6 +103,106 @@ class CloudDeepBrain:
         )
 
 
+class CloudBrainError(RuntimeError):
+    """The Cloud AI 100 inference endpoint returned a non-OK response."""
+
+
+class CirrascaleDeepBrain:
+    """Off-device deep brain, running for real on hosted Cloud AI 100 silicon.
+
+    Replaces `CloudDeepBrain`'s labeled stub. Talks to Cirrascale's AI Suite
+    endpoint (`INFERENCE_CLOUD_ENDPOINT`, OpenAI-shaped `/chat/completions`)
+    with `INFERENCE_CLOUD_API_KEY`. Credentials come from the environment --
+    never from a tracked file; `secrets.txt` is gitignored.
+
+    **What this does and does not close of gap #4.** It makes the cloud tier
+    *real*: a real network hop, a real large model, real token counts, real
+    measured latency. It does **not** make Cloud AI 100 a modeled target in
+    QUAD-Client -- `hardware_detect`'s platform enum still has no cloud value
+    (see docs/GAPS.md #4). And the API reports nothing about the silicon it
+    runs on: the Cloud AI 100 attribution comes from Cirrascale's own service
+    documentation, not from anything observable here. `/models`, `/health` and
+    the completion response were checked; none expose device information.
+    Recorded per the data/ receipts rule rather than asserted.
+
+    Only masked text reaches this class -- that is invariant #3, enforced by
+    the router, and this class must never be given the vault.
+    """
+
+    #: Only model this key can reach today. A 70B returns "Invalid model/rate
+    #: limits not configured for this model", which reads as an account
+    #: provisioning limit rather than a platform one -- override with
+    #: TWO_BRAIN_CLOUD_MODEL if a larger one is enabled.
+    DEFAULT_MODEL = "Llama-3.1-8B"
+    _MAX_NEW_TOKENS = 512
+    _TIMEOUT_S = 300
+
+    def __init__(
+        self,
+        signals: TierSignals,
+        model: str | None = None,
+        endpoint: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        self.signals = signals
+        self.model = model or os.environ.get("TWO_BRAIN_CLOUD_MODEL") or self.DEFAULT_MODEL
+        self._endpoint = (endpoint or os.environ.get("INFERENCE_CLOUD_ENDPOINT") or "").rstrip("/")
+        self._api_key = api_key or os.environ.get("INFERENCE_CLOUD_API_KEY") or ""
+        if not self._endpoint or not self._api_key:
+            raise CloudBrainError(
+                "INFERENCE_CLOUD_ENDPOINT and INFERENCE_CLOUD_API_KEY must be set "
+                "(export them from secrets.txt -- it is gitignored and must stay so)."
+            )
+
+    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+        import urllib.error
+        import urllib.request
+
+        messages = []
+        if context:
+            messages.append({"role": "system", "content": context})
+        messages.append({"role": "user", "content": masked_query})
+        payload = json.dumps(
+            {"model": self.model, "messages": messages, "max_tokens": self._MAX_NEW_TOKENS}
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self._endpoint}/chat/completions",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        start = time.perf_counter()
+        try:
+            with urllib.request.urlopen(request, timeout=self._TIMEOUT_S) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # Never echo the request: it carries the Authorization header.
+            raise CloudBrainError(f"cloud endpoint returned HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise CloudBrainError(f"cloud endpoint unreachable: {exc.reason}") from exc
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        if "choices" not in body:
+            raise CloudBrainError(f"unexpected response: {str(body)[:200]}")
+
+        usage = body.get("usage", {})
+        total_tokens = usage.get("total_tokens") or _estimate_tokens(masked_query)
+        # Real token count, but the *rate* is still the datasheet-derived
+        # estimate in data/profile_workload/cloud_large.json -- Cirrascale
+        # publishes no per-token price through this API. Half-real, and
+        # labeled as such rather than presented as a measured cost.
+        rate = self.signals.profile.get("token_cost_usd_per_1k", 0.0)
+        return BrainResponse(
+            text=body["choices"][0]["message"]["content"].strip(),
+            latency_ms=latency_ms,
+            cost_usd=(total_tokens / 1000.0) * rate,
+        )
+
+
 class GenieError(RuntimeError):
     """A Genie C API call returned a non-success `Genie_Status_t`."""
 

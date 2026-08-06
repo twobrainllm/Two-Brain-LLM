@@ -19,6 +19,7 @@ from typing import Literal
 from two_brain_router.privacy import MaskResult, PIIGuard, assert_masked_token_invariant
 from two_brain_router.routing.brains import (
     Brain,
+    CirrascaleDeepBrain,
     CloudDeepBrain,
     GpuLocalBrain,
     LocalFastBrain,
@@ -43,6 +44,7 @@ _TIER_FILES: dict[str, tuple[str, str]] = {
 #: (see superpowers/deploy-local-brain-npu.md Phase 1).
 _NPU_BRAIN_ENV_VAR = "TWO_BRAIN_NPU_BRAIN"
 _GPU_BRAIN_ENV_VAR = "TWO_BRAIN_GPU_BRAIN"
+_CLOUD_BRAIN_ENV_VAR = "TWO_BRAIN_CLOUD_BRAIN"
 
 
 def _build_fast_brain(tier: Tier, signals: TierSignals) -> Brain:
@@ -62,6 +64,18 @@ def _build_fast_brain(tier: Tier, signals: TierSignals) -> Brain:
     return LocalFastBrain(tier, signals)
 
 
+def _build_deep_brain(signals: TierSignals) -> Brain:
+    """The cloud tier, real when opted in.
+
+    Same opt-in shape as the fast brain: unset, the stub keeps the base
+    package stdlib-only *and* offline, so the demo and the test suite never
+    depend on a network call or a credential.
+    """
+    if os.environ.get(_CLOUD_BRAIN_ENV_VAR) == "1":
+        return CirrascaleDeepBrain(signals)
+    return CloudDeepBrain(signals)
+
+
 class TwoBrainRouter:
     """Routes a query to the local fast brain or escalates to the Cloud AI 100
     deep brain, masking PII and compressing context before anything leaves
@@ -76,7 +90,7 @@ class TwoBrainRouter:
         self.cloud = TierSignals.load("cloud_large", "cloud_ai100")
         self.difficulty = DifficultyEstimator()
         self.fast_brain = _build_fast_brain(tier, self.local)
-        self.deep_brain = CloudDeepBrain(self.cloud)
+        self.deep_brain = _build_deep_brain(self.cloud)
 
     def route(self, query: str, context: str = "") -> RouteDecision:
         notes: list[str] = []
