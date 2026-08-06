@@ -1,0 +1,3 @@
+My email is test@gmail.com.
+My phone number is 555-123-4567.
+My SSN is 123-45-6789.

@@ -1,0 +1,3 @@
+What is a binary search tree?
+What is a queue?
+What is polymorphism?

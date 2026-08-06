@@ -1,0 +1,3 @@
+Derive the Bellman equation.
+Compare transformers and RNNs.
+Explain distributed consensus.
