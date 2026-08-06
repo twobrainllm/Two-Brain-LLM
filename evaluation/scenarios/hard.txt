@@ -1,3 +1,3 @@
-Derive the Bellman equation.
-Compare transformers and RNNs.
-Explain distributed consensus.
+Derive the time complexity of merge sort step by step and compare it to quicksort's worst case, then explain the trade-offs.
+Explain distributed consensus algorithms and compare Paxos and Raft in detail.
+Design a fault tolerant distributed storage system and explain consistency tradeoffs.

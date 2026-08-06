@@ -1,3 +1,3 @@
-My email is test@gmail.com.
-My phone number is 555-123-4567.
-My SSN is 123-45-6789.
+My email is test@gmail.com and my phone number is 555-123-4567. Explain how I should migrate my account securely.
+My SSN is 123-45-6789 and I need help drafting an email about a payroll issue.
+My credit card number is 4111-1111-1111-1111. Explain PCI compliance requirements.

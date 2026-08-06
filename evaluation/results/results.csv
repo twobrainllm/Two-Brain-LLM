@@ -1,0 +1,10 @@
+scenario,query,route,difficulty,latency_ms,cost_usd,pii_entities
+pii,My email is test@gmail.com and my phone number is 555-123-4567. Explain how I should migrate my account securely.,local,0.28,1752.8,0.0,2
+pii,My SSN is 123-45-6789 and I need help drafting an email about a payroll issue.,local,0.2,1484.0,0.0,1
+pii,My credit card number is 4111-1111-1111-1111. Explain PCI compliance requirements.,local,0.2,1036.0,0.0,1
+hard,"Derive the time complexity of merge sort step by step and compare it to quicksort's worst case, then explain the trade-offs.",cloud,0.91,885.8,0.0756,0
+hard,Explain distributed consensus algorithms and compare Paxos and Raft in detail.,local,0.34,1125.6,0.0,0
+hard,Design a fault tolerant distributed storage system and explain consistency tradeoffs.,local,0.36,1125.6,0.0,0
+easy,What is a binary search tree?,local,0.07,856.8,0.0,0
+easy,What is a queue?,local,0.04,856.8,0.0,0
+easy,What is polymorphism?,local,0.05,856.8,0.0,0
