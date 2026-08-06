@@ -37,3 +37,15 @@ data/npu_model/**/*.dll
 data/npu_model/**/*.so
 data/npu_model/**/*.cat
 data/npu_model/**/*.onnx
+data/npu_model/**/*.gguf
+
+# GenieX experiment venv (source-only sdist, auto-provisions a native SDK)
+.venv-geniex/
+
+# GPU (Adreno/OpenCL) VLM work -- same rationale as the NPU section above.
+# Pre-built llama.cpp OpenCL binary + a copy of the Adreno driver package
+# (needed for the no-admin-rights OCL_ICD_FILENAMES workaround -- see
+# data/vlm_gpu_model/*/_real_inference_smoke_log.md); not vendored.
+.llama-cpp-opencl/
+data/vlm_gpu_model/**/raw/
+data/vlm_gpu_model/**/*.gguf
