@@ -17,7 +17,14 @@ import os
 from typing import Literal
 
 from two_brain_router.privacy import MaskResult, PIIGuard, assert_masked_token_invariant
-from two_brain_router.routing.brains import Brain, CloudDeepBrain, LocalFastBrain, NpuFastBrain
+from two_brain_router.routing.brains import (
+    Brain,
+    CirrascaleDeepBrain,
+    CloudDeepBrain,
+    GpuLocalBrain,
+    LocalFastBrain,
+    NpuFastBrain,
+)
 from two_brain_router.routing.policy import RouteDecision, RoutePolicy
 from two_brain_router.signals import DifficultyEstimator, TierSignals
 
@@ -36,12 +43,37 @@ _TIER_FILES: dict[str, tuple[str, str]] = {
 #: .venv-npu environment that actually has the runtime + hardware for it
 #: (see superpowers/deploy-local-brain-npu.md Phase 1).
 _NPU_BRAIN_ENV_VAR = "TWO_BRAIN_NPU_BRAIN"
+_GPU_BRAIN_ENV_VAR = "TWO_BRAIN_GPU_BRAIN"
+_CLOUD_BRAIN_ENV_VAR = "TWO_BRAIN_CLOUD_BRAIN"
 
 
 def _build_fast_brain(tier: Tier, signals: TierSignals) -> Brain:
+    """Pick the AI-PC tier's fast brain; both real backends are opt-in.
+
+    Neither real brain is the default -- unset, the base package stays
+    stdlib-only and uses the mock. Which of the two *should* be preferred is an
+    open question: the GPU is ~3x faster on throughput, but the NPU exists for
+    power efficiency and perf-per-watt has not been measured. See
+    docs/local-inference-status.md. GPU wins if both are set, purely so the
+    combination is deterministic rather than an error.
+    """
+    if tier == "pc" and os.environ.get(_GPU_BRAIN_ENV_VAR) == "1":
+        return GpuLocalBrain(tier, signals)
     if tier == "pc" and os.environ.get(_NPU_BRAIN_ENV_VAR) == "1":
         return NpuFastBrain(tier, signals)
     return LocalFastBrain(tier, signals)
+
+
+def _build_deep_brain(signals: TierSignals) -> Brain:
+    """The cloud tier, real when opted in.
+
+    Same opt-in shape as the fast brain: unset, the stub keeps the base
+    package stdlib-only *and* offline, so the demo and the test suite never
+    depend on a network call or a credential.
+    """
+    if os.environ.get(_CLOUD_BRAIN_ENV_VAR) == "1":
+        return CirrascaleDeepBrain(signals)
+    return CloudDeepBrain(signals)
 
 
 class TwoBrainRouter:
@@ -58,7 +90,7 @@ class TwoBrainRouter:
         self.cloud = TierSignals.load("cloud_large", "cloud_ai100")
         self.difficulty = DifficultyEstimator()
         self.fast_brain = _build_fast_brain(tier, self.local)
-        self.deep_brain = CloudDeepBrain(self.cloud)
+        self.deep_brain = _build_deep_brain(self.cloud)
 
     def route(self, query: str, context: str = "") -> RouteDecision:
         notes: list[str] = []
