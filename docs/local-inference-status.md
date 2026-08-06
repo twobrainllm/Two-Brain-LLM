@@ -153,17 +153,26 @@ transport. The backend is honest; it is just unreliable here.
 only.
 
 - `routing/brains.py` has exactly one real-hardware `Brain`: `NpuFastBrain`.
-- `routing/router.py:41-44` still selects `NpuFastBrain` for the AI PC tier.
+- `router.py::_build_fast_brain` selects it only when
+  `tier == "pc" **and** TWO_BRAIN_NPU_BRAIN=1`. **It is not the default** --
+  unset, the router still uses the `LocalFastBrain` mock, which keeps the base
+  package stdlib-only. So "changing the device default" is really a question
+  about what that env gate should select, not about replacing a live default.
 - There is no `GpuLlmBrain`, no `GpuVlmBrain`, and no test coverage for either.
 - The router has no notion of an image input at all, so a VLM cannot yet be
   routed even if the seam existed.
+
+The same env-gate precedent is the obvious model for a GPU brain: add a
+`GpuLlmBrain` alongside `NpuFastBrain` and let the gate choose between them,
+rather than changing any default.
 
 ---
 
 ## Open questions, in priority order
 
-1. **Perf-per-watt for NPU vs GPU vs CPU.** Blocks every device-default
-   decision, including whether `NpuFastBrain` should stay the router's choice.
+1. **Perf-per-watt for NPU vs GPU vs CPU.** Blocks the device question --
+   specifically, what `TWO_BRAIN_NPU_BRAIN` (or a successor gate) should
+   select for the AI PC tier.
 2. **A `Brain` seam for the GPU path** (`GpuLlmBrain` first -- it is a drop-in
    for the existing contract; `GpuVlmBrain` needs a router that can carry an
    image).
