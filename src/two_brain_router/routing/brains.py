@@ -325,3 +325,259 @@ class NpuFastBrain:
             self.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+class GpuBrainError(RuntimeError):
+    """`llama-server` failed to start, or returned a non-OK HTTP response."""
+
+
+#: llama.cpp OpenCL/Adreno build. Not vendored (see .gitignore) -- override with
+#: TWO_BRAIN_LLAMA_BIN. Verified build 10291 (803b7fcae); see
+#: data/vlm_gpu_model/qwen3-vl-4b-instruct/_real_inference_smoke_log.md.
+_LLAMA_BIN_DIR = DATA_DIR.parent / ".llama-cpp-opencl" / "extracted"
+
+#: Default weights: the same model NpuFastBrain runs, as a GGUF, so the two
+#: are a like-for-like comparison of device rather than of model.
+_GPU_MODEL_PATH = DATA_DIR / "npu_model" / "phi-3.5-mini-instruct" / "gguf" / "Phi-3.5-mini-instruct-Q4_0.gguf"
+
+
+class GpuLocalBrain:
+    """On-device fast brain running on the Adreno GPU, running for real.
+
+    One class covers both LLM and VLM weights on purpose. The LLM/VLM split is
+    a *capability* difference, not a backend one: both are llama.cpp GGUFs on
+    the same `ggml-opencl` backend, same device, same context sizing. The only
+    difference is whether a multimodal projector is loaded, which is a
+    constructor argument (`mmproj_path`) rather than a subclass. A VLM also
+    answers text-only queries perfectly well, so a single vision-capable
+    instance can serve both roles.
+
+    **`answer()` is deliberately text-only even when a projector is loaded.**
+    `Brain.answer` has no image parameter, and adding one would force a change
+    in `router.py` -- the signal this file's own guidance names for a seam
+    drawn in the wrong place. More importantly, images are an unsolved privacy
+    question here: `PIIGuard` masks *text*, so a face, a document, or EXIF GPS
+    in an image would cross to the deep brain untouched while
+    `assert_masked_token_invariant` still passed, because it only inspects
+    text. Routing images needs that decision made first, not an API shape that
+    quietly pre-empts it. Loading the projector now simply means the instance
+    is ready when it is.
+
+    Unlike `NpuFastBrain`, which drives Genie in-process through `ctypes`, this
+    talks to a `llama-server` child process over loopback HTTP. That is a real
+    departure from the AI-PC tier's no-HTTP-hop precedent, taken deliberately:
+    llama.cpp's C API would need a hand-written decode loop, sampler, and chat
+    templating -- the bespoke-FFI surface that already produced two logged bugs
+    in `NpuFastBrain` -- whereas `llama-server` implements all of it, speaks an
+    OpenAI-shaped API, and gives multi-slot serving (`-np N`) that the Genie
+    C API has no equivalent for. The hop is loopback on the same device, not a
+    network call. Only stdlib is used to talk to it, so this module stays
+    importable from the base venv.
+
+    The server is started once and reused across `answer()` calls -- cold load
+    is ~3 s (see data/npu_model/phi-3.5-mini-instruct/_real_geniex_hybrid_log.md).
+    """
+
+    _MAX_NEW_TOKENS = 48
+    _N_CTX = 4096
+    _STARTUP_TIMEOUT_S = 120.0
+
+    def __init__(
+        self,
+        tier: str,
+        signals: TierSignals,
+        model_path: Path | None = None,
+        mmproj_path: Path | None = None,
+        bin_dir: Path | None = None,
+        mmproj_offload: bool = True,
+        log_path: Path | None = None,
+    ) -> None:
+        self.tier = tier
+        self.signals = signals
+        self._model_path = Path(os.environ.get("TWO_BRAIN_GPU_MODEL") or model_path or _GPU_MODEL_PATH)
+        env_mmproj = os.environ.get("TWO_BRAIN_GPU_MMPROJ")
+        self._mmproj_path = Path(env_mmproj) if env_mmproj else mmproj_path
+        self._bin_dir = Path(os.environ.get("TWO_BRAIN_LLAMA_BIN") or bin_dir or _LLAMA_BIN_DIR)
+        # The 8B VLM segfaults with its vision encoder on GPU (OpenCL has no
+        # flash-attention kernel at its head_dim 72) -- pass False for that one.
+        # See data/vlm_gpu_model/qwen3-vl-8b-instruct/_real_inference_smoke_log.md.
+        self._mmproj_offload = mmproj_offload
+        # llama-server hides device/offload lines at its default verbosity, so
+        # with logs discarded a silent CPU fallback would be undetectable --
+        # exactly the failure mode this project rejects elsewhere. Setting
+        # log_path (or TWO_BRAIN_GPU_LOG) captures the server's own log at -v,
+        # where `using device GPUOpenCL` / `offloaded N/N layers to GPU` /
+        # `ggml_opencl: OpenCL driver:` are the lines that prove placement.
+        env_log = os.environ.get("TWO_BRAIN_GPU_LOG")
+        self._log_path = Path(env_log) if env_log else log_path
+        self._log_file: object | None = None
+        self._proc: object | None = None
+        self._base_url: str | None = None
+        self._start_server()
+
+    #: Substrings that, in a captured server log, prove GPU placement.
+    GPU_PLACEMENT_MARKERS = ("using device GPUOpenCL", "layers to GPU", "ggml_opencl:")
+
+    def verify_gpu_placement(self) -> bool:
+        """True if the captured server log shows real GPU offload.
+
+        Requires `log_path` to have been set -- returns False otherwise, since
+        absence of evidence is not evidence of placement.
+        """
+        if self._log_path is None or not self._log_path.exists():
+            return False
+        text = self._log_path.read_text(encoding="utf-8", errors="replace")
+        return any(marker in text for marker in self.GPU_PLACEMENT_MARKERS)
+
+    def _server_exe(self) -> Path:
+        exe = self._bin_dir / ("llama-server.exe" if os.name == "nt" else "llama-server")
+        if not exe.exists():
+            raise GpuBrainError(
+                f"llama-server not found at {exe}. The OpenCL build is not vendored -- "
+                "set TWO_BRAIN_LLAMA_BIN to the directory holding it."
+            )
+        return exe
+
+    def _server_env(self) -> dict[str, str]:
+        """Environment for the child, with the Adreno OpenCL ICD wired up.
+
+        The ICD is not registered system-wide on this machine (registering it
+        needs admin rights), so the Khronos loader is pointed at the driver's
+        own ICD via OCL_ICD_FILENAMES. Without this, device enumeration returns
+        "Available devices: (none)" and llama.cpp silently falls back to CPU --
+        which would make this class quietly *not* a GPU brain.
+        """
+        env = dict(os.environ)
+        icd = self._bin_dir / "OpenCL_adreno.dll"
+        if icd.exists() and "OCL_ICD_FILENAMES" not in env:
+            env["OCL_ICD_FILENAMES"] = str(icd)
+        env["PATH"] = f"{self._bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        return env
+
+    def _free_port(self) -> int:
+        import socket
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+
+    def _start_server(self) -> None:
+        import subprocess
+
+        if not self._model_path.exists():
+            raise GpuBrainError(
+                f"model not found at {self._model_path} -- set TWO_BRAIN_GPU_MODEL. "
+                "GGUF weights are not vendored (see .gitignore)."
+            )
+        port = self._free_port()
+        cmd = [
+            str(self._server_exe()),
+            "-m", str(self._model_path),
+            # -c is not optional: llama.cpp's auto-fit sizes context from the
+            # model's train length (262144 here), overcommits the KV cache on
+            # this device, and then fails a ~300 MB compute-buffer allocation.
+            "-c", str(self._N_CTX),
+            "-ngl", "99",
+            "--host", "127.0.0.1",
+            "--port", str(port),
+        ]
+        if self._mmproj_path is not None:
+            cmd += ["--mmproj", str(self._mmproj_path)]
+            if not self._mmproj_offload:
+                cmd.append("--no-mmproj-offload")
+        if self._log_path is not None:
+            cmd.append("-v")  # device/offload lines only appear above default verbosity
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_file = self._log_path.open("wb")
+            sink = self._log_file
+        else:
+            sink = subprocess.DEVNULL
+        self._proc = subprocess.Popen(
+            cmd,
+            env=self._server_env(),
+            stdout=sink,
+            stderr=sink,
+        )
+        self._base_url = f"http://127.0.0.1:{port}"
+        self._await_ready()
+
+    def _await_ready(self) -> None:
+        import urllib.error
+        import urllib.request
+
+        deadline = time.perf_counter() + self._STARTUP_TIMEOUT_S
+        while time.perf_counter() < deadline:
+            if self._proc is not None and self._proc.poll() is not None:  # type: ignore[attr-defined]
+                raise GpuBrainError(
+                    f"llama-server exited with code {self._proc.returncode} during startup"  # type: ignore[attr-defined]
+                )
+            try:
+                with urllib.request.urlopen(f"{self._base_url}/health", timeout=2) as resp:
+                    if resp.status == 200:
+                        return
+            except (urllib.error.URLError, OSError):
+                pass
+            time.sleep(0.25)
+        self.close()
+        raise GpuBrainError(f"llama-server did not become ready within {self._STARTUP_TIMEOUT_S:.0f}s")
+
+    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+        import urllib.error
+        import urllib.request
+
+        messages = []
+        if context:
+            messages.append({"role": "system", "content": context})
+        messages.append({"role": "user", "content": masked_query})
+        payload = json.dumps(
+            {
+                "messages": messages,
+                "max_tokens": self._MAX_NEW_TOKENS,
+                "temperature": 0.7,
+                "stream": False,
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self._base_url}/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        start = time.perf_counter()
+        try:
+            with urllib.request.urlopen(request, timeout=300) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:  # pragma: no cover - server-side failure
+            raise GpuBrainError(f"llama-server returned HTTP {exc.code}: {exc.read()[:200]!r}") from exc
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        text = body["choices"][0]["message"]["content"]
+        return BrainResponse(text=text.strip(), latency_ms=latency_ms, cost_usd=0.0)
+
+    def close(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        self._proc = None
+        if proc.poll() is None:  # type: ignore[attr-defined]
+            proc.terminate()  # type: ignore[attr-defined]
+            try:
+                proc.wait(timeout=10)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 -- fall through to kill
+                proc.kill()  # type: ignore[attr-defined]
+        log_file, self._log_file = self._log_file, None
+        if log_file is not None:
+            try:
+                log_file.close()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                pass
+
+    def __del__(self) -> None:
+        # Best-effort, same rationale as NpuFastBrain: never raise from a
+        # destructor during interpreter shutdown. Leaking the child process
+        # would be worse than a swallowed error here.
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            pass

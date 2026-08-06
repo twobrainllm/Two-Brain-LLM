@@ -17,7 +17,13 @@ import os
 from typing import Literal
 
 from two_brain_router.privacy import MaskResult, PIIGuard, assert_masked_token_invariant
-from two_brain_router.routing.brains import Brain, CloudDeepBrain, LocalFastBrain, NpuFastBrain
+from two_brain_router.routing.brains import (
+    Brain,
+    CloudDeepBrain,
+    GpuLocalBrain,
+    LocalFastBrain,
+    NpuFastBrain,
+)
 from two_brain_router.routing.policy import RouteDecision, RoutePolicy
 from two_brain_router.signals import DifficultyEstimator, TierSignals
 
@@ -36,9 +42,21 @@ _TIER_FILES: dict[str, tuple[str, str]] = {
 #: .venv-npu environment that actually has the runtime + hardware for it
 #: (see superpowers/deploy-local-brain-npu.md Phase 1).
 _NPU_BRAIN_ENV_VAR = "TWO_BRAIN_NPU_BRAIN"
+_GPU_BRAIN_ENV_VAR = "TWO_BRAIN_GPU_BRAIN"
 
 
 def _build_fast_brain(tier: Tier, signals: TierSignals) -> Brain:
+    """Pick the AI-PC tier's fast brain; both real backends are opt-in.
+
+    Neither real brain is the default -- unset, the base package stays
+    stdlib-only and uses the mock. Which of the two *should* be preferred is an
+    open question: the GPU is ~3x faster on throughput, but the NPU exists for
+    power efficiency and perf-per-watt has not been measured. See
+    docs/local-inference-status.md. GPU wins if both are set, purely so the
+    combination is deterministic rather than an error.
+    """
+    if tier == "pc" and os.environ.get(_GPU_BRAIN_ENV_VAR) == "1":
+        return GpuLocalBrain(tier, signals)
     if tier == "pc" and os.environ.get(_NPU_BRAIN_ENV_VAR) == "1":
         return NpuFastBrain(tier, signals)
     return LocalFastBrain(tier, signals)
