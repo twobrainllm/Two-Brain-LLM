@@ -73,7 +73,57 @@
   <main class="main">
     <header class="main-header">
       <span class="main-title">Two-Brain Chat</span>
-      <span class="mock-badge">Mock mode — replies are simulated, not routed through TwoBrainRouter yet</span>
+
+      <div class="profiler" id="profiler">
+        <button
+          type="button"
+          class="profiler-pill"
+          id="profiler-pill"
+          aria-expanded="false"
+          aria-label="Query profiler"
+          title="Mock mode — these numbers use real formulas ported from the router (see ui/README.md), but no model or network call backs them yet."
+        >
+          <span class="profiler-dot" id="profiler-dot" data-tier="local"></span>
+          <span class="profiler-summary" id="profiler-summary">Profiler</span>
+        </button>
+
+        <div class="profiler-card" id="profiler-card">
+          <div class="profiler-card-row profiler-card-header">
+            <span class="profiler-dot" id="profiler-card-dot" data-tier="local"></span>
+            <span class="profiler-card-tier" id="profiler-card-tier">—</span>
+          </div>
+
+          <div class="profiler-field">
+            <div class="profiler-field-label">
+              <span>Difficulty</span>
+              <span id="profiler-difficulty-value">—</span>
+            </div>
+            <div class="profiler-gauge">
+              <div class="profiler-gauge-threshold"></div>
+              <div class="profiler-gauge-fill" id="profiler-gauge-fill"></div>
+            </div>
+          </div>
+
+          <div class="profiler-field">
+            <div class="profiler-field-label"><span>Privacy</span></div>
+            <div class="profiler-field-value" id="profiler-privacy-value">—</div>
+          </div>
+
+          <div class="profiler-field">
+            <div class="profiler-field-label"><span>Latency</span></div>
+            <div class="profiler-field-value" id="profiler-latency-value">—</div>
+          </div>
+
+          <div class="profiler-field">
+            <div class="profiler-field-label"><span>Cost</span></div>
+            <div class="profiler-field-value" id="profiler-cost-value">—</div>
+          </div>
+
+          <ul class="profiler-notes" id="profiler-notes"></ul>
+
+          <div class="profiler-footer" id="profiler-footer">—</div>
+        </div>
+      </div>
     </header>
 
     <section class="chat-area" id="chat-area">
@@ -120,6 +170,7 @@
   </svg>
 </template>
 
+<script src="profiler.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -22,6 +22,20 @@ const els = {
   brainToggle: document.getElementById("brain-toggle"),
   exprButtons: document.getElementById("expr-buttons"),
   robotTemplate: document.getElementById("robot-svg-template"),
+  profiler: document.getElementById("profiler"),
+  profilerPill: document.getElementById("profiler-pill"),
+  profilerCard: document.getElementById("profiler-card"),
+  profilerDot: document.getElementById("profiler-dot"),
+  profilerSummary: document.getElementById("profiler-summary"),
+  profilerCardDot: document.getElementById("profiler-card-dot"),
+  profilerCardTier: document.getElementById("profiler-card-tier"),
+  profilerDifficultyValue: document.getElementById("profiler-difficulty-value"),
+  profilerGaugeFill: document.getElementById("profiler-gauge-fill"),
+  profilerPrivacyValue: document.getElementById("profiler-privacy-value"),
+  profilerLatencyValue: document.getElementById("profiler-latency-value"),
+  profilerCostValue: document.getElementById("profiler-cost-value"),
+  profilerNotes: document.getElementById("profiler-notes"),
+  profilerFooter: document.getElementById("profiler-footer"),
 };
 
 const LOOK_DIRECTIONS = ["left", "right", "up", "down"];
@@ -245,12 +259,17 @@ function openChat(chatId) {
   state.activeChatId = chatId;
   renderMessages(chat);
   renderChatList();
+
+  const lastAssistant = [...chat.messages].reverse().find((m) => m.role === "assistant" && m.metrics);
+  if (lastAssistant) renderProfiler(lastAssistant.metrics, lastAssistant.tier);
+  else showProfilerIdle();
 }
 
 function showEmptyState() {
   els.emptyState.style.display = "flex";
   els.messages.style.display = "none";
   els.messages.innerHTML = "";
+  showProfilerIdle();
 }
 
 function renderMessages(chat) {
@@ -320,6 +339,73 @@ function createChat(firstMessage) {
   return chat;
 }
 
+function tierLabel(tier) {
+  return tier === "cloud" ? "Cloud" : "Local";
+}
+
+function formatPrivacy(metrics) {
+  if (!metrics.piiCount) return "No PII detected";
+  const parts = metrics.piiEntities.map((e) => `${e.count} ${e.type}`);
+  return `${metrics.piiCount} masked (${parts.join(", ")})`;
+}
+
+/** Renders the profiler pill + card from one message's computed metrics (see profiler.js). */
+function renderProfiler(metrics, tier) {
+  els.profiler.dataset.hasData = "true";
+  els.profilerDot.dataset.tier = tier;
+  els.profilerCardDot.dataset.tier = tier;
+  els.profilerCardTier.textContent = `${tierLabel(tier)} brain`;
+
+  const summaryLatencyMs = Math.round(metrics.actualLatencyMs ?? metrics.estLatencyMs);
+  els.profilerSummary.textContent = `${tierLabel(tier)} · ${summaryLatencyMs}ms`;
+
+  els.profilerDifficultyValue.textContent = `${metrics.difficulty.toFixed(2)} / ${metrics.escalateThreshold}`;
+  els.profilerGaugeFill.style.width = `${Math.round(metrics.difficulty * 100)}%`;
+  els.profilerGaugeFill.style.background =
+    metrics.difficulty >= metrics.escalateThreshold ? "var(--brain-cloud)" : "var(--brain-local)";
+
+  els.profilerPrivacyValue.textContent = formatPrivacy(metrics);
+
+  els.profilerLatencyValue.textContent =
+    `est ${Math.round(metrics.estLatencyMs)}ms` +
+    (metrics.actualLatencyMs != null ? ` · sim ${Math.round(metrics.actualLatencyMs)}ms` : "");
+
+  els.profilerCostValue.textContent =
+    metrics.estCostUsd > 0 ? `$${metrics.estCostUsd.toFixed(5)}` : "$0 (on-device)";
+
+  els.profilerNotes.innerHTML = "";
+  for (const note of metrics.notes) {
+    const li = document.createElement("li");
+    li.textContent = note;
+    els.profilerNotes.appendChild(li);
+  }
+
+  els.profilerFooter.textContent = metrics.deviceContext;
+}
+
+function showProfilerIdle() {
+  els.profiler.dataset.hasData = "false";
+  els.profilerDot.dataset.tier = "";
+  els.profilerSummary.textContent = "Profiler";
+  closeProfilerCard();
+}
+
+function openProfilerCard() {
+  if (els.profiler.dataset.hasData !== "true") return;
+  els.profilerCard.dataset.open = "true";
+  els.profilerPill.setAttribute("aria-expanded", "true");
+}
+
+function closeProfilerCard() {
+  els.profilerCard.dataset.open = "false";
+  els.profilerPill.setAttribute("aria-expanded", "false");
+}
+
+function toggleProfilerCard() {
+  if (els.profilerCard.dataset.open === "true") closeProfilerCard();
+  else openProfilerCard();
+}
+
 /**
  * MOCK: stands in for TwoBrainRouter.route(query, context). The tier is
  * whatever the sidebar toggle is set to, not a real routing decision -- see
@@ -353,6 +439,7 @@ async function handleSend(e) {
   updateSendState();
 
   const tier = state.currentTier;
+  const thinkingStartedAt = performance.now();
   const thinkingRow = renderMessageEl({ role: "assistant", content: "…", tier });
   const thinkingAvatar = thinkingRow.querySelector(".robot-avatar");
   thinkingAvatar?.classList.add("thinking");
@@ -374,12 +461,15 @@ async function handleSend(e) {
   await sleep(HAPPY_LEAD_MS);
 
   const answer = mockRespond(query, tier);
-  chat.messages.push({ role: "assistant", content: answer, tier, timestamp: Date.now() });
+  const metrics = computeMetrics(query, tier);
+  metrics.actualLatencyMs = performance.now() - thinkingStartedAt;
+  chat.messages.push({ role: "assistant", content: answer, tier, timestamp: Date.now(), metrics });
   chat.updatedAt = Date.now();
   saveChats();
   renderMessages(chat);
   renderChatList();
   playExpression(els.messages.querySelector(".message.assistant:last-child .robot-avatar"), "happy");
+  renderProfiler(metrics, tier);
 }
 
 function autoGrow() {
@@ -433,6 +523,17 @@ els.brainToggle.addEventListener("click", (e) => {
 els.exprButtons.addEventListener("click", (e) => {
   const btn = e.target.closest("button");
   if (btn) playExpression(activePreviewAvatar(), btn.dataset.expr);
+});
+
+els.profilerPill.addEventListener("click", (e) => {
+  e.stopPropagation();
+  toggleProfilerCard();
+});
+document.addEventListener("click", (e) => {
+  if (!els.profiler.contains(e.target)) closeProfilerCard();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeProfilerCard();
 });
 
 renderChatList();

@@ -40,6 +40,34 @@ Each message stores its own `tier` at send time, so switching the toggle
 later doesn't repaint history — old messages keep the color of whatever
 tier "answered" them, same as the real router would.
 
+## Query profiler
+
+The pill in the top-right of the header (click to expand, Dynamic-Island
+style) shows per-query telemetry: difficulty score against the escalation
+threshold, PII/privacy detection, estimated latency and cost, the router's
+own escalation reasoning, and the AI PC's real captured hardware context.
+
+**Real:** the formulas and constants. `ui/profiler.js` is a line-for-line
+port of `signals/difficulty.py`'s `DifficultyEstimator`,
+`privacy/patterns.py`'s `PATTERNS` + `privacy/guard.py`'s `PIIGuard.detect`,
+`routing/policy.py`'s latency estimate and `routing/brains.py`'s cost
+formula, and `routing/policy.py`'s escalation/local note text — with the
+same profiled constants (`data/profile_workload/pc_3b.json`,
+`cloud_large.json`) and the same captured hardware string
+(`data/hardware_detect/ai_pc.json`), cited inline in `profiler.js`. Given
+the same query, it produces the same difficulty score, PII count, and
+latency/cost estimate the real router would.
+
+**Mocked:** the *invocation*. Nothing in `profiler.js` calls the Python
+router — it's a JS re-implementation run against whatever tier the sidebar
+toggle is set to, not a real routing decision. The "actual" latency shown
+alongside the estimate is the mock thinking choreography's own measured
+wall-clock duration, not a real model's.
+
+Each assistant message stores its own `metrics` snapshot (same pattern as
+`tier`), so the profiler always reflects whichever message last answered —
+switching chats or tiers later doesn't recompute history.
+
 ## Wiring it to the real router
 
 `TwoBrainRouter.route(query, context)`
@@ -71,6 +99,11 @@ To wire it up on the target device:
    feature.
 4. Keep the per-message `tier_badge`/dot — it's useful even once real,
    since color alone isn't an accessible signal.
+5. **Retire `profiler.js`'s ported formulas** in favor of the real
+   `RouteDecision` fields the same `/route` response already carries
+   (`difficulty_score`, `est_latency_ms`, `est_cost_usd`,
+   `pii_entities_masked`, `notes`) — at that point the JS port becomes a
+   second, divergence-prone source of truth instead of a stand-in for one.
 
 Until step 1 exists on a machine that can actually run it, this stays
 labeled mock, per this repo's own rule: nothing gets to look real without
