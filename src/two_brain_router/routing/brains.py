@@ -352,16 +352,22 @@ class GpuLocalBrain:
     answers text-only queries perfectly well, so a single vision-capable
     instance can serve both roles.
 
-    **`answer()` is deliberately text-only even when a projector is loaded.**
-    `Brain.answer` has no image parameter, and adding one would force a change
-    in `router.py` -- the signal this file's own guidance names for a seam
-    drawn in the wrong place. More importantly, images are an unsolved privacy
-    question here: `PIIGuard` masks *text*, so a face, a document, or EXIF GPS
-    in an image would cross to the deep brain untouched while
-    `assert_masked_token_invariant` still passed, because it only inspects
-    text. Routing images needs that decision made first, not an API shape that
-    quietly pre-empts it. Loading the projector now simply means the instance
-    is ready when it is.
+    **`answer()` deliberately takes text-only *input*, even when a projector is
+    loaded.** To be clear about which side is constrained: these models are
+    image-text-to-text (Qwen3-VL's own GGUF metadata tags it exactly that), so
+    text-only *output* is inherent, not a limitation -- `BrainResponse.text`
+    stays the right shape no matter what happens with images later. The
+    projector is an input-side encoder (`mmproj loaded: vision=true`).
+
+    It is the *input* that is withheld. `Brain.answer` has no image parameter,
+    and adding one would force a change in `router.py` -- the signal this
+    file's own guidance names for a seam drawn in the wrong place. More
+    importantly, image input is an unsolved privacy question here: `PIIGuard`
+    masks *text*, so a face, a document, or EXIF GPS in an image would cross to
+    the deep brain untouched while `assert_masked_token_invariant` still
+    passed, because it only inspects text. Routing images needs that decision
+    made first, not an API shape that quietly pre-empts it. Loading the
+    projector now simply means the instance is ready when it is.
 
     Unlike `NpuFastBrain`, which drives Genie in-process through `ctypes`, this
     talks to a `llama-server` child process over loopback HTTP. That is a real
