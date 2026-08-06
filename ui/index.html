@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Two-Brain Chat</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect x='3' y='3' width='34' height='34' rx='10' fill='%23007CC0' opacity='.25'/%3E%3Crect x='7' y='7' width='26' height='26' rx='7' fill='%23007CC0'/%3E%3Crect x='13' y='17' width='5' height='9' rx='2.5' fill='%23111318'/%3E%3Crect x='22' y='17' width='5' height='9' rx='2.5' fill='%23111318'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <button id="new-chat-btn" class="new-chat-btn" type="button">
+        <svg viewBox="0 0 20 20" width="16" height="16" fill="none"><path d="M10 4v12M4 10h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <span>New chat</span>
+      </button>
+    </div>
+
+    <div class="sidebar-search">
+      <svg class="search-icon" viewBox="0 0 20 20" width="15" height="15" fill="none"><circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.6"/><path d="M16 16l-3.6-3.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <input id="search-input" type="text" placeholder="Search chats..." autocomplete="off" />
+    </div>
+
+    <nav class="chat-list" id="chat-list" aria-label="Chat history"></nav>
+
+    <div class="sidebar-footer">
+      <div class="brain-toggle" title="Mock control — see ui/README.md. Not wired to TwoBrainRouter yet.">
+        <span class="brain-toggle-label">Simulated brain</span>
+        <div class="segmented" id="brain-toggle" role="radiogroup" aria-label="Simulated brain tier">
+          <button class="segment active" data-tier="local" role="radio" aria-checked="true" type="button">Local</button>
+          <button class="segment" data-tier="cloud" role="radio" aria-checked="false" type="button">Cloud</button>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="main-header">
+      <span class="main-title">Two-Brain Chat</span>
+      <span class="mock-badge">Mock mode — replies are simulated, not routed through TwoBrainRouter yet</span>
+    </header>
+
+    <section class="chat-area" id="chat-area">
+      <div class="empty-state" id="empty-state">
+        <div class="robot-avatar robot-large" id="empty-state-avatar" data-tier="local" aria-hidden="true">
+          <svg viewBox="0 0 40 40">
+            <rect class="rb-face-outer" x="3" y="3" width="34" height="34" rx="10"/>
+            <rect class="rb-face-inner" x="7" y="7" width="26" height="26" rx="7"/>
+            <rect class="rb-eye rb-eye-l" x="13" y="17" width="5" height="9" rx="2.5"/>
+            <rect class="rb-eye rb-eye-r" x="22" y="17" width="5" height="9" rx="2.5"/>
+          </svg>
+        </div>
+        <h1>How can I help you today?</h1>
+        <p class="empty-state-hint">Replies are simulated right now — use the brain toggle in the sidebar to preview the local/cloud color switch.</p>
+      </div>
+      <div class="messages" id="messages"></div>
+    </section>
+
+    <form class="composer" id="composer">
+      <div class="composer-inner">
+        <textarea id="composer-input" placeholder="Message Two-Brain..." rows="1"></textarea>
+        <button type="submit" id="send-btn" disabled aria-label="Send message">
+          <svg viewBox="0 0 20 20" width="16" height="16" fill="none"><path d="M10 16V4M10 4l5 5M10 4l-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </form>
+  </main>
+</div>
+
+<template id="robot-svg-template">
+  <svg viewBox="0 0 40 40">
+    <rect class="rb-face-outer" x="3" y="3" width="34" height="34" rx="10"/>
+    <rect class="rb-face-inner" x="7" y="7" width="26" height="26" rx="7"/>
+    <rect class="rb-eye rb-eye-l" x="13" y="17" width="5" height="9" rx="2.5"/>
+    <rect class="rb-eye rb-eye-r" x="22" y="17" width="5" height="9" rx="2.5"/>
+  </svg>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>
