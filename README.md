@@ -223,6 +223,14 @@ done-when criteria is in
   artifact instead of a self-compiled one); see
   `superpowers/deploy-local-brain-npu.md`. `convert_model` itself is still
   broken.
+- **The Mobile tier's real fast brain is in progress, not yet merged in.**
+  `src/phone_brain/` (branch `local_brain`) has a working Genie/QNN server
+  for Llama-3.2-3B-Instruct on a Galaxy S25 and a confidence-estimation
+  reference implementation, built as a standalone package rather than a
+  `Brain` implementation. `docs/PHONE_BRAIN.md` audits it against this
+  project's actual code and lists what has to change before it's absorbed --
+  most importantly, it currently sends the raw, unmasked query off-device
+  before any routing decision, which is not this project's privacy guarantee.
 - **A fixed QAIRT `ReshapeOp::calculateShape`** (the uninitialized-memory
   bug found locally, gap #3b) or a fixed hosted-server install (missing
   `libpython3.10.so.1.0`, gap #3) -- either would unblock real

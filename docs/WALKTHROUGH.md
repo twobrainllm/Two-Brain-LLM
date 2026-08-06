@@ -303,6 +303,11 @@ installing anything.
 Ordered by what unblocks the most. Items 1 and 2 are not fixable from this
 client — they need someone with server or SDK access.
 
+> **Update:** item 3 is now done for the AI-PC tier (see below) — bypassing
+> item 1 rather than waiting on it. The Mobile tier's counterpart is a
+> separate, unmerged, in-progress effort — see `../CLAUDE.md`'s "Branch
+> state" section for the full picture across branches.
+
 ### 1. Unblock `convert_model` (P0 — blocks 3, 4, 5)
 
 Two independent defects, both with complete repro steps already written down.
@@ -345,6 +350,13 @@ base package stays stdlib-only by default. Nothing above `brains.py`
 changed — the seam held. `tests/test_npu_brain.py` has the Phase 6
 verification suite (skips without the real runtime/artifact, passes for
 real under `.venv-npu`).
+
+**This closes the AI-PC tier only.** The Mobile tier's fast brain is a
+separate, still-open effort — `src/phone_brain/` on branch `local_brain`
+has a working Genie/QNN server for Llama-3.2-3B-Instruct on a Galaxy S25,
+but it isn't wired into `Brain`/`TwoBrainRouter` yet and has real issues to
+resolve first (it currently sends the raw, unmasked query off-device before
+any routing decision). See `docs/PHONE_BRAIN.md`.
 
 ### 4. Replace the difficulty heuristic with a real confidence signal (P2 — depends on 3)
 
