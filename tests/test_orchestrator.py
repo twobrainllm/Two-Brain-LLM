@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from two_brain_router.routing import (
+    BrainResponse,
     PhoneFastBrain,
     RemoteBrainRefused,
     RoutePolicy,
@@ -27,6 +28,42 @@ from two_brain_router.routing import (
 )
 from two_brain_router.signals.confidence import confidence_to_difficulty, parse_self_reported
 from two_brain_router.signals.loader import TierSignals
+
+
+class _FakeNpuFastBrain:
+    """Stand-in for the real `NpuFastBrain` in escalation-path tests --
+    avoids needing the real Genie/QAIRT stack and NPU hardware just to
+    verify the router's *wiring* to it. `tests/test_npu_brain.py` covers
+    the real thing separately, skipping cleanly without that hardware.
+    """
+
+    instances: list["_FakeNpuFastBrain"] = []
+    reports_confidence = False
+
+    def __init__(self, tier, signals):
+        self.tier = tier
+        self.signals = signals
+        self.received_queries: list[str] = []
+        self.closed = False
+        _FakeNpuFastBrain.instances.append(self)
+
+    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+        self.received_queries.append(masked_query)
+        return BrainResponse(
+            text=f"[ai-pc second-opinion answer to: {masked_query!r}]",
+            latency_ms=321.0,
+            cost_usd=0.0,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def fake_npu_brain(monkeypatch):
+    _FakeNpuFastBrain.instances.clear()
+    monkeypatch.setattr("two_brain_router.routing.router.NpuFastBrain", _FakeNpuFastBrain)
+    return _FakeNpuFastBrain
 
 # --------------------------------------------------------------------------
 # A real, tiny L-contract server
@@ -235,14 +272,18 @@ def test_unconfident_fast_brain_escalates_and_owns_the_discarded_cost(monkeypatc
     assert "reported latency includes it" in discarded
 
 
-def test_unparseable_confidence_falls_back_to_the_heuristic(monkeypatch):
-    """A model that ignores the output format must not silently become
-    'maximally confident' or 'maximally unsure'."""
+def test_unparseable_confidence_is_treated_as_maximally_uncertain(monkeypatch):
+    """No parseable CONFIDENCE line means no signal at all -- the router
+    does not fall back to a different (surface-feature) signal for it, it
+    just treats the brain as maximally unsure and escalates. Without an
+    escalation brain configured (this test), that means the cloud, exactly
+    like a low-but-parsed confidence would."""
     with _PhoneServer("An answer with no confidence line.") as server:
         decision = _mobile_router(server, monkeypatch).route("What time zone is Tokyo in?")
 
-    assert any("fell back to the surface-feature heuristic" in n for n in decision.notes)
-    assert decision.tier_answered == "local"
+    assert decision.tier_answered == "cloud"
+    assert decision.difficulty_score == 1.0
+    assert any("no usable confidence signal" in n for n in decision.notes)
 
 
 def test_latency_budget_skips_the_fast_brain_entirely(monkeypatch):
@@ -295,3 +336,113 @@ def test_pii_never_reaches_the_phone_or_the_cloud_unmasked(monkeypatch):
     # 3. the user still gets their real values back
     assert "jane.doe@example.com" in decision.answer
     assert "123-45-6789" in decision.answer
+
+
+# --------------------------------------------------------------------------
+# The escalation brain: mobile's "not confident" path prefers a second
+# local opinion (the AI PC's real model) over the cloud, when configured.
+# --------------------------------------------------------------------------
+
+
+def test_no_escalation_brain_by_default(monkeypatch):
+    monkeypatch.setenv("TWO_BRAIN_PHONE_BRAIN", "1")
+    router = TwoBrainRouter(tier="mobile")
+    assert router.escalation_brain is None
+
+
+def test_no_escalation_brain_on_the_pc_tier(monkeypatch, fake_npu_brain):
+    """The pc tier's own fast brain already *is* this model when the NPU
+    flag is on (see _build_fast_brain) -- it is never also configured as a
+    second opinion for itself."""
+    monkeypatch.setenv("TWO_BRAIN_NPU_BRAIN", "1")
+    router = TwoBrainRouter(tier="pc")
+    assert isinstance(router.fast_brain, fake_npu_brain)
+    assert router.escalation_brain is None
+    router.close()
+
+
+def test_low_confidence_escalates_to_the_ai_pc_not_the_cloud(monkeypatch, fake_npu_brain):
+    monkeypatch.setenv("TWO_BRAIN_NPU_BRAIN", "1")
+    with _PhoneServer("Uh, maybe?\nCONFIDENCE: 20") as server:
+        decision = _mobile_router(server, monkeypatch).route("Prove the Riemann hypothesis.")
+
+    assert decision.tier_answered == "local"
+    assert decision.est_cost_usd == 0.0
+    assert len(server.received) == 1, "the phone is still asked first"
+    assert any("second opinion" in n for n in decision.notes)
+
+    ai_pc = fake_npu_brain.instances[-1]
+    assert ai_pc.received_queries == ["Prove the Riemann hypothesis."]
+    assert decision.answer.startswith("[ai-pc second-opinion answer")
+
+
+def test_confident_phone_never_calls_the_escalation_brain(monkeypatch, fake_npu_brain):
+    monkeypatch.setenv("TWO_BRAIN_NPU_BRAIN", "1")
+    with _PhoneServer("Tokyo is UTC+9.\nCONFIDENCE: 92") as server:
+        decision = _mobile_router(server, monkeypatch).route("What time zone is Tokyo in?")
+
+    assert decision.tier_answered == "local"
+    assert decision.answer == "Tokyo is UTC+9."
+    assert fake_npu_brain.instances[-1].received_queries == [], (
+        "a confident phone answer must not also cost an AI PC inference"
+    )
+
+
+def test_unparseable_confidence_also_escalates_to_the_ai_pc_when_configured(monkeypatch, fake_npu_brain):
+    monkeypatch.setenv("TWO_BRAIN_NPU_BRAIN", "1")
+    with _PhoneServer("An answer with no confidence line.") as server:
+        decision = _mobile_router(server, monkeypatch).route("What time zone is Tokyo in?")
+
+    assert decision.tier_answered == "local"
+    assert decision.difficulty_score == 1.0
+    assert fake_npu_brain.instances[-1].received_queries
+
+
+def test_latency_budget_skip_goes_straight_to_the_ai_pc_when_configured(monkeypatch, fake_npu_brain):
+    """The phone is still never called (its own profiled latency already
+    blew the budget) -- but now the AI PC is asked directly instead of
+    paying for a cloud round-trip when a local second opinion exists."""
+    monkeypatch.setenv("TWO_BRAIN_NPU_BRAIN", "1")
+    with _PhoneServer("unused\nCONFIDENCE: 99") as server:
+        decision = _mobile_router(
+            server, monkeypatch, local_latency_budget_ms=1
+        ).route("What time zone is Tokyo in?")
+
+    assert decision.tier_answered == "local"
+    assert server.received == [], "the phone should still never be called"
+    assert fake_npu_brain.instances[-1].received_queries
+
+
+def test_escalation_brain_only_ever_sees_masked_text(monkeypatch, fake_npu_brain):
+    """Masking happens before the routing decision (invariant #1), so this
+    holds regardless of which brain ends up answering -- including a brain
+    that, unlike the cloud, runs in-process on this same machine."""
+    monkeypatch.setenv("TWO_BRAIN_NPU_BRAIN", "1")
+    query = "My email is jane.doe@example.com -- prove the Riemann hypothesis."
+    with _PhoneServer("Not sure.\nCONFIDENCE: 10") as server:
+        decision = _mobile_router(server, monkeypatch).route(query)
+
+    sent_to_ai_pc = fake_npu_brain.instances[-1].received_queries[0]
+    assert "jane.doe@example.com" not in sent_to_ai_pc
+    assert "[PII_EMAIL_1]" in sent_to_ai_pc
+    # rehydrated for the user, same as every other brain here
+    assert "jane.doe@example.com" in decision.answer
+
+
+def test_discarded_phone_latency_is_still_billed_when_escalating_to_the_ai_pc(monkeypatch, fake_npu_brain):
+    monkeypatch.setenv("TWO_BRAIN_NPU_BRAIN", "1")
+    with _PhoneServer("Uh, maybe?\nCONFIDENCE: 20") as server:
+        decision = _mobile_router(server, monkeypatch).route("Prove the Riemann hypothesis.")
+
+    # fake AI PC always reports 321.0ms -- total must be more than that alone.
+    assert decision.est_latency_ms > 321.0
+    assert any("discarded" in n for n in decision.notes)
+
+
+def test_router_close_closes_the_escalation_brain(monkeypatch, fake_npu_brain):
+    monkeypatch.setenv("TWO_BRAIN_PHONE_BRAIN", "1")
+    monkeypatch.setenv("TWO_BRAIN_NPU_BRAIN", "1")
+    router = TwoBrainRouter(tier="mobile")
+    assert router.escalation_brain is not None
+    router.close()
+    assert fake_npu_brain.instances[-1].closed is True

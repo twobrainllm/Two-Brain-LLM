@@ -4,6 +4,10 @@
     python -m two_brain_router.api --tier mobile
     $env:TWO_BRAIN_NPU_BRAIN=1;   python -m two_brain_router.api --tier pc
     $env:TWO_BRAIN_PHONE_BRAIN=1; python -m two_brain_router.api --tier mobile
+    # both flags, mobile tier: phone answers when confident; when it isn't,
+    # the same AI PC model above answers as a second opinion instead of
+    # escalating to the cloud -- see docs/ORCHESTRATOR.md
+    $env:TWO_BRAIN_PHONE_BRAIN=1; $env:TWO_BRAIN_NPU_BRAIN=1; python -m two_brain_router.api --tier mobile
 
 One route:
 
@@ -156,9 +160,7 @@ def serve(tier: Tier, host: str, port: int) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        close = getattr(router.fast_brain, "close", None)
-        if callable(close):
-            close()
+        router.close()  # closes fast_brain and escalation_brain, whichever are real
         httpd.server_close()
 
 

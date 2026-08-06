@@ -93,6 +93,18 @@ Llama-3.2-3B w4a16. Real numbers need a `bench_phone_brain.py` run against the
 actual S25, with a receipt, per the `data/` rule below. Until then the mobile
 tier's *latency budget pre-check* is reasoning from the wrong model.
 
+**Mobile's "not confident" path now has a third destination, not just the
+cloud.** When `TWO_BRAIN_NPU_BRAIN=1` is also set, an unconfident phone
+answer is followed by a direct call to the AI PC's `NpuFastBrain` — the same
+real model the `pc` tier uses — instead of falling back to the surface-feature
+heuristic or escalating straight to the cloud. Still `tier_answered="local"`
+(nothing crosses the cloud boundary); still masked-text-only into that brain;
+deliberately not latency-optimized (two real local inferences on one query
+when the phone isn't confident). See
+[`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md)'s "The escalation brain"
+section before touching `TwoBrainRouter.escalation_brain` or
+`_build_escalation_brain`.
+
 ---
 
 ## Invariants — do not break these
@@ -113,7 +125,11 @@ must preserve all four:
    **`PhoneFastBrain` is on the far side of a boundary as well** — the mobile
    model runs on a physically separate device over HTTP — so the same rule
    applies to it, and it additionally refuses a non-loopback host without an
-   explicit opt-in.
+   explicit opt-in. **`escalation_brain` (`NpuFastBrain`, when mobile's phone
+   isn't confident) is not on the far side of this specific boundary** — it
+   runs in-process on this machine, so it never reaches the cloud — but it
+   still only ever receives `masked_query.masked_text`, same as every other
+   brain here.
 4. **Rehydrate last, on-device.** Only after the answer is back.
 
 Note that invariant 1 is *why* the confidence path is safe: a self-rating brain
@@ -159,9 +175,12 @@ behind its own env var. Don't split it into a `routing/brains/` subpackage —
 that was proposed once and the codebase went the other way.
 
 `signals/difficulty.py` (the surface-feature heuristic) is still the signal for
-any brain with `reports_confidence = False`, so it is not dead code — it is the
-fallback, including when a self-rating brain returns an unparseable confidence.
-The real-signal replacement for it lives in `signals/confidence.py`.
+any brain with `reports_confidence = False`, so it is not dead code. **It is
+no longer the fallback for an unparseable confidence** — that used to be true
+but isn't any more: `route()`'s confidence path now treats "no parseable
+number" the same as "definitely not confident" (`difficulty = 1.0`), not a
+second, different signal. See `docs/ORCHESTRATOR.md`'s "`confidence = None`
+is not `confidence = 0.0`" section for why conflating the two was wrong.
 
 ---
 
