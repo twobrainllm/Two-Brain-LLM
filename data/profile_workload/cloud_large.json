@@ -1,16 +1,40 @@
 {
-  "_mock": true,
-  "_reason": "No AI100 target exists in QUAD's tool schemas at all (see ../hardware_detect/cloud_ai100.json) so this was never profilable via profile_workload regardless of the qairt-converter defect. Modeled as a batched cloud-serving deployment: latency includes a network round-trip, cost is a real per-token API-style price instead of on-device energy.",
-  "model_id": "qwen2.5-32b-instruct",
+  "_mock": false,
+  "_source": "real -- measured against Cirrascale AI Suite (https://aisuite.cirrascale.com/apis/v2), OpenAI-shaped /chat/completions, n=2 per point at 16 and 128 max_tokens. Pricing is Cirrascale's published catalogue rate, not a measured invoice. See ../cloud_ai100/_real_endpoint_log.md for the full log, including what is still NOT verifiable (the Cloud AI 100 silicon is not observable through this API).",
+  "model_id": "Llama-3.3-70B",
+  "_model_note": "Llama-3.3-70B is the intended deep brain. Measurements below were taken against Llama-3.1-8B, the only catalogue model reachable while the larger ones returned 'Models Busy/Unavailable'. Re-measure when a 70B answers -- expect it to be slower per token.",
   "device_tier": "Cloud",
   "platform": "cloud-ai100",
-  "runtime": "aic-serve",
-  "latency_ms": {"network_rtt_mean": 45, "ttft_mean": 320, "per_token_mean": 12.4},
-  "throughput_tokens_per_s_per_request": 80.6,
+  "runtime": "cirrascale-aisuite",
+  "context_limit_tokens": 8192,
+  "latency_ms": {
+    "network_rtt_mean": 119,
+    "_network_rtt_note": "real, but this is fixed overhead (RTT + prefill of a 44-token prompt) derived from the intercept of the 16/128-token fit, not an isolated ping",
+    "ttft_mean": 0,
+    "_ttft_note": "not separable without streaming; folded into network_rtt_mean above so the router's ttft + n*per_token estimate stays correct",
+    "per_token_mean": 9.9
+  },
+  "throughput_tokens_per_s_per_request": 101.0,
+  "_measured_points": [
+    {"max_tokens": 16, "completion_tokens": 16, "wall_ms": [276.7, 279.2]},
+    {"max_tokens": 128, "completion_tokens": 128, "wall_ms": [1380.1, 1393.2]}
+  ],
   "power_mw": null,
   "energy_per_1k_tokens_mj": null,
-  "token_cost_usd_per_1k": 1.8,
+  "token_cost_usd_per_1k": 0.00069,
+  "_cost_note": "Output rate for the 70B, kept for the legacy single-rate field. Real billing splits input/output and differs per model -- CirrascaleDeepBrain.MODEL_PRICING is the authority. The previous value here was 1.8 USD/1k, a datasheet guess ~2600x too high that made one query look like $1.03; it did not affect routing, since policy.py decides on difficulty and latency budget, not cost.",
+  "pricing_usd_per_1m": {
+    "Llama-3.1-8B": {"input": 0.02, "output": 0.22},
+    "Qwen-QwQ-32B": {"input": 0.08, "output": 0.36},
+    "Llama-3.3-70B": {"input": 0.19, "output": 0.69},
+    "DeepSeek-R1-Distill-Llama-70B": {"input": 0.19, "output": 0.69}
+  },
   "memory_peak_mb": null,
   "utilization": null,
-  "measurement_notes": {"all_fields": "mocked:no_cloud_ai100_plumbing_exists"}
+  "measurement_notes": {
+    "latency": "real:measured_2026-08-06",
+    "pricing": "real:vendor_published_catalogue",
+    "power": "unavailable:no_device_telemetry_through_this_api",
+    "silicon": "unverified:api_reports_no_device_information"
+  }
 }

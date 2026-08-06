@@ -47,18 +47,11 @@ on the Adreno GPU. The cloud tier is ~4x faster per token.
 2. **Gap #4 is not closed.** `hardware_detect` still has no cloud platform
    value and `convert_model` no cloud `target_sdk`. This bypasses QUAD entirely,
    the same way the NPU brain bypassed `convert_model`.
-3. **Cost is half-real.** Token counts are real, from `usage`. The *rate* is
-   still the datasheet-derived `token_cost_usd_per_1k: 1.8` in
-   `cloud_large.json`, and it is almost certainly wrong — it yields **$1.03 for
-   a single query**, which no hosted 8B costs. Cirrascale publishes no
-   per-token price through this API. Treat `cost_usd` as unusable until a real
-   rate is obtained.
-4. **`Llama-3.1-8B` is the only model reachable on this key.** `Llama-3.1-70B`
-   and `meta-llama/Llama-3.1-70B-Instruct` both return
-   `{"message":"Too many requests. Invalid model/rate limits not configured for
-   this model.","status":"error"}` — which reads as an **account provisioning
-   limit, not a platform limit**. Worth asking Cirrascale to enable a larger
-   model; `TWO_BRAIN_CLOUD_MODEL` overrides the default with no code change.
+3. ~~**Cost is half-real.**~~ **SUPERSEDED** — the account owner supplied the
+   vendor catalogue shortly after this was written, so pricing is now real.
+   See "Correction + real catalogue and pricing" below. The suspicion recorded
+   here (that 1.8 USD/1k "is almost certainly wrong") was correct, and
+   understated: it was off by ~16,000x.
 
 ## Architectural finding: the tiers are closer than the design assumes
 
@@ -110,3 +103,70 @@ narrower than that test's name implies.
 
 One fabricated name ("Sarah Chen") was sent to Cirrascale during this test. No
 real personal data was involved.
+
+---
+
+## Correction + real catalogue and pricing (same day)
+
+The vendor catalogue, supplied by the account owner, corrects two earlier
+conclusions in this file.
+
+| Size | Model | Context | $/1M input | $/1M output |
+|---|---|---|---|---|
+| 8B | `Llama-3.1-8B` | 8K | 0.02 | 0.22 |
+| 32B | `Qwen-QwQ-32B` | 8K | 0.08 | 0.36 |
+| 70B | `Llama-3.3-70B` | 8K | 0.19 | 0.69 |
+| 70B | `DeepSeek-R1-Distill-Llama-70B` | 8K | 0.19 | 0.69 |
+
+**Correction 1 — a 70B does exist; the earlier probe used a wrong name.**
+This file previously read the 70B failure as an account provisioning limit.
+That was wrong. `Llama-3.1-70B` (the name tried) simply does not exist. The
+service's two error messages are diagnostic and distinguish the cases:
+
+- `"Invalid model/rate limits not configured for this model"` → **name not in
+  the catalogue** (returned for `Llama-3.1-70B`, and for `Llama3.1-8B` without
+  the dash).
+- `"Internal Server Error: Models Busy/Unavailable"` (HTTP 500) → **valid name,
+  model not currently loaded** (returned for `Llama-3.3-70B`,
+  `DeepSeek-R1-Distill-Llama-70B`, `Qwen-QwQ-32B`).
+
+**Correction 2 — the cost figure was wrong by four orders of magnitude.**
+Recomputed on the real usage block from the live 8B call (prompt 46,
+completion 38):
+
+| | Cost for that one call |
+|---|---|
+| Old mocked rate (1.8 USD/1k) | $0.15120000 |
+| Real, `Llama-3.1-8B` | **$0.00000928** |
+| Real, `Llama-3.3-70B` | $0.00003496 |
+
+**Overstated by ~16,293x.** It did **not** affect routing — `policy.py` decides
+on difficulty and `local_latency_budget_ms`, and never reads cost — so the
+damage was confined to reporting. `CirrascaleDeepBrain.MODEL_PRICING` now bills
+input and output separately at the published rates, and
+`data/profile_workload/cloud_large.json` is `_mock: false` for latency and
+pricing.
+
+The practical consequence is that **cloud escalation is essentially free at
+these volumes** (~$0.00003 for a 70B answer). Any future policy that weighs
+cost against privacy exposure should start from that, not from the old figure.
+
+## Service availability is real and intermittent
+
+Mid-session the whole service degraded: `Llama-3.3-70B`, both other large
+models, **and eventually `Llama-3.1-8B`** all returned HTTP 500
+`Models Busy/Unavailable`, and `GET /models` — which had earlier returned the
+full catalogue — began returning `{}` while still answering HTTP 200.
+
+This is load state, not provisioning: the 8B had been answering normally
+minutes earlier. It means **the deep brain must be assumed intermittently
+unavailable**, which is now handled: `CirrascaleDeepBrain` tries
+`Llama-3.3-70B` and falls back to `Llama-3.1-8B`, surfacing the service's own
+message if both fail.
+
+**Still unverified because of that outage:** a live end-to-end call against a
+70B. The fallback chain was exercised and behaved correctly (tried both, raised
+with the real service message), and the pricing maths was verified against real
+captured token counts — but no 70B has yet answered on this account. Re-run
+when the service recovers, and re-measure `cloud_large.json`'s latency against
+it, since a 70B will be slower per token than the 8B those numbers came from.

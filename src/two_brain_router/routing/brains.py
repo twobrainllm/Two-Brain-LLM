@@ -129,11 +129,27 @@ class CirrascaleDeepBrain:
     the router, and this class must never be given the vault.
     """
 
-    #: Only model this key can reach today. A 70B returns "Invalid model/rate
-    #: limits not configured for this model", which reads as an account
-    #: provisioning limit rather than a platform one -- override with
-    #: TWO_BRAIN_CLOUD_MODEL if a larger one is enabled.
-    DEFAULT_MODEL = "Llama-3.1-8B"
+    #: Published Cirrascale catalogue: (usd_per_1m_input, usd_per_1m_output).
+    #: All four are 8K context. These are the vendor's list prices, not
+    #: measured spend -- but unlike the datasheet guess they replaced (which
+    #: implied ~$1800/1M and made a single query look like $1.03), they are
+    #: real published rates.
+    MODEL_PRICING: dict[str, tuple[float, float]] = {
+        "Llama-3.1-8B": (0.02, 0.22),
+        "Qwen-QwQ-32B": (0.08, 0.36),
+        "Llama-3.3-70B": (0.19, 0.69),
+        "DeepSeek-R1-Distill-Llama-70B": (0.19, 0.69),
+    }
+    #: Every catalogue model is 8K. Escalation sends masked query + compressed
+    #: context, so this is a real ceiling on how much context may cross.
+    CONTEXT_LIMIT_TOKENS = 8192
+
+    #: The 70B is the better deep brain -- an 8B is only ~2x the local fast
+    #: brain, and this device already runs an 8B locally, so an 8B deep brain
+    #: buys throughput rather than capability. Falls back automatically when
+    #: the 70B is unavailable, which is a real and observed condition.
+    DEFAULT_MODEL = "Llama-3.3-70B"
+    FALLBACK_MODEL = "Llama-3.1-8B"
     _MAX_NEW_TOKENS = 512
     _TIMEOUT_S = 300
 
@@ -154,16 +170,17 @@ class CirrascaleDeepBrain:
                 "(export them from secrets.txt -- it is gitignored and must stay so)."
             )
 
-    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+    def _cost_usd(self, model: str, prompt_tokens: int, completion_tokens: int) -> float:
+        """Real published rates, billed separately for input and output."""
+        rate_in, rate_out = self.MODEL_PRICING.get(model, (0.0, 0.0))
+        return (prompt_tokens * rate_in + completion_tokens * rate_out) / 1_000_000
+
+    def _post(self, model: str, messages: list[dict]) -> tuple[dict, float]:
         import urllib.error
         import urllib.request
 
-        messages = []
-        if context:
-            messages.append({"role": "system", "content": context})
-        messages.append({"role": "user", "content": masked_query})
         payload = json.dumps(
-            {"model": self.model, "messages": messages, "max_tokens": self._MAX_NEW_TOKENS}
+            {"model": model, "messages": messages, "max_tokens": self._MAX_NEW_TOKENS}
         ).encode("utf-8")
         request = urllib.request.Request(
             f"{self._endpoint}/chat/completions",
@@ -174,33 +191,61 @@ class CirrascaleDeepBrain:
             },
             method="POST",
         )
-
         start = time.perf_counter()
         try:
             with urllib.request.urlopen(request, timeout=self._TIMEOUT_S) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            # Never echo the request: it carries the Authorization header.
-            raise CloudBrainError(f"cloud endpoint returned HTTP {exc.code}") from exc
+            # Surface the service's own message -- it distinguishes "busy",
+            # "invalid model" and auth failures, which matter differently.
+            # Never echo the request itself: it carries the Authorization header.
+            detail = ""
+            try:
+                detail = json.loads(exc.read().decode("utf-8")).get("message", "")
+            except Exception:  # noqa: BLE001
+                pass
+            raise CloudBrainError(f"cloud endpoint HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise CloudBrainError(f"cloud endpoint unreachable: {exc.reason}") from exc
-        latency_ms = (time.perf_counter() - start) * 1000
+        return body, (time.perf_counter() - start) * 1000
 
-        if "choices" not in body:
-            raise CloudBrainError(f"unexpected response: {str(body)[:200]}")
+    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+        messages = []
+        if context:
+            messages.append({"role": "system", "content": context})
+        messages.append({"role": "user", "content": masked_query})
 
-        usage = body.get("usage", {})
-        total_tokens = usage.get("total_tokens") or _estimate_tokens(masked_query)
-        # Real token count, but the *rate* is still the datasheet-derived
-        # estimate in data/profile_workload/cloud_large.json -- Cirrascale
-        # publishes no per-token price through this API. Half-real, and
-        # labeled as such rather than presented as a measured cost.
-        rate = self.signals.profile.get("token_cost_usd_per_1k", 0.0)
-        return BrainResponse(
-            text=body["choices"][0]["message"]["content"].strip(),
-            latency_ms=latency_ms,
-            cost_usd=(total_tokens / 1000.0) * rate,
-        )
+        # The catalogue's larger models are frequently "Models Busy/Unavailable"
+        # (HTTP 500) -- observed for the 32B and both 70Bs, and for the 8B too
+        # during a service-wide dip, so this is load state rather than
+        # provisioning. Degrade to the smaller model rather than failing the
+        # whole escalation; the caller can see which one actually answered.
+        candidates = [self.model]
+        if self.FALLBACK_MODEL not in candidates:
+            candidates.append(self.FALLBACK_MODEL)
+
+        last_error: CloudBrainError | None = None
+        for model in candidates:
+            try:
+                body, latency_ms = self._post(model, messages)
+            except CloudBrainError as exc:
+                last_error = exc
+                continue
+            if "choices" not in body:
+                last_error = CloudBrainError(f"unexpected response: {str(body)[:200]}")
+                continue
+            usage = body.get("usage", {})
+            self.model_used = model
+            return BrainResponse(
+                text=body["choices"][0]["message"]["content"].strip(),
+                latency_ms=latency_ms,
+                cost_usd=self._cost_usd(
+                    model,
+                    usage.get("prompt_tokens", 0),
+                    usage.get("completion_tokens", 0),
+                ),
+            )
+        raise last_error or CloudBrainError("no cloud model answered")
 
 
 class GenieError(RuntimeError):
