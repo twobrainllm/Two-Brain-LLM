@@ -42,6 +42,9 @@ data/npu_model/**/*.gguf
 # GenieX experiment venv (source-only sdist, auto-provisions a native SDK)
 .venv-geniex/
 
+# Local scratch space -- drafts, PR bodies, throwaway notes. Never committed.
+scratch/
+
 # Credentials for the Cloud AI 100 deep brain (Cirrascale AI Suite endpoint).
 # Never commit. CloudDeepBrain reads INFERENCE_CLOUD_API_KEY /
 # INFERENCE_CLOUD_ENDPOINT from the environment, not from a tracked file.
