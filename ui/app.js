@@ -20,8 +20,53 @@ const els = {
   composerInput: document.getElementById("composer-input"),
   sendBtn: document.getElementById("send-btn"),
   brainToggle: document.getElementById("brain-toggle"),
+  exprButtons: document.getElementById("expr-buttons"),
   robotTemplate: document.getElementById("robot-svg-template"),
 };
+
+const LOOK_DIRECTIONS = ["left", "right", "up", "down"];
+const LOOK_VARIANTS = ["look", "shrink-look", "expand-look"];
+const EXPRESSIONS = [
+  "happy",
+  "wink",
+  "surprised",
+  ...LOOK_VARIANTS.flatMap((variant) => LOOK_DIRECTIONS.map((dir) => `${variant}-${dir}`)),
+];
+const EXPRESSION_HOLD_MS = { happy: 500, wink: 900, surprised: 700 };
+for (const name of EXPRESSIONS) {
+  if (!(name in EXPRESSION_HOLD_MS)) EXPRESSION_HOLD_MS[name] = 1600;
+}
+
+/**
+ * Plays a one-off expression on an avatar, then reverts to its normal
+ * idle breathing/blink. `name` must be one of EXPRESSIONS.
+ *
+ * Cancels any expression animation still in flight before switching --
+ * a class swap alone can leave the old animation's current frame (e.g.
+ * a wink's closed eye) rendered for a tick before the new one takes
+ * over, since the browser doesn't restart a still-running animation
+ * until its next style recalc.
+ */
+function playExpression(avatarEl, name, holdMs) {
+  if (!avatarEl) return;
+  for (const el of avatarEl.querySelectorAll(".rb-eye, .rb-eye-wrap, .rb-face-inner")) {
+    for (const anim of el.getAnimations()) anim.cancel();
+  }
+  for (const e of EXPRESSIONS) avatarEl.classList.remove(`expr-${e}`);
+  clearTimeout(avatarEl._exprTimeout);
+  avatarEl.classList.add(`expr-${name}`);
+  avatarEl._exprTimeout = setTimeout(() => {
+    avatarEl.classList.remove(`expr-${name}`);
+  }, holdMs ?? EXPRESSION_HOLD_MS[name] ?? 900);
+}
+
+function activePreviewAvatar() {
+  if (els.messages.style.display !== "none") {
+    const last = els.messages.querySelector(".message.assistant:last-child .robot-avatar");
+    if (last) return last;
+  }
+  return els.emptyStateAvatar;
+}
 
 const state = {
   chats: loadChats(),
@@ -283,6 +328,7 @@ async function handleSend(e) {
   saveChats();
   renderMessages(chat);
   renderChatList();
+  playExpression(els.messages.querySelector(".message.assistant:last-child .robot-avatar"), "happy");
 }
 
 function autoGrow() {
@@ -331,6 +377,11 @@ els.composerInput.addEventListener("keydown", (e) => {
 els.brainToggle.addEventListener("click", (e) => {
   const btn = e.target.closest(".segment");
   if (btn) setTier(btn.dataset.tier);
+});
+
+els.exprButtons.addEventListener("click", (e) => {
+  const btn = e.target.closest("button");
+  if (btn) playExpression(activePreviewAvatar(), btn.dataset.expr);
 });
 
 renderChatList();

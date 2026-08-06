@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Two-Brain Chat</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect x='3' y='3' width='34' height='34' rx='10' fill='%23007CC0' opacity='.25'/%3E%3Crect x='7' y='7' width='26' height='26' rx='7' fill='%23007CC0'/%3E%3Crect x='13' y='17' width='5' height='9' rx='2.5' fill='%23111318'/%3E%3Crect x='22' y='17' width='5' height='9' rx='2.5' fill='%23111318'/%3E%3C/svg%3E" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect x='3' y='3' width='34' height='34' rx='10' fill='%238A8A8A' opacity='.25'/%3E%3Crect x='7' y='7' width='26' height='26' rx='7' fill='%238A8A8A'/%3E%3Crect x='13' y='17' width='5' height='9' rx='2.5' fill='%23111318'/%3E%3Crect x='22' y='17' width='5' height='9' rx='2.5' fill='%23111318'/%3E%3C/svg%3E" />
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -32,6 +32,41 @@
           <button class="segment" data-tier="cloud" role="radio" aria-checked="false" type="button">Cloud</button>
         </div>
       </div>
+
+      <div class="expression-preview" title="Demo control — triggers a one-off expression, see ui/README.md">
+        <span class="brain-toggle-label">Preview expression</span>
+        <div id="expr-buttons">
+          <div class="expr-row">
+            <button type="button" data-expr="happy">Happy</button>
+            <button type="button" data-expr="surprised">Surprised</button>
+            <button type="button" data-expr="wink">Wink</button>
+          </div>
+
+          <div class="expr-row-label">Look</div>
+          <div class="expr-row">
+            <button type="button" data-expr="look-left">←</button>
+            <button type="button" data-expr="look-right">→</button>
+            <button type="button" data-expr="look-up">↑</button>
+            <button type="button" data-expr="look-down">↓</button>
+          </div>
+
+          <div class="expr-row-label">Look + shrink</div>
+          <div class="expr-row">
+            <button type="button" data-expr="shrink-look-left">←</button>
+            <button type="button" data-expr="shrink-look-right">→</button>
+            <button type="button" data-expr="shrink-look-up">↑</button>
+            <button type="button" data-expr="shrink-look-down">↓</button>
+          </div>
+
+          <div class="expr-row-label">Look + expand</div>
+          <div class="expr-row">
+            <button type="button" data-expr="expand-look-left">←</button>
+            <button type="button" data-expr="expand-look-right">→</button>
+            <button type="button" data-expr="expand-look-up">↑</button>
+            <button type="button" data-expr="expand-look-down">↓</button>
+          </div>
+        </div>
+      </div>
     </div>
   </aside>
 
@@ -47,8 +82,12 @@
           <svg viewBox="0 0 40 40">
             <rect class="rb-face-outer" x="3" y="3" width="34" height="34" rx="10"/>
             <rect class="rb-face-inner" x="7" y="7" width="26" height="26" rx="7"/>
-            <rect class="rb-eye rb-eye-l" x="13" y="17" width="5" height="9" rx="2.5"/>
-            <rect class="rb-eye rb-eye-r" x="22" y="17" width="5" height="9" rx="2.5"/>
+            <g class="rb-eye-wrap">
+              <rect class="rb-eye rb-eye-l" x="13" y="17" width="5" height="9" rx="2.5"/>
+            </g>
+            <g class="rb-eye-wrap">
+              <rect class="rb-eye rb-eye-r" x="22" y="17" width="5" height="9" rx="2.5"/>
+            </g>
           </svg>
         </div>
         <h1>How can I help you today?</h1>
@@ -72,8 +111,12 @@
   <svg viewBox="0 0 40 40">
     <rect class="rb-face-outer" x="3" y="3" width="34" height="34" rx="10"/>
     <rect class="rb-face-inner" x="7" y="7" width="26" height="26" rx="7"/>
-    <rect class="rb-eye rb-eye-l" x="13" y="17" width="5" height="9" rx="2.5"/>
-    <rect class="rb-eye rb-eye-r" x="22" y="17" width="5" height="9" rx="2.5"/>
+    <g class="rb-eye-wrap">
+      <rect class="rb-eye rb-eye-l" x="13" y="17" width="5" height="9" rx="2.5"/>
+    </g>
+    <g class="rb-eye-wrap">
+      <rect class="rb-eye rb-eye-r" x="22" y="17" width="5" height="9" rx="2.5"/>
+    </g>
   </svg>
 </template>
 
