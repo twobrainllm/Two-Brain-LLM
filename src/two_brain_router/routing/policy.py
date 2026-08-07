@@ -14,13 +14,44 @@ from typing import Literal
 class RouteDecision:
     """The full record of one routed request -- answer plus its audit trail."""
 
-    tier_answered: Literal["local", "cloud"]
+    #: `"hybrid"` means **both** brains contributed: the local model answered
+    #: what it could and named a gap, and the deep brain answered only that gap
+    #: (Shape C -- docs/ORCHESTRATOR.md). It is a third value rather than
+    #: `"cloud"` because the two are different privacy events *and* different
+    #: cost events, and collapsing them would make the audit trail lie in both
+    #: directions. For the "did anything cross the boundary?" question, treat
+    #: `"hybrid"` exactly like `"cloud"` -- it did.
+    tier_answered: Literal["local", "cloud", "hybrid"]
     difficulty_score: float
     est_latency_ms: float
     est_cost_usd: float
+    #: How many PII entities were **masked**, because something crossed a
+    #: boundary. Zero on a locally-answered query, and that zero is the good
+    #: outcome, not a missing measurement -- nothing was masked because nothing
+    #: left the device. Compare `pii_entities_detected`, which is what the query
+    #: contained regardless.
+    #:
+    #: These were one field until masking moved from the front door to the
+    #: boundary. Keeping them merged would have made the headline privacy claim
+    #: unreadable: a query full of PII answered entirely on-device would report
+    #: "0", which reads as "no PII here" when it actually means "all of it
+    #: stayed".
     pii_entities_masked: int
+    #: What to show the user: the merged text on a hybrid decision, the single
+    #: brain's answer otherwise. Always rehydrated, always on-device.
     answer: str
     notes: list[str]
+    #: The three fields below are populated on a hybrid decision only, so a
+    #: caller can show *which* brain said what instead of one opaque blob. All
+    #: rehydrated, same as `answer`.
+    local_answer: str | None = None
+    cloud_answer: str | None = None
+    #: What the local model said it could not do, in its own words.
+    gap: str | None = None
+    #: How many PII entities the query contained, whether or not any were
+    #: masked. Always populated. Defaulted so the field could be added without
+    #: breaking any existing construction of this dataclass.
+    pii_entities_detected: int = 0
 
 
 @dataclass
@@ -37,9 +68,39 @@ class RoutePolicy:
     #: Local answer is preferred whenever it fits this budget at the tier's
     #: profiled per-token rate (data/profile_workload/<tier>.json).
     local_latency_budget_ms: float = 3000
+    #: The same ceiling for Shape C, and deliberately a much larger number.
+    #:
+    #: `local_latency_budget_ms` exists to avoid *starting* a local inference
+    #: whose answer would then be thrown away -- "a local answer would have been
+    #: discarded anyway". **That premise is false in Shape C.** There, a usable
+    #: local answer is always kept and shown to the user; the deep brain is
+    #: asked a narrower question alongside it, not instead of it. So the local
+    #: call is never waste, and pricing it as if it were skipped the fast brain
+    #: on two of the four demo queries -- including the PII one, where skipping
+    #: it sent to the cloud a query the local model went on to answer fully
+    #: on-device.
+    #:
+    #: This is therefore a runaway guard, not a target. The value comes from
+    #: measurement, not preference: real structured answers on the AI-PC tier
+    #: took 2558-6501 ms (see data/npu_model/phi-3.5-mini-instruct/
+    #: _real_structured_inference_log.md), so this sits at roughly 2.3x the
+    #: slowest observed call -- high enough never to fire on a normal query,
+    #: low enough to bail on a pathological one.
+    local_partial_budget_ms: float = 15000
     #: Escalated context is trimmed to this many characters before it leaves
     #: the device.
     max_context_chars: int = 800
+    #: On a hybrid decision, whether the local model's partial answer is sent
+    #: to the deep brain alongside the gap.
+    #:
+    #: A privacy/quality trade, which is why it is a visible knob and not an
+    #: implementation detail. **On:** the deep brain can complete the answer
+    #: instead of duplicating it, at the cost of one more piece of
+    #: locally-generated text crossing the boundary (masked first, like
+    #: everything else). **Off:** strictly less leaves the device, and the two
+    #: halves may overlap or contradict, because the deep brain is answering
+    #: the gap blind.
+    send_partial_to_cloud: bool = True
 
     def estimate_local_latency_ms(self, profile: dict, query: str) -> float:
         """What the fast brain would cost for this query, per its profile."""
@@ -52,6 +113,28 @@ class RoutePolicy:
             difficulty >= self.escalate_threshold
             or local_latency_est_ms > self.local_latency_budget_ms
         )
+
+    def needs_gap_fill(self, difficulty: float, gap: str) -> bool:
+        """Does this structured local answer need the deep brain at all?
+
+        Two independent triggers, ORed:
+
+        - **A named gap.** The local model explicitly said which part it could
+          not do. That is a direct statement about *this* query and it counts
+          on its own, even at high confidence -- a model can be entirely sure
+          about the half it answered and still be missing the other half.
+          Ignoring a stated gap because the overall number looked good would
+          throw away the most specific signal in the system.
+        - **Low confidence**, via the same `escalate_threshold` every other path
+          uses. Still one threshold, not two.
+
+        Deliberately no latency term, unlike `should_escalate`. By the time this
+        is asked the local inference has already been paid for, and the budget
+        was settled *before* the call (see `router.py::_route_on_confidence`).
+        Re-testing it here could only add the deep brain's latency on top of
+        time already spent.
+        """
+        return bool(gap.strip()) or difficulty >= self.escalate_threshold
 
     def escalation_note(self, difficulty: float, local_latency_est_ms: float) -> str:
         return (

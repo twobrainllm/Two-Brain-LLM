@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.log
+genie_bundle_l_phone/
+*.dlc
+*.bin
+*.qnn
+.DS_Store

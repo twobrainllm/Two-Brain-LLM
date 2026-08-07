@@ -265,3 +265,202 @@ support it without closing the first session first.
 After the fix, all 4 of Phase 6's real-hardware tests pass under
 `.venv-npu`: `test_real_inference_smoke`, `test_npu_ep_assignment`,
 `test_router_end_to_end_with_real_brain`, `test_brain_reachable_cleanly`.
+
+## Attempt 5 -- Shape B (self-rated confidence), re-deployed in a fresh checkout
+
+Context: this checkout (`.../Downloads/QUAD/QUAD-Client-main/samples/
+two_brain_privacy_router`) had neither `.venv-npu` nor the gitignored artifact.
+Both were rebuilt from scratch, then `NpuFastBrain` was switched to Shape B so
+the AI PC tier routes on the model's own confidence instead of the
+surface-feature heuristic. Four real defects surfaced; all four are fixed and
+logged below, per the receipts rule.
+
+### Artifact provenance for this checkout
+
+The zip was copied from a sibling clone of this repo on the same machine
+(`C:\Users\qc_de\dev\hollowbyte\Two-Brain-LLM`) rather than re-fetched, then
+verified against this directory's own download receipt **before** extracting:
+
+- size `2078158835` bytes -- exact match to `_real_download_log.md`'s
+  `Content-Length`
+- SHA256 `4e1573f75d666e0bf2a24678dcfb539edfc9e7c8a109e1c3f9b8913633718e13`
+  -- exact match
+
+The hash is the integrity check, so this is equivalent to a fresh S3 GET for
+correctness purposes; it does **not** independently re-prove the URL is still
+live, and this log should not be read as claiming it does.
+
+**Real discrepancy found while verifying the extracted files.** Seven of the
+eight match `_real_download_log.md`'s table byte-for-byte. `genie_config.json`
+does not: **5,375 bytes here vs. 5,376 in the table.** Cause, confirmed by
+byte-diffing against the sibling clone: that clone's copy has been hand-edited,
+`"use-mmap": true` -> `"use-mmap": false` (a 1-byte change, `true`->`false`),
+and the receipt table recorded the *edited* size. This checkout's file is the
+pristine content of the SHA256-verified zip and is left unmodified. The edit is
+documented nowhere in that clone; `use-mmap: true` was tested here and works
+(and cold-loads roughly twice as fast -- see below), so it was kept.
+
+### Real bug 4 -- `_check` treated Genie *warnings* as fatal errors
+
+First Shape B run died immediately:
+
+```
+GenieError: GenieDialog_query failed with Genie_Status_t=1
+```
+
+`GenieCommon.h` (QAIRT 2.38 SDK, `include/Genie/GenieCommon.h:69-86`) splits the
+status space by sign: `GENIE_STATUS_SUCCESS 0`, errors negative
+(`GENIE_STATUS_ERROR_GENERAL -1` ... `-14`), warnings positive --
+**`GENIE_STATUS_WARNING_ABORTED 1`**. `_check` raised on `status != 0`.
+
+This is self-inflicted and was latent in the shipped code, not introduced by
+Shape B: `answer()` itself signals `GENIE_DIALOG_ACTION_ABORT` once
+`_MAX_NEW_TOKENS` is reached, and Genie then returns `WARNING_ABORTED(1)` from
+`GenieDialog_query` -- so **the token cap crashed the very call it existed to
+truncate.** It went unnoticed because every run in Attempts 1-4 produced short
+answers that stopped on the `<|end|>` stop sequence well before the cap. Fixed:
+`_check` now raises only on `status < 0`.
+
+### Real bug 5 -- `close()` was not idempotent, corrupting the *next* session
+
+With bug 4 fixed, creating a second brain in the same process (after the first
+was explicitly closed) failed:
+
+```
+GenieError: GenieDialog_reset failed with Genie_Status_t=-5   # ERROR_INVALID_HANDLE
+```
+
+`close()` freed the dialog and config handles without clearing them, and
+`__del__` calls `close()` too -- so an explicit `close()` followed by garbage
+collection freed the same native handles twice. The double-free corrupted
+Genie's internal state such that a *subsequent, non-overlapping* session got an
+invalid handle. `__del__`'s `except Exception` could not catch it, because
+freeing a stale handle returns a status code rather than raising. Fixed:
+`close()` clears each handle as it frees it.
+
+Note this is a *different* failure from Attempt 4's concurrent-session limit.
+That one is a real hardware/runtime constraint on two live sessions; this one is
+a plain refcounting bug in this code, and sequential create-close-create works
+correctly once fixed.
+
+### Real bug 6 -- `genie-t2t-run.exe` hits Windows MAX_PATH in a deep checkout
+
+`test_npu_ep_assignment` failed here while the same artifact worked in the
+sibling clone:
+
+```
+Genie: 2.1ms [ ERROR ] NSPModel: Can't access model file : weight_sharing_model_ar128_ar1_cl512_cl1024_cl2048_cl3072_cl4096_1_of_4.serialized.bin
+Failed to create the dialog.
+```
+
+The file exists, the name in `genie_config.json`'s `ctx-bins` matches, and the
+CLI's cwd is the artifact directory. The actual cause is **path length**: the
+resolved path is **269 characters** in this checkout vs. **233** in the sibling
+-- MAX_PATH is 260. `LongPathsEnabled=1` is set machine-wide on this box, but
+that only helps executables manifested `longPathAware`, and QAIRT 2.38's
+`genie-t2t-run.exe` is not. `NpuFastBrain` itself is unaffected (Python is
+long-path aware and passes absolute paths), which is why only the CLI-based test
+hit it. Ruled out first, not assumed: `use-mmap: false` was tested and failed
+identically, so the config difference above is not the cause.
+
+Fixed in `tests/test_npu_brain.py` with `_short_path_to()`, which runs the CLI
+through a temporary directory junction (`mklink /J`, no elevation needed) when
+the real path is too long. Skipping instead would have silently dropped the only
+automatable on-HTP execution receipt this suite has, purely because of where the
+repo was cloned. With the junction, the CLI produces **392 `QnnGraph_execute
+started` / 392 `done` pairs against `QnnHtp`, and zero `ExecutionProvider` or
+CPU-fallback mentions** -- the same on-device evidence as Attempt 2.
+
+### Real finding -- the model complies with the format, but will not stop
+
+Appending `SELF_REPORT_SUFFIX` to the prompt works: Phi-3.5 emits a parseable
+`CONFIDENCE:` line. But left to itself it then keeps generating unasked-for
+rationale until the token cap, e.g. (verbatim, truncated mid-word by the cap):
+
+> `Paris\n\nCONFIDENCE: 95\n\nRationale: The question is straightforward and
+> pertains to a commonly known fact. […] as this is a basic geographical
+> knowledge point that doesn't typically require verification.`
+
+That tripled latency (mean **5659 ms** vs **1767 ms**) and left truncated prose
+in the answer text. Three prompt variants were measured against 4-7 queries
+each:
+
+| Variant | Mean latency | Outcome |
+|---|---|---|
+| A -- suffix only, unchanged system prompt | 5659 ms | rambles every time |
+| B -- "output nothing after the CONFIDENCE line" | 2532 ms | **rejected** -- reordered to confidence-first and sometimes returned `CONFIDENCE: 85` with **no answer at all** |
+| C -- "exactly two parts" | 5508 ms | still rambles |
+| **D -- strict two-line + `"\n\n"` stop sequence** | **1767 ms** | shipped |
+
+D works because the system prompt forbids blank lines *inside* the reply, so a
+blank line can only occur after the confidence number -- which makes `"\n\n"` a
+safe stop sequence. If the model disobeys, generation stops before the number,
+nothing parses, and the query escalates: the safe direction.
+
+B is worth recording as a rejected option rather than a failed one: it was the
+fastest variant measured, and an empty answer is still worse than a slow one.
+
+### Real re-profile (n=8, through `NpuFastBrain.answer()`, Shape B prompt)
+
+TTFT timed to the first streamed Genie callback, so these are numbers from the
+exact code path the router uses -- not the CLI.
+
+| Query | Total | TTFT | Tokens | ms/token | Confidence |
+|---|---|---|---|---|---|
+| What time zone is Tokyo in? | 1270 | 132.8 | 16 | 75.8 | 0.95 |
+| What is the capital of France? | 837 | 96.6 | 11 | 74.0 | 0.95 |
+| Who wrote Pride and Prejudice? | 661 | 99.4 | 7 | 93.6 | **None** |
+| How many continents are there? | 1381 | 117.9 | 19 | 70.2 | 0.95 |
+| What is gravity? | 2102 | 100.2 | 28 | 74.1 | 0.85 |
+| Explain why the sky is blue. | 3030 | 99.2 | 43 | 69.8 | 0.95 |
+| Boiling point of water at sea level? | 1133 | 93.5 | 17 | 65.0 | 1.00 |
+| Merge sort vs quicksort worst case | 3085 | 107.8 | 43 | 70.9 | 0.95 |
+
+Summary: **ttft_mean 105.9 ms, ttft_p95 117.9 ms (a real order statistic now --
+the previous pass had n=1 and set p95 = mean as a placeholder), per_token_mean
+74.2 ms, 13.5 tok/s.** Cold load **6498 ms**. Mean total 1687 ms.
+
+**`per_token_mean` went *down*, 94.5 -> 74.2, and that is a correction rather
+than a speedup.** Attempt 2's figure came from a single 2180-token runaway whose
+context-length bucket climbed 512 -> 3072 mid-run; decode is slower at longer
+context, so that number was biased high. Shape B answers are 7-43 tokens and
+stay in the 512 bucket. Cold load likewise dropped 13134 -> 6498 ms, which is
+attributable to `use-mmap: true` (this checkout's pristine config) vs. `false`
+(the edited sibling config Attempt 3b ran against).
+
+`tokens_max` was **43**, comfortably under `_MAX_NEW_TOKENS = 96` -- that is the
+measurement the raised cap is set from, and it confirms the cap is a runaway
+guard rather than something the normal path reaches.
+
+### Real finding -- the confidence signal barely discriminates
+
+Seven of eight queries parsed, and the parsed values were **0.85, 0.95, 0.95,
+0.95, 0.95, 0.95, 1.00**. Inverted to difficulty that is 0.00-0.15, all far
+below `RoutePolicy.escalate_threshold = 0.55`.
+
+So on this artifact the self-report separates "produced a number" from "didn't",
+but it does **not** meaningfully separate easy queries from hard ones -- the
+merge-sort derivation self-rated 0.95, the same as "What is the capital of
+France?". In practice the AI PC tier's escalations are therefore driven almost
+entirely by the latency budget pre-check, not by the confidence.
+
+This is a real result, not a tuning failure, and it is exactly the calibration
+risk `docs/WALKTHROUGH.md` next-step #4(b) flagged as unverified. It is
+recorded here rather than papered over by moving the threshold: the honest
+reading is that a 3B quantized model's prompted self-report is a weak difficulty
+signal, and closing that gap needs either logprobs (which Genie does not expose
+through this C API) or `confidence_estimator.py`'s `hybrid()` approach.
+
+The one unparsed query is instructive too: "Who wrote Pride and Prejudice?"
+returned `'Jane Austen, 95'` -- the model dropped the `CONFIDENCE:` label while
+still supplying the number. That falls through to `difficulty = 1.0` and
+escalates, which is the safe direction but the wrong answer for a trivially easy
+question.
+
+### Verification
+
+All 40 base-suite tests pass unmodified, including both privacy regression
+tests (`test_escalated_pii_never_reaches_cloud_unmasked` and
+`test_pii_never_reaches_the_phone_or_the_cloud_unmasked`). All 5 real-hardware
+tests pass under `.venv-npu` -- the original four plus
+`test_self_reported_confidence_is_parsed_and_stripped`.
