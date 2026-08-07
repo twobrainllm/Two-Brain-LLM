@@ -13,11 +13,14 @@ Run with:
 """
 from __future__ import annotations
 
+import contextlib
 import glob
 import os
 import subprocess
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
@@ -65,6 +68,47 @@ def _find_genie_cli() -> str | None:
     return candidates[-1] if candidates else None
 
 
+#: Windows' classic path ceiling. `genie-t2t-run.exe` (QAIRT 2.38) is not
+#: manifested long-path-aware, so it resolves the relative `ctx-bins` names in
+#: genie_config.json through the MAX_PATH-limited API and fails with
+#: `NSPModel: Can't access model file : ...` when the checkout sits deep enough
+#: that artifact_dir + filename exceeds this -- even with the machine-wide
+#: LongPathsEnabled=1 registry flag set. `NpuFastBrain` itself is unaffected
+#: (Python *is* long-path aware, and it passes absolute paths), which is why
+#: only this CLI-based test hits it.
+_MAX_PATH = 260
+
+
+@contextlib.contextmanager
+def _short_path_to(directory: Path):
+    """Yield a path to `directory` that is short enough for a non-long-path-aware
+    exe, via a temporary junction when the real one is too long.
+
+    A junction (`mklink /J`) rather than a symlink: it needs no elevation and no
+    Developer Mode. Skipping instead would quietly drop the only automatable
+    on-HTP execution receipt this suite has, purely because of where the repo
+    was cloned.
+    """
+    longest = max((len(f.name) for f in directory.iterdir()), default=0)
+    if len(str(directory)) + 1 + longest < _MAX_PATH:
+        yield directory
+        return
+
+    link = Path(tempfile.gettempdir()) / f"tbnpu{os.getpid()}"
+    if link.exists():
+        link.unlink()
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(directory)],
+        check=True,
+        capture_output=True,
+    )
+    try:
+        yield link
+    finally:
+        # rmdir removes the junction itself, never the files it points at.
+        subprocess.run(["cmd", "/c", "rmdir", str(link)], capture_output=True)
+
+
 @pytest.fixture
 def npu_brain():
     """Function-scoped, not module-scoped: a real run showed a second live
@@ -84,6 +128,30 @@ def npu_brain():
     brain.close()
 
 
+@pytest.fixture
+def npu_brain_factory():
+    """`npu_brain`, but with constructor arguments -- for tests that need a
+    brain built differently (currently: `structured=False`).
+
+    Same one-session-at-a-time discipline as `npu_brain` above, and for the same
+    hardware reason: every brain this hands out is closed on teardown, so two
+    Genie dialogs are never live at once even if a test asks for two.
+    """
+    from two_brain_router.routing.brains import NpuFastBrain
+    from two_brain_router.signals.loader import TierSignals
+
+    built: list[NpuFastBrain] = []
+
+    def _build(**kw) -> NpuFastBrain:
+        brain = NpuFastBrain("pc", TierSignals.load("pc_3b", "ai_pc"), **kw)
+        built.append(brain)
+        return brain
+
+    yield _build
+    for brain in built:
+        brain.close()
+
+
 def test_real_inference_smoke(npu_brain):
     """A fixed prompt against the real deployed model returns a non-empty,
     well-formed completion within a generous timeout -- not mocked, not the
@@ -97,6 +165,30 @@ def test_real_inference_smoke(npu_brain):
     assert not response.text.startswith("[cloud:")
     assert elapsed_ms < _INFERENCE_CEILING_MS
     assert response.cost_usd == 0.0
+
+
+def test_self_reported_confidence_is_parsed_and_stripped(npu_brain):
+    """The real model emits a usable `CONFIDENCE:` number for an easy factual
+    query, and it is removed from the answer the user sees.
+
+    This is what makes the AI PC tier route on Shape B at all -- if the number
+    stops parsing, `route()` treats the query as maximally uncertain and
+    escalates everything, which is safe but silently useless. Asserted against
+    an easy question because the interesting failure is "no number", not "a low
+    number"; calibration is a separate, still-open question (see the Attempt 5
+    calibration note in _real_inference_smoke_log.md)."""
+    assert npu_brain.reports_confidence is True
+
+    response = npu_brain.answer("What is the capital of France?")
+
+    assert response.confidence is not None, (
+        f"no parseable CONFIDENCE line -- raw text was {response.text!r}"
+    )
+    assert 0.0 <= response.confidence <= 1.0
+    assert response.error is None
+    # The self-report is routing metadata, not part of the answer.
+    assert "CONFIDENCE" not in response.text.upper()
+    assert response.text.strip()
 
 
 def test_npu_ep_assignment():
@@ -116,24 +208,28 @@ def test_npu_ep_assignment():
     env = dict(os.environ)
     env["PATH"] = os.pathsep.join([lib_dir, cli_dir, env.get("PATH", "")])
 
-    sample_prompt = _NPU_ARTIFACT_DIR / "sample_prompt.txt"
-    result = subprocess.run(
-        [
-            genie_cli,
-            "-c", "genie_config.json",
-            "--prompt_file", str(sample_prompt),
-            "--log", "info",
-            "--action", "ABORT",
-            "--sleep", "5000",
-        ],
-        cwd=str(_NPU_ARTIFACT_DIR),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
+    with _short_path_to(_NPU_ARTIFACT_DIR) as artifact_dir:
+        result = subprocess.run(
+            [
+                genie_cli,
+                "-c", "genie_config.json",
+                "--prompt_file", str(artifact_dir / "sample_prompt.txt"),
+                "--log", "info",
+                "--action", "ABORT",
+                "--sleep", "5000",
+            ],
+            cwd=str(artifact_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
 
     log = result.stdout + result.stderr
+    assert "Can't access model file" not in log, (
+        "Genie could not open the weight binaries -- if this is a long path, "
+        "_short_path_to did not shorten it enough"
+    )
     assert "QnnGraph_execute started" in log
     assert "QnnGraph_execute done" in log
     assert "QnnHtp" in log
@@ -144,10 +240,82 @@ def test_npu_ep_assignment():
     assert "forced to cpu" not in log.lower()
 
 
+def test_structured_reply_is_parsed_into_a_solution_and_a_gap(npu_brain):
+    """The real model emits Shape C's JSON, and it names the sub-question it
+    cannot do.
+
+    Asserted against a *deliberately two-part* question -- one half the model
+    certainly knows, one half it certainly does not (a population on a specific
+    date). That shape is what makes the assertion meaningful: this tier's
+    confidence number is known to be a weak signal (0.85-1.00 on everything,
+    see the Attempt 5 calibration note), so a query that is uniformly easy or
+    uniformly hard would tell us nothing about whether the *gap* field carries
+    information the confidence number doesn't.
+
+    If this starts failing, check `_real_structured_inference_log.md` first --
+    a prompt-wording change is the most likely cause, and it is measured there.
+    """
+    assert npu_brain.reports_gaps is True
+    assert npu_brain.reports_confidence is True
+
+    response = npu_brain.answer(
+        "What is the capital of France, and what was its population on "
+        "3 March 2019?"
+    )
+
+    assert response.error is None, f"raw text was {response.text!r}"
+    assert response.confidence is not None
+    assert response.text.strip()
+    # The JSON scaffolding is routing metadata, never part of the answer.
+    assert not response.text.lstrip().startswith("{")
+    assert '"solution"' not in response.text
+    assert response.unknown.strip(), (
+        "the model answered a question it demonstrably cannot fully answer "
+        "without naming any gap -- Shape C degenerates to Shape B if this stops "
+        f"happening. text={response.text!r}"
+    )
+
+
+def test_structured_mode_can_be_turned_off(npu_brain_factory):
+    """`TWO_BRAIN_STRUCTURED=0` returns the real brain to Shape B.
+
+    Worth pinning because it is the isolation tool: when this tier misbehaves,
+    it separates "the model is bad at JSON" from "the model is bad at this
+    question" without giving up the real hardware.
+    """
+    brain = npu_brain_factory(structured=False)
+    assert brain.reports_gaps is False
+    assert brain.reports_confidence is True
+
+    response = brain.answer("What is the capital of France?")
+
+    assert response.confidence is not None, f"raw text was {response.text!r}"
+    assert response.unknown == ""
+    assert "CONFIDENCE" not in response.text.upper()
+
+
 def test_router_end_to_end_with_real_brain(monkeypatch):
     """Run all three demo queries through TwoBrainRouter with NpuFastBrain
-    wired in: the easy query now returns a genuinely generated answer, and
-    masking/escalation is otherwise unchanged."""
+    wired in, on the Shape C path.
+
+    **These expectations changed when Shape C landed, and the change is the
+    point** -- the previous version asserted `"cloud"` for both the hard query
+    and the PII query. Both now keep the local model's answer instead of
+    discarding it:
+
+    - the hard query is no longer skipped on the 3000ms budget (Shape C uses
+      `local_partial_budget_ms`, because its answer is kept rather than
+      discarded -- see `_real_structured_inference_log.md`);
+    - the PII query stays entirely on-device, which is a privacy improvement,
+      not a regression: the local model answers it fully, so nothing needs to
+      cross at all.
+
+    Asserted loosely on tier, because which of `local`/`hybrid` you get depends
+    on whether the model names a gap for that particular phrasing -- a real
+    model behaviour that varies run to run. What must hold every time is the
+    invariant: nothing leaves unmasked, and anything that did leave is visible
+    in the notes.
+    """
     monkeypatch.setenv("TWO_BRAIN_NPU_BRAIN", "1")
     from two_brain_router.routing.router import TwoBrainRouter
 
@@ -158,12 +326,18 @@ def test_router_end_to_end_with_real_brain(monkeypatch):
         assert not easy.answer.startswith("[local:")
         assert easy.answer.strip()
 
-        hard = router.route(
-            "Derive the time complexity of merge sort step by step and "
-            "compare it to quicksort's worst case, then explain the "
-            "trade-offs."
+        split = router.route(
+            "What is the capital of France, and what was its population on "
+            "3 March 2019?"
         )
-        assert hard.tier_answered == "cloud"
+        assert split.tier_answered in ("local", "hybrid")
+        if split.tier_answered == "hybrid":
+            # A split keeps both halves, and both reach the user.
+            assert split.local_answer and split.local_answer.strip()
+            assert split.cloud_answer and split.cloud_answer.strip()
+            assert split.gap and split.gap.strip()
+            assert split.local_answer in split.answer
+            assert split.cloud_answer in split.answer
 
         pii = router.route(
             "My email is jane.doe@example.com and my phone is "
@@ -171,13 +345,35 @@ def test_router_end_to_end_with_real_brain(monkeypatch):
             "their SSN 123-45-6789 was found in an old backup and needs "
             "to be rotated?"
         )
-        assert pii.tier_answered == "cloud"
-        assert pii.pii_entities_masked >= 1
-        sent_off_device = next(n for n in pii.notes if n.startswith("sent off-device"))
-        assert "jane.doe@example.com" not in sent_off_device
-        assert "jane.doe@example.com" in pii.answer
+        assert pii.tier_answered in ("local", "hybrid")
+        # `detected`, not `masked`: this brain is on-device and trusted with the
+        # raw query, so a fully-local answer masks nothing at all. Asserting on
+        # `pii_entities_masked` here would demand a *leak* to pass.
+        assert pii.pii_entities_detected >= 1
+        if pii.tier_answered == "local":
+            assert pii.pii_entities_masked == 0, "nothing left the device, so nothing needed masking"
+        # The load-bearing assertion, whichever tier answered: if anything went
+        # off-device, it went masked. `next(..., None)` rather than `next(...)`
+        # because on a fully-local answer there is no such note to find -- and
+        # that absence is itself the stronger outcome.
+        sent_off_device = next(
+            (n for n in pii.notes if n.startswith("sent off-device")), None
+        )
+        if sent_off_device is not None:
+            assert "jane.doe@example.com" not in sent_off_device
+            assert "123-45-6789" not in sent_off_device
+        # Rehydration: no placeholder may survive into what the user reads, and
+        # whichever entities the model *did* refer to come back as real values.
+        # Not asserted per-entity -- a real model quotes back some of what it
+        # was given and not others (this run echoed the SSN and not the email),
+        # which is a model choice and not a router property.
+        assert "[PII_" not in pii.answer
+        assert any(
+            value in pii.answer
+            for value in ("jane.doe@example.com", "555-123-4567", "123-45-6789")
+        ), f"nothing was rehydrated into the answer: {pii.answer!r}"
     finally:
-        router.fast_brain.close()
+        router.close()
 
 
 def test_brain_reachable_cleanly():

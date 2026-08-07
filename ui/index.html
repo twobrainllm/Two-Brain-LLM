@@ -25,9 +25,16 @@
     <nav class="chat-list" id="chat-list" aria-label="Chat history"></nav>
 
     <div class="sidebar-footer">
-      <div class="brain-toggle" title="Mock control — see ui/README.md. Not wired to TwoBrainRouter yet.">
-        <span class="brain-toggle-label">Simulated brain</span>
-        <div class="segmented" id="brain-toggle" role="radiogroup" aria-label="Simulated brain tier">
+      <div
+        id="backend-status"
+        class="backend-status"
+        data-live="false"
+        title="Checked against /health on load and after every send. See ui/README.md."
+      >Checking backend…</div>
+
+      <div class="brain-toggle" title="Only used if the API is unreachable — see ui/README.md.">
+        <span class="brain-toggle-label">Preview tier (if offline)</span>
+        <div class="segmented" id="brain-toggle" role="radiogroup" aria-label="Offline preview tier">
           <button class="segment active" data-tier="local" role="radio" aria-checked="true" type="button">Local</button>
           <button class="segment" data-tier="cloud" role="radio" aria-checked="false" type="button">Cloud</button>
         </div>
@@ -81,7 +88,7 @@
           id="profiler-pill"
           aria-expanded="false"
           aria-label="Query profiler"
-          title="Mock mode — these numbers use real formulas ported from the router (see ui/README.md), but no model or network call backs them yet."
+          title="Live: the real RouteDecision from /route. Falls back to formulas ported from the router (see ui/README.md) if the API is unreachable."
         >
           <span class="profiler-dot" id="profiler-dot" data-tier="local"></span>
           <span class="profiler-summary" id="profiler-summary">Profiler</span>
@@ -141,7 +148,7 @@
           </svg>
         </div>
         <h1>How can I help you today?</h1>
-        <p class="empty-state-hint">Replies are simulated right now — use the brain toggle in the sidebar to preview the local/cloud color switch.</p>
+        <p class="empty-state-hint">Connected to the two-brain router over <code>/route</code>. If the API isn't running, replies fall back to an offline preview instead.</p>
       </div>
       <div class="messages" id="messages"></div>
     </section>

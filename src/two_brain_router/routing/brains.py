@@ -4,13 +4,21 @@ The cloud brain is still a stub: the Cloud AI 100 has no plumbing in
 QUAD-Client at all (gap #4), so it returns a *labeled* stub answer with
 latency/cost estimated from `profile_workload`'s envelope shape.
 
-The `pc_3b` local tier is no longer a stub. `NpuFastBrain` runs a real
-Phi-3.5-mini-instruct artifact on this machine's Hexagon NPU via Qualcomm's
-Genie SDK (`Genie.dll`, called through `ctypes` -- not ONNX Runtime GenAI;
-see `data/npu_model/phi-3.5-mini-instruct/_real_download_log.md` for why).
-`LocalFastBrain` remains the stub used for the mobile tier, which is still
-blocked (gap #3/#3b + #5b) -- see
-`superpowers/deploy-local-brain-npu.md`'s Non-goals.
+Neither local tier is a stub any more:
+
+- **AI PC (`pc_3b`)** -- `NpuFastBrain` runs a real Phi-3.5-mini-instruct
+  artifact on this machine's Hexagon NPU via Qualcomm's Genie SDK
+  (`Genie.dll`, called through `ctypes` -- not ONNX Runtime GenAI; see
+  `data/npu_model/phi-3.5-mini-instruct/_real_download_log.md` for why).
+  In-process by design -- `docs/npu-deployment.md`.
+- **Mobile (`mobile_1b`)** -- `PhoneFastBrain` talks to the on-device Genie
+  server built in `src/phone_brain/` over the OpenAI-shaped contract in
+  `src/phone_brain/L_INTERFACE_CONTRACT.md`. Off-process by necessity: the
+  model runs on a physically separate device.
+
+`LocalFastBrain` remains as the labeled-stub fallback both tiers use when
+their real runtime isn't wired up, so the package still runs anywhere with
+no SDK and no hardware.
 
 This is the seam to replace with real inference: implement `Brain.answer` and
 keep the returned `BrainResponse` shape, and the router, policy, and privacy
@@ -26,7 +34,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from two_brain_router.signals.confidence import SELF_REPORT_SUFFIX, parse_self_reported
 from two_brain_router.signals.loader import DATA_DIR, TierSignals
+from two_brain_router.signals.structured import (
+    STRUCTURED_SUFFIX,
+    STRUCTURED_SYSTEM_PROMPT,
+    parse_structured,
+)
+
+#: Master switch for the structured (Shape C) reply format on the AI-PC
+#: brains. On by default -- but those brains are themselves opt-in
+#: (`TWO_BRAIN_NPU_BRAIN` / `TWO_BRAIN_GPU_BRAIN`), so nothing about the
+#: default stdlib-only path changes. Set `TWO_BRAIN_STRUCTURED=0` to get the
+#: older bare `CONFIDENCE:` self-report back (Shape B) without giving up the
+#: real brain -- useful for isolating "is the model bad at JSON?" from "is the
+#: model bad at this question?".
+_STRUCTURED_ENV_VAR = "TWO_BRAIN_STRUCTURED"
+
+
+def _structured_default() -> bool:
+    return os.environ.get(_STRUCTURED_ENV_VAR, "1") != "0"
 
 
 @dataclass
@@ -36,12 +63,75 @@ class BrainResponse:
     text: str
     latency_ms: float
     cost_usd: float = 0.0
+    #: The brain's own confidence in this answer, `[0.0, 1.0]`, or None when
+    #: this brain emits no such signal (LocalFastBrain, CloudDeepBrain -- the
+    #: stubs; both real brains, NpuFastBrain included, self-rate). See
+    #: signals/confidence.py for why None and 0.0 mean different things.
+    confidence: float | None = None
+    #: Set when the brain could not be reached or misbehaved. The router
+    #: surfaces this in RouteDecision.notes rather than raising -- per
+    #: L_INTERFACE_CONTRACT.md, a failed fast brain is an escalate signal, not
+    #: a user-visible error.
+    error: str | None = None
+    #: The part of the query this brain says it *cannot* answer, in its own
+    #: words -- empty when it answered fully, or when the brain doesn't report
+    #: gaps at all (`Brain.reports_gaps`). This is what the deep brain's
+    #: follow-up call is about; `text` stays the part that was answered. See
+    #: signals/structured.py and docs/ORCHESTRATOR.md "Shape C".
+    unknown: str = ""
+    #: A "masked" string the model volunteered, if any. Recorded for the audit
+    #: trail and never routed on -- masking is `privacy/guard.py`'s job, and it
+    #: happens at the cloud boundary rather than being delegated to a model that
+    #: was trusted with the raw text. See signals/structured.py.
+    model_masked_output: str = ""
 
 
 class Brain(Protocol):
     """Implement this to plug a real runtime in behind the router."""
 
-    def answer(self, masked_query: str, context: str = "") -> BrainResponse: ...
+    #: Whether `answer()` populates `BrainResponse.confidence`.
+    #:
+    #: This flips the *order* of the router's decision, so it is part of the
+    #: contract rather than an implementation detail. When False the router
+    #: scores difficulty first and only calls this brain if it decides to stay
+    #: local. When True the brain's own confidence *is* the difficulty signal
+    #: and arrives with the answer, so the router must call it before deciding
+    #: -- see router.py's `route()` and docs/ORCHESTRATOR.md.
+    reports_confidence: bool
+
+    #: Whether `answer()` also populates `BrainResponse.unknown` -- i.e. whether
+    #: this brain can say *which part* it couldn't do, not just how sure it is
+    #: overall. Strictly stronger than `reports_confidence`: a brain that
+    #: reports gaps necessarily self-rates, so `reports_gaps` implies
+    #: `reports_confidence` and never the reverse.
+    #:
+    #: This is what lets the router split one query across two brains instead of
+    #: picking one (Shape C -- docs/ORCHESTRATOR.md): the local answer is kept
+    #: and only the named gap is sent on. Read via `getattr(brain,
+    #: "reports_gaps", False)` in the router, so a third-party brain predating
+    #: this field is still valid.
+    reports_gaps: bool
+
+    #: Whether this brain is **inside the trust boundary** -- i.e. whether it
+    #: may be handed the user's query exactly as typed, PII and all.
+    #:
+    #: This is the flag that decides what `answer()`'s `query` argument
+    #: actually contains, so it is the most safety-critical thing in this
+    #: Protocol. True only for a model executing on *this* machine, in this
+    #: process or in a child process we started: `NpuFastBrain` (in-process
+    #: `ctypes`), `GpuLocalBrain` (a `llama-server` child on loopback), and the
+    #: in-process stub. False for anything reached across a boundary --
+    #: `PhoneFastBrain` (a physically separate device) and both cloud brains --
+    #: which receive masked text only.
+    #:
+    #: **Defaults to False everywhere it is read.** The router uses
+    #: `getattr(brain, "trusted_with_raw_pii", False)`, so a brain that forgets
+    #: to declare it gets masked input. Forgetting to opt *in* costs answer
+    #: quality; forgetting to opt *out* would leak, so the default is the one
+    #: that fails safe.
+    trusted_with_raw_pii: bool
+
+    def answer(self, query: str, context: str = "") -> BrainResponse: ...
 
 
 class VisionBrain(Brain, Protocol):
@@ -58,14 +148,56 @@ class VisionBrain(Brain, Protocol):
     like any other text, and sending only that.
     """
 
-    def answer(self, masked_query: str, context: str = "", image: Path | None = None) -> BrainResponse: ...
+    def answer(self, query: str, context: str = "", image: Path | None = None) -> BrainResponse: ...
 
     def describe_image(self, image: Path, question: str = "") -> BrainResponse: ...
 
 
-def _estimate_tokens(masked_query: str) -> int:
+def _estimate_tokens(query: str) -> int:
     """Token count the latency/cost estimates are driven off."""
-    return max(len(masked_query.split()) * 2, 16)
+    return max(len(query.split()) * 2, 16)
+
+
+def _to_brain_response(raw_text: str, latency_ms: float, structured: bool) -> BrainResponse:
+    """Turn a self-rating brain's raw completion into a `BrainResponse`.
+
+    Shared by `NpuFastBrain` and `GpuLocalBrain` on purpose: both real AI-PC
+    brains must report a number, a gap, and *the absence of either* in exactly
+    the same way, or the router's Shape B/C paths would treat two backends of
+    the same tier differently for reasons that have nothing to do with the
+    query. `PhoneFastBrain` keeps its own tail because it is Shape B only.
+
+    `error` is set whenever no confidence came back. That is not "the call
+    failed" -- the text is still returned and still usable -- it is the audit
+    trail for a formatting failure the router will read as maximally uncertain.
+    """
+    parsed = parse_structured(raw_text) if structured else None
+    if parsed is None:
+        answer, confidence = parse_self_reported(raw_text)
+        unknown = ""
+        model_masked = ""
+        note = "no parseable CONFIDENCE line in the response"
+    else:
+        answer, confidence = parsed.solution, parsed.confidence
+        unknown = parsed.unknown
+        model_masked = parsed.model_masked_output
+        note = (
+            "no parseable JSON object in the response"
+            if parsed.source == "raw"
+            else "fell back to a bare CONFIDENCE: line -- no JSON object in the response"
+        )
+    return BrainResponse(
+        text=answer,
+        latency_ms=latency_ms,
+        cost_usd=0.0,
+        confidence=confidence,
+        unknown=unknown,
+        model_masked_output=model_masked,
+        # A structured reply that degraded to `source="self_report"` still
+        # produced a usable number, so it is not an error -- only the total
+        # absence of a signal is.
+        error=None if confidence is not None else note,
+    )
 
 
 class LocalFastBrain:
@@ -76,16 +208,23 @@ class LocalFastBrain:
     profile_workload's real envelope shape (data/profile_workload/<tier>.json).
     """
 
+    reports_confidence = False
+    reports_gaps = False
+    #: In-process, so it is inside the boundary like the real local brains --
+    #: a stub that received *different* input from the thing it stands in for
+    #: would make the default path a bad rehearsal for the real one.
+    trusted_with_raw_pii = True
+
     def __init__(self, tier: str, signals: TierSignals) -> None:
         self.tier = tier
         self.signals = signals
 
-    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+    def answer(self, query: str, context: str = "") -> BrainResponse:
         latency_ms = self.signals.profile["latency_ms"]
-        n_tokens = _estimate_tokens(masked_query)
+        n_tokens = _estimate_tokens(query)
         est_latency = latency_ms["ttft_mean"] + n_tokens * latency_ms["per_token_mean"]
         return BrainResponse(
-            text=f"[local:{self.tier} mock fast-brain response to: {masked_query!r}]",
+            text=f"[local:{self.tier} mock fast-brain response to: {query!r}]",
             latency_ms=est_latency,
             cost_usd=0.0,
         )
@@ -99,13 +238,19 @@ class CloudDeepBrain:
     from data/profile_workload/cloud_large.json, network RTT included.
     """
 
+    reports_confidence = False
+    reports_gaps = False
+    #: The boundary itself. Never raw text, even as a stub -- if this were ever
+    #: True the whole sample would be pointless.
+    trusted_with_raw_pii = False
+
     def __init__(self, signals: TierSignals) -> None:
         self.signals = signals
 
-    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+    def answer(self, query: str, context: str = "") -> BrainResponse:
         prof = self.signals.profile
         latency_ms = prof["latency_ms"]
-        n_tokens = _estimate_tokens(masked_query)
+        n_tokens = _estimate_tokens(query)
         est_latency = (
             latency_ms["network_rtt_mean"]
             + latency_ms["ttft_mean"]
@@ -114,7 +259,7 @@ class CloudDeepBrain:
         cost = (n_tokens / 1000.0) * prof["token_cost_usd_per_1k"]
         return BrainResponse(
             text=(
-                f"[cloud:ai100 mock deep-brain response to: {masked_query!r} "
+                f"[cloud:ai100 mock deep-brain response to: {query!r} "
                 f"| context_used={context!r}]"
             ),
             latency_ms=est_latency,
@@ -172,6 +317,14 @@ class CirrascaleDeepBrain:
     _MAX_NEW_TOKENS = 512
     _TIMEOUT_S = 300
 
+    #: The deep brain is the *destination* of a routing decision, never an
+    #: input to one. It is asked to answer, not to rate itself or to hand work
+    #: back -- there is nothing above it to escalate to.
+    reports_confidence = False
+    reports_gaps = False
+    #: This class is the reason the boundary exists.
+    trusted_with_raw_pii = False
+
     def __init__(
         self,
         signals: TierSignals,
@@ -228,11 +381,11 @@ class CirrascaleDeepBrain:
             raise CloudBrainError(f"cloud endpoint unreachable: {exc.reason}") from exc
         return body, (time.perf_counter() - start) * 1000
 
-    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+    def answer(self, query: str, context: str = "") -> BrainResponse:
         messages = []
         if context:
             messages.append({"role": "system", "content": context})
-        messages.append({"role": "user", "content": masked_query})
+        messages.append({"role": "user", "content": query})
 
         # The catalogue's larger models are frequently "Models Busy/Unavailable"
         # (HTTP 500) -- observed for the 32B and both 70Bs, and for the 8B too
@@ -331,12 +484,70 @@ class NpuFastBrain:
     an explicit stop sequence and additionally bounds output length itself.
     """
 
-    _MAX_NEW_TOKENS = 48
-    _STOP_SEQUENCES = ["<|end|>", "<|user|>", "<|system|>"]
+    #: This model self-rates: it answers and reports its own confidence in one
+    #: call, so the router uses that number as the difficulty signal instead of
+    #: `signals/difficulty.py`'s surface-feature heuristic (Shape B --
+    #: docs/ORCHESTRATOR.md). Same mechanism as `PhoneFastBrain`, so both real
+    #: brains report the same way and `routing/policy.py` stays untouched.
+    #:
+    #: Honest caveat: this is a *prompted self-report*, not a logprob. Genie
+    #: still exposes no token probabilities through the C API used here, so the
+    #: number is the model's own claim about itself. Measured discrimination on
+    #: this artifact is weak -- see the calibration note in
+    #: data/npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md
+    #: (Attempt 5); it separates "can't answer" from "can", not easy from hard.
+    reports_confidence = True
 
-    def __init__(self, tier: str, signals: TierSignals, artifact_dir: Path | None = None) -> None:
+    #: Inside the boundary: this runs *in this process*, through `ctypes` into
+    #: `Genie.dll`, on this machine's own NPU. Nothing it is given is
+    #: transmitted anywhere. So it gets the query as the user typed it --
+    #: masking it here would only degrade the answer (a model asked to draft a
+    #: reply to `[PII_EMAIL_1]` writes a worse reply than one that can see the
+    #: address) while protecting nothing.
+    trusted_with_raw_pii = True
+
+    #: Raised from 48 when the self-report was added: the answer *plus* the
+    #: `CONFIDENCE:` line has to fit, and a cap that truncates the line away
+    #: silently turns every query into an escalation. This is a runaway guard,
+    #: not a target -- measured answers land well under it (mean ~1.8s / query,
+    #: Attempt 5), because `_STOP_SEQUENCES` ends generation first.
+    _MAX_NEW_TOKENS = 96
+
+    #: Structured mode has strictly more to emit than `CONFIDENCE:` mode -- the
+    #: JSON scaffolding, plus an `unknown` field that is *prose*, not a number
+    #: -- so it gets its own, larger cap. The same "a cap that truncates the
+    #: format away turns every query into an escalation" reasoning applies, only
+    #: harder: a JSON object cut off mid-string doesn't degrade, it fails to
+    #: parse entirely. `"\n\n"` still ends generation well before this in
+    #: practice, because single-line JSON is what STRUCTURED_SUFFIX asks for.
+    _STRUCTURED_MAX_NEW_TOKENS = 320
+
+    #: `"\n\n"` is load-bearing, not cosmetic. Left to itself this model emits
+    #: the answer, the `CONFIDENCE:` line, a blank line, and then paragraphs of
+    #: unasked-for rationale until the token cap -- which tripled latency
+    #: (~5.7s vs ~1.8s per query) and left truncated mid-word prose in the
+    #: answer. `_render_prompt`'s system message forbids blank lines *inside*
+    #: the reply, so a blank line can only occur after the confidence number,
+    #: which makes it a safe place to stop. If the model disobeys and puts one
+    #: earlier, generation stops before the number, nothing parses, and the
+    #: query escalates -- the safe direction.
+    _STOP_SEQUENCES = ["<|end|>", "<|user|>", "<|system|>", "\n\n"]
+
+    def __init__(
+        self,
+        tier: str,
+        signals: TierSignals,
+        artifact_dir: Path | None = None,
+        structured: bool | None = None,
+    ) -> None:
         self.tier = tier
         self.signals = signals
+        #: On unless TWO_BRAIN_STRUCTURED=0. `reports_gaps` tracks it exactly:
+        #: without the JSON format there is no `unknown` field to report, so
+        #: claiming the capability would make the router split work that never
+        #: comes back split.
+        self._structured = _structured_default() if structured is None else structured
+        self.reports_gaps = self._structured
         self._artifact_dir = artifact_dir or _NPU_ARTIFACT_DIR
         self._lib = self._load_genie()
         self._config_handle = self._create_config()
@@ -389,7 +600,24 @@ class NpuFastBrain:
 
     @staticmethod
     def _check(status: int, what: str) -> None:
-        if status != 0:  # GENIE_STATUS_SUCCESS
+        """Raise on a Genie *error*, not on a Genie *warning*.
+
+        GenieCommon.h splits the status space by sign: 0 is
+        GENIE_STATUS_SUCCESS, negatives are errors
+        (GENIE_STATUS_ERROR_GENERAL = -1 ... GENIE_STATUS_ERROR_BOUND_HANDLE
+        = -14), and positives are warnings -- GENIE_STATUS_WARNING_ABORTED = 1,
+        _BOUND_HANDLE = 2, _PAUSED = 3.
+
+        Treating `status != 0` as fatal was a real bug: `answer()` signals
+        GENIE_DIALOG_ACTION_ABORT itself once `_MAX_NEW_TOKENS` is hit, and
+        Genie then returns WARNING_ABORTED(1) from `GenieDialog_query` -- so
+        the token cap this class relies on to bound output length crashed the
+        very call it was meant to truncate. It went unnoticed because every
+        earlier recorded run stopped on the `<|end|>` stop sequence well before
+        the cap (see data/npu_model/phi-3.5-mini-instruct/
+        _real_inference_smoke_log.md, Attempt 5).
+        """
+        if status < 0:
             raise GenieError(f"{what} failed with Genie_Status_t={status}")
 
     def _create_config(self) -> ctypes.c_void_p:
@@ -432,15 +660,69 @@ class NpuFastBrain:
         )
         return handle
 
+    def _render_prompt(self, query: str, context: str) -> str:
+        """Phi-3.5's chat template, asking for whichever reply format is active.
+
+        Structured mode (the default) swaps the two-line instruction below for
+        `STRUCTURED_SYSTEM_PROMPT` + `STRUCTURED_SUFFIX`. The *shape* of the
+        instruction is identical -- a system message that forbids blank lines,
+        plus a user-turn suffix pinning the exact output format -- because that
+        shape is what makes `_STOP_SEQUENCES`' `"\\n\\n"` safe, and that
+        property has to survive the format change. Single-line JSON contains no
+        blank line, so the stop sequence still fires only after the reply is
+        complete.
+        """
+        if self._structured:
+            system = STRUCTURED_SYSTEM_PROMPT
+            if context:
+                system += f" Context: {context}"
+            return (
+                f"<|system|>\n{system}<|end|>\n"
+                f"<|user|>\n{query}{STRUCTURED_SUFFIX}<|end|>\n"
+                f"<|assistant|>\n"
+            )
+        return self._render_self_report_prompt(query, context)
+
     @staticmethod
-    def _render_prompt(query: str, context: str) -> str:
-        system = "You are a helpful, concise assistant. Answer in one or two sentences."
+    def _render_self_report_prompt(query: str, context: str) -> str:
+        """The original Shape B prompt: answer plus a bare `CONFIDENCE:` line.
+
+        Still reachable via `TWO_BRAIN_STRUCTURED=0`, and kept verbatim rather
+        than reworded -- every measurement in
+        `_real_inference_smoke_log.md` Attempt 5 was taken against this exact
+        wording, so changing it would silently invalidate those receipts.
+
+        The strict two-line instruction is what makes `_STOP_SEQUENCES`'
+        `"\\n\\n"` safe (see there) and is worth keeping verbatim -- looser
+        phrasings were measured and lost. Asking the model to lead with the
+        confidence instead ("output CONFIDENCE first, then answer") was faster
+        still but sometimes returned the number *and no answer at all*, so it
+        was rejected: an empty answer is worse than a slow one.
+
+        `SELF_REPORT_SUFFIX` goes inside the `<|user|>` block, before its
+        `<|end|>`, so the stop sequence cannot fire before the model has read
+        the instruction. It is imported rather than restated so this brain and
+        `PhoneFastBrain` ask for the number in identical words.
+        """
+        system = (
+            "You are a helpful, concise assistant. Reply with exactly two lines "
+            "and nothing else: line 1 is your answer in one or two sentences; "
+            "line 2 is 'CONFIDENCE: <number>'. Do not use blank lines. Do not "
+            "explain the number."
+        )
         if context:
             system += f" Context: {context}"
-        return f"<|system|>\n{system}<|end|>\n<|user|>\n{query}<|end|>\n<|assistant|>\n"
+        return (
+            f"<|system|>\n{system}<|end|>\n"
+            f"<|user|>\n{query}{SELF_REPORT_SUFFIX}<|end|>\n"
+            f"<|assistant|>\n"
+        )
 
-    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
-        prompt = self._render_prompt(masked_query, context)
+    def answer(self, query: str, context: str = "") -> BrainResponse:
+        prompt = self._render_prompt(query, context)
+        max_new_tokens = (
+            self._STRUCTURED_MAX_NEW_TOKENS if self._structured else self._MAX_NEW_TOKENS
+        )
         chunks: list[str] = []
         token_count = 0
 
@@ -453,7 +735,7 @@ class NpuFastBrain:
                     chunks.append(response.decode("utf-8", errors="replace"))
                     token_count += 1
                 if (
-                    token_count >= self._MAX_NEW_TOKENS
+                    token_count >= max_new_tokens
                     and sentence_code not in (_GENIE_SENTENCE_END, _GENIE_SENTENCE_ABORT)
                 ):
                     self._lib.GenieDialog_signal(self._dialog_handle, _GENIE_DIALOG_ACTION_ABORT)
@@ -476,11 +758,29 @@ class NpuFastBrain:
         )
         latency_ms = (time.perf_counter() - start) * 1000
 
-        return BrainResponse(text="".join(chunks).strip(), latency_ms=latency_ms, cost_usd=0.0)
+        return _to_brain_response(
+            "".join(chunks).strip(), latency_ms, structured=self._structured
+        )
 
     def close(self) -> None:
-        self._lib.GenieDialog_free(self._dialog_handle)
-        self._lib.GenieDialogConfig_free(self._config_handle)
+        """Release the Genie dialog + config. Idempotent.
+
+        The handles are cleared as they are freed because `__del__` also calls
+        this: without the guard, an explicit `close()` followed by garbage
+        collection frees the same native handles twice. That is not a harmless
+        double-free -- a real run showed it corrupting Genie's internal state so
+        that the *next* session created in the same process failed with
+        GENIE_STATUS_ERROR_INVALID_HANDLE(-5) on `GenieDialog_reset`, even
+        though the two sessions never overlapped. `__del__` swallowing
+        exceptions did not (and could not) catch it, since freeing a stale
+        handle returns a status code rather than raising.
+        """
+        if self._dialog_handle is not None:
+            self._lib.GenieDialog_free(self._dialog_handle)
+            self._dialog_handle = None
+        if self._config_handle is not None:
+            self._lib.GenieDialogConfig_free(self._config_handle)
+            self._config_handle = None
 
     def __del__(self) -> None:
         # Best-effort: interpreter shutdown may have already torn down ctypes
@@ -538,22 +838,10 @@ class GpuLocalBrain:
     answers text-only queries perfectly well, so a single vision-capable
     instance can serve both roles.
 
-    **`answer()` deliberately takes text-only *input*, even when a projector is
-    loaded.** To be clear about which side is constrained: these models are
-    image-text-to-text (Qwen3-VL's own GGUF metadata tags it exactly that), so
-    text-only *output* is inherent, not a limitation -- `BrainResponse.text`
-    stays the right shape no matter what happens with images later. The
-    projector is an input-side encoder (`mmproj loaded: vision=true`).
-
-    It is the *input* that is withheld. `Brain.answer` has no image parameter,
-    and adding one would force a change in `router.py` -- the signal this
-    file's own guidance names for a seam drawn in the wrong place. More
-    importantly, image input is an unsolved privacy question here: `PIIGuard`
-    masks *text*, so a face, a document, or EXIF GPS in an image would cross to
-    the deep brain untouched while `assert_masked_token_invariant` still
-    passed, because it only inspects text. Routing images needs that decision
-    made first, not an API shape that quietly pre-empts it. Loading the
-    projector now simply means the instance is ready when it is.
+    **`answer()`'s `image` parameter is the one place in this file that goes
+    beyond the plain `Brain` protocol** -- see `VisionBrain`. The router only
+    ever passes `image` to a brain it already confirmed `can_see`; a non-vision
+    `answer()` call is identical to before this capability existed.
 
     Unlike `NpuFastBrain`, which drives Genie in-process through `ctypes`, this
     talks to a `llama-server` child process over loopback HTTP. That is a real
@@ -568,12 +856,54 @@ class GpuLocalBrain:
 
     The server is started once and reused across `answer()` calls -- cold load
     is ~3 s (see data/npu_model/phi-3.5-mini-instruct/_real_geniex_hybrid_log.md).
+
+    **Self-rating is now on by default for text queries.** This class used to
+    be Shape A ("a real option for later, not a limitation of the backend") --
+    that option has been taken. In structured mode it asks for
+    `signals/structured.py`'s JSON object, so it reports both a confidence and
+    a named gap, which makes it a Shape C brain. `TWO_BRAIN_STRUCTURED=0`
+    returns it to Shape A.
+
+    Two deliberate exceptions, both about images:
+
+    - **`describe_image` and any `answer(..., image=...)` call stay plain
+      prose.** A description exists to be masked and forwarded to a text-only
+      deep brain; wrapping it in JSON would add a parse step between the VLM
+      and the guard for no benefit, and `_MAX_DESCRIBE_TOKENS` is sized for
+      prose. `_structured` is ignored whenever an image is present.
+    - The router therefore keeps routing image-bearing queries the old way --
+      see `router.py::route`.
+
+    **Unverified on this machine.** The `llama-server` OpenCL build and the
+    GGUF weights are not present here (`.gitignore`), so the structured path
+    below has been exercised only against the parser and a fake transport, not
+    against a real Adreno run. `NpuFastBrain`'s structured path *has* real
+    receipts. Treat that asymmetry as real until someone runs
+    `tests/test_gpu_brain.py` with the stack installed.
     """
 
     _MAX_NEW_TOKENS = 48
+    #: Structured replies carry JSON scaffolding plus a prose `unknown` field,
+    #: and a JSON object truncated mid-string fails to parse outright rather
+    #: than degrading. Same reasoning as `NpuFastBrain._STRUCTURED_MAX_NEW_TOKENS`.
+    _STRUCTURED_MAX_NEW_TOKENS = 512
     _MAX_DESCRIBE_TOKENS = 512
     _N_CTX = 4096
     _STARTUP_TIMEOUT_S = 120.0
+
+    #: Inside the boundary, same as `NpuFastBrain`, and the loopback HTTP hop
+    #: does not change that: `llama-server` is a child process this class
+    #: started, bound to `127.0.0.1` on a port it chose, on this machine. No
+    #: packet leaves the host. So this brain also sees the raw query.
+    trusted_with_raw_pii = True
+
+    #: llama.cpp compiles `response_format: {"type": "json_object"}` into a GBNF
+    #: grammar, which makes malformed JSON structurally impossible rather than
+    #: merely unlikely -- a much stronger guarantee than `NpuFastBrain` can get,
+    #: since Genie's C API exposes no grammar hook. Sent optimistically and
+    #: retried without it on a 4xx, because an older `llama-server` that rejects
+    #: the field should cost one extra round trip, not make this brain unusable.
+    _USE_JSON_RESPONSE_FORMAT = True
 
     def __init__(
         self,
@@ -584,9 +914,15 @@ class GpuLocalBrain:
         bin_dir: Path | None = None,
         mmproj_offload: bool = True,
         log_path: Path | None = None,
+        structured: bool | None = None,
     ) -> None:
         self.tier = tier
         self.signals = signals
+        self._structured = _structured_default() if structured is None else structured
+        # Both flip together and both are instance-level here (unlike the other
+        # brains' class constants) because this one class covers two shapes.
+        self.reports_confidence = self._structured
+        self.reports_gaps = self._structured
         self._model_path = Path(os.environ.get("TWO_BRAIN_GPU_MODEL") or model_path or _GPU_MODEL_PATH)
         env_mmproj = os.environ.get("TWO_BRAIN_GPU_MMPROJ")
         self._mmproj_path = Path(env_mmproj) if env_mmproj else mmproj_path
@@ -630,11 +966,6 @@ class GpuLocalBrain:
         `mmproj_offload=False` because its vision encoder cannot run on the GPU.
         `prefer="speed"` -> Qwen3-VL-4B-Instruct-Q8_0 (6/7), vision encoder on
         the GPU, ~39% faster.
-
-        Both are still text-in/text-out today: `answer()` does not accept an
-        image, for the protocol and privacy reasons in this class's docstring.
-        Loading the projector means the instance is ready when that lands, and
-        it makes the recommended weights a default rather than folklore.
         See data/vlm_gpu_model/_eval/RESULTS.md.
         """
         if prefer not in ("quality", "speed"):
@@ -783,53 +1114,88 @@ class GpuLocalBrain:
         mime = mimetypes.guess_type(str(image))[0] or "image/png"
         return f"data:{mime};base64," + base64.b64encode(image.read_bytes()).decode("ascii")
 
-    def answer(self, masked_query: str, context: str = "", image: Path | None = None) -> BrainResponse:
+    def _post_completion(self, payload: dict) -> dict:
         import urllib.error
         import urllib.request
 
+        request = urllib.request.Request(
+            f"{self._base_url}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=300) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:200]
+            # An older llama-server rejects `response_format` outright. Drop it
+            # and retry once rather than failing the query: the prompt already
+            # asks for JSON in words, and signals/structured.py parses a
+            # best-effort reply. Only retried when the field was actually sent,
+            # so this cannot loop.
+            if exc.code < 500 and "response_format" in payload:
+                retry = {k: v for k, v in payload.items() if k != "response_format"}
+                return self._post_completion(retry)
+            raise GpuBrainError(f"llama-server returned HTTP {exc.code}: {detail!r}") from exc
+
+    def answer(self, query: str, context: str = "", image: Path | None = None) -> BrainResponse:
         if image is not None and not self.can_see:
             raise GpuBrainError(
                 "image passed to a text-only brain -- construct via GpuLocalBrain.for_vision()"
             )
 
+        # Structured mode is text-only: a described image has to come back as
+        # prose for the guard to mask and the deep brain to read. See the class
+        # docstring.
+        structured = self._structured and image is None
+
         messages = []
+        system = STRUCTURED_SYSTEM_PROMPT if structured else ""
         if context:
-            messages.append({"role": "system", "content": context})
+            system = f"{system} Context: {context}".strip() if system else context
+        if system:
+            messages.append({"role": "system", "content": system})
         if image is not None:
             # OpenAI-shaped content parts; llama-server routes these through mtmd.
             messages.append({"role": "user", "content": [
-                {"type": "text", "text": masked_query},
+                {"type": "text", "text": query},
                 {"type": "image_url", "image_url": {"url": self._image_data_uri(image)}},
             ]})
         else:
-            messages.append({"role": "user", "content": masked_query})
-        payload = json.dumps(
-            {
-                "messages": messages,
-                # A description has to carry the whole image; the 48-token
-                # budget that suits a fast-brain reply would truncate it.
-                "max_tokens": self._MAX_DESCRIBE_TOKENS if image is not None else self._MAX_NEW_TOKENS,
-                "temperature": 0.7,
-                "stream": False,
-            }
-        ).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self._base_url}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+            user_text = query + STRUCTURED_SUFFIX if structured else query
+            messages.append({"role": "user", "content": user_text})
+
+        if image is not None:
+            # A description has to carry the whole image; the 48-token budget
+            # that suits a fast-brain reply would truncate it.
+            max_tokens = self._MAX_DESCRIBE_TOKENS
+        elif structured:
+            max_tokens = self._STRUCTURED_MAX_NEW_TOKENS
+        else:
+            max_tokens = self._MAX_NEW_TOKENS
+
+        payload: dict = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            # Lowered from 0.7 for structured replies: the confidence number and
+            # the gap description are being *read* by the router, not by a
+            # person, so sampling variance in them is noise in a routing
+            # decision rather than welcome variety in prose.
+            "temperature": 0.2 if structured else 0.7,
+            "stream": False,
+        }
+        if structured and self._USE_JSON_RESPONSE_FORMAT:
+            payload["response_format"] = {"type": "json_object"}
 
         start = time.perf_counter()
-        try:
-            with urllib.request.urlopen(request, timeout=300) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:  # pragma: no cover - server-side failure
-            raise GpuBrainError(f"llama-server returned HTTP {exc.code}: {exc.read()[:200]!r}") from exc
+        body = self._post_completion(payload)
         latency_ms = (time.perf_counter() - start) * 1000
 
-        text = body["choices"][0]["message"]["content"]
-        return BrainResponse(text=text.strip(), latency_ms=latency_ms, cost_usd=0.0)
+        text = body["choices"][0]["message"]["content"].strip()
+        if not structured:
+            return BrainResponse(text=text, latency_ms=latency_ms, cost_usd=0.0)
+        return _to_brain_response(text, latency_ms, structured=True)
 
     def close(self) -> None:
         proc = self._proc
@@ -857,3 +1223,178 @@ class GpuLocalBrain:
             self.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+#: Hosts that mean "this device". The phone is reached over
+#: `adb reverse tcp:8000 tcp:8000`, which is precisely what makes it appear on
+#: loopback -- so loopback is the honest test for "the masked query is not
+#: traversing a network", not a proxy for it.
+_ON_DEVICE_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+class RemoteBrainRefused(ValueError):
+    """A fast brain was pointed at a host that is not on-device."""
+
+
+class PhoneFastBrain:
+    """Fast brain served over an OpenAI-shaped HTTP endpoint (Mobile tier).
+
+    Speaks the contract in `src/phone_brain/L_INTERFACE_CONTRACT.md`
+    (`POST /v1/chat/completions`), so it is identical against
+    `mock_phone_brain_server.py` and against the real Genie/GenieX server on
+    the Galaxy S25 -- only the base URL changes. Deliberately **not**
+    phone-specific: any OpenAI-shaped endpoint works, which is why a future
+    hosted AI-PC or cloud tier can reuse this class rather than copy it.
+
+    Two things make this different from the other brains here:
+
+    1. **It self-rates.** `reports_confidence = True`, so the router asks it
+       *before* deciding local-vs-cloud and uses the returned confidence as
+       the difficulty signal (one inference call, not two). See
+       signals/confidence.py.
+    2. **It is off-process.** Unlike `NpuFastBrain`, which is in-process by
+       design (docs/npu-deployment.md), the mobile model genuinely runs on a
+       separate device. That makes the base URL a privacy-relevant input, so
+       it is checked -- see `_assert_on_device`.
+
+    Latency is *measured*, not estimated from `data/profile_workload/`: this
+    makes a real call, so there is a real number to report.
+    """
+
+    reports_confidence = True
+    #: Confidence only, no gap decomposition -- this brain is deliberately
+    #: untouched by the Shape C work (the phone is not wired in yet; see
+    #: docs/ORCHESTRATOR.md). It keeps Shape B exactly as it was, so the mobile
+    #: tier's behaviour and its tests are unchanged.
+    reports_gaps = False
+
+    #: **Outside the boundary, unlike the AI-PC brains.** The AI PC's models run
+    #: on this machine and are handed the raw query; this one runs on a
+    #: physically separate device reached over HTTP, so it keeps receiving
+    #: masked text only. `adb reverse` makes that hop *look* like loopback,
+    #: which is exactly why this is declared rather than inferred from the URL:
+    #: the packets really do leave the host. `_assert_on_device` guards the
+    #: same distinction from the other direction.
+    trusted_with_raw_pii = False
+
+    #: `adb reverse tcp:8000 tcp:8000` puts the phone here (L contract).
+    #:
+    #: `127.0.0.1`, not `localhost`, and this is measured rather than
+    #: stylistic: on this Windows host `localhost` resolves to `::1` first,
+    #: the server binds IPv4 only, and the failed IPv6 attempt costs **~2s per
+    #: call** before the fallback succeeds (measured 2778-3117ms via
+    #: `localhost` vs. 742-1153ms via `127.0.0.1`, same server, same prompt).
+    #: For most clients that is an annoyance; here it is a correctness bug,
+    #: because `RoutePolicy.local_latency_budget_ms` is 3000ms and the router
+    #: decides local-vs-cloud on this exact number -- a phantom 2s would
+    #: escalate queries the phone could comfortably have answered.
+    DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+    DEFAULT_MODEL = "llama-3.2-3b-instruct"
+
+    #: Matches confidence_estimator.py's request shape exactly -- the L
+    #: contract pins these four fields.
+    _MAX_TOKENS = 256
+    _TEMPERATURE = 0.2
+    _TIMEOUT_S = 120.0
+
+    def __init__(
+        self,
+        tier: str,
+        signals: TierSignals,
+        base_url: str | None = None,
+        model: str | None = None,
+        allow_remote: bool = False,
+        timeout_s: float | None = None,
+    ) -> None:
+        self.tier = tier
+        self.signals = signals
+        self.base_url = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
+        self.model = model or self.DEFAULT_MODEL
+        self.timeout_s = timeout_s if timeout_s is not None else self._TIMEOUT_S
+        self._assert_on_device(self.base_url, allow_remote)
+
+    @staticmethod
+    def _assert_on_device(base_url: str, allow_remote: bool) -> None:
+        """Refuse a non-loopback endpoint unless explicitly allowed.
+
+        Defense in depth for `docs/PHONE_BRAIN.md` reconciliation point 1. The
+        router only ever hands this class *masked* text, so this is not the
+        thing standing between the user and a leak -- but `--base-url` is a
+        plain string, and the difference between "the model runs on my phone"
+        and "the model runs on someone's server" is exactly one typo. A query
+        that leaves the device is a different privacy posture than the one this
+        project advertises, so it takes a deliberate opt-in rather than a
+        silent default.
+        """
+        import urllib.parse
+
+        host = urllib.parse.urlsplit(base_url).hostname
+        if allow_remote or host in _ON_DEVICE_HOSTS:
+            return
+        raise RemoteBrainRefused(
+            f"refusing to send queries to non-on-device host {host!r}: the mobile "
+            f"fast brain is reached over loopback (adb reverse). Pass "
+            f"allow_remote=True (or set TWO_BRAIN_PHONE_ALLOW_REMOTE=1) if the "
+            f"model really is meant to run off-device."
+        )
+
+    def _post_chat_completion(self, prompt: str) -> dict:
+        """One `POST /v1/chat/completions`, stdlib only.
+
+        `urllib` rather than `requests` on purpose: this package declares zero
+        runtime dependencies (pyproject.toml), and the phone brain's own
+        tooling is stdlib-only for the same reason.
+        """
+        import urllib.request
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self._MAX_TOKENS,
+            "temperature": self._TEMPERATURE,
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def answer(self, query: str, context: str = "") -> BrainResponse:
+        """Answer `query`, and report how sure the model is about it.
+
+        Never raises on a transport failure. Per L_INTERFACE_CONTRACT.md's
+        error-handling section, a timeout or non-200 means "L failed" and
+        should escalate rather than block the user -- so that path returns
+        `confidence=0.0` (a definite escalate once inverted to difficulty) with
+        `error` set for the audit trail, instead of propagating an exception
+        the router would have to special-case.
+        """
+        prompt = f"{context}\n\n{query}" if context else query
+        start = time.perf_counter()
+        try:
+            body = self._post_chat_completion(prompt + SELF_REPORT_SUFFIX)
+            raw_text = body["choices"][0]["message"]["content"]
+        except Exception as exc:  # noqa: BLE001 -- any failure is an escalate signal
+            return BrainResponse(
+                text="",
+                latency_ms=(time.perf_counter() - start) * 1000,
+                cost_usd=0.0,
+                confidence=0.0,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        answer, confidence = parse_self_reported(raw_text)
+        return BrainResponse(
+            text=answer,
+            latency_ms=latency_ms,
+            cost_usd=0.0,
+            confidence=confidence,
+            error=(
+                None
+                if confidence is not None
+                else "no parseable CONFIDENCE line in the response"
+            ),
+        )

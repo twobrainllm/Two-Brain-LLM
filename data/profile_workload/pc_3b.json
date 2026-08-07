@@ -1,25 +1,26 @@
 {
   "_mock": false,
-  "_reason": "Real capture from an actual model, replacing the earlier no-artifact mock (see ../../superpowers/deploy-local-brain-npu.md Phase 2/3 and ../npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md for the full run). Not every field could be measured this pass -- each is marked individually in measurement_notes rather than filled with a plausible guess, matching this project's receipts rule.",
+  "_reason": "Real capture from an actual model. Re-measured after the Shape B prompt change (NpuFastBrain now self-rates), because the previous numbers were measured against a different prompt and a runaway generation -- see ../npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md Attempt 5. Not every field could be measured this pass -- each is marked individually in measurement_notes rather than filled with a plausible guess, matching this project's receipts rule.",
   "model_id": "phi-3.5-mini-instruct",
   "device_tier": "AI PC",
   "platform": "windows",
   "runtime": "genie_qnn_htp",
-  "latency_ms": {"ttft_mean": 142, "ttft_p95": 142, "per_token_mean": 94.5},
-  "throughput_tokens_per_s": 10.6,
+  "latency_ms": {"ttft_mean": 105.9, "ttft_p95": 117.9, "per_token_mean": 74.2},
+  "throughput_tokens_per_s": 13.5,
   "power_mw": {"npu_active": 0, "idle": 0},
   "energy_per_1k_tokens_mj": 0,
   "token_cost_usd_per_1k": 0.0,
   "memory_peak_mb": 0,
   "utilization": {"npu": 0.0, "cpu": 0.0, "gpu": 0.0},
   "measurement_notes": {
-    "runtime": "corrected:previous mock said model_id qwen2.5-3b-instruct / runtime npu (generic) -- real artifact is Qualcomm's Genie SDK running Phi-3.5-mini-instruct on the QnnHtp (Hexagon) backend, not ONNX Runtime GenAI/QNN-EP (see ../npu_model/phi-3.5-mini-instruct/_real_download_log.md)",
-    "latency": "measured:genie-t2t-run.exe, single real run (n=1) -- see ../npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md",
-    "ttft_p95": "not_measured:n=1, no distribution yet -- set equal to ttft_mean pending a multi-run capture, not a computed percentile",
+    "runtime": "Qualcomm's Genie SDK running Phi-3.5-mini-instruct on the QnnHtp (Hexagon) backend, not ONNX Runtime GenAI/QNN-EP (see ../npu_model/phi-3.5-mini-instruct/_real_download_log.md)",
+    "latency": "measured:n=8 real queries through NpuFastBrain.answer() itself (not the genie-t2t-run.exe CLI), on the Shape B prompt the router actually sends. TTFT timed to the first streamed Genie callback. See _real_inference_smoke_log.md Attempt 5 for the per-query table.",
+    "ttft_p95": "measured:n=8, real order statistic -- replaces the previous pass's ttft_p95==ttft_mean placeholder, which was set that way because n was 1",
+    "per_token_mean": "corrected:was 94.5 from a single 2180-token runaway generation whose context-length bucket climbed 512->3072 mid-run; decode is slower at longer context, so that figure was biased high. Shape B answers are short (7-43 tokens, mean 23) and stay in the 512 bucket, where the real rate is 74.2ms/token.",
     "throughput_tokens_per_s": "derived:1000/per_token_mean",
     "power_mw": "not_measured:no power-draw instrumentation attached to this run",
     "energy_per_1k_tokens_mj": "not_measured:depends on power_mw",
-    "memory_peak_mb": "not_measured:process RSS not sampled during this run",
+    "memory_peak_mb": "not_measured:process RSS not sampled during this run. Genie's own log reports 816,554,496 bytes allocated across 7 buffers at load, but that is the NPU-side weight allocation, not process peak RSS, so it is not recorded here as if it were.",
     "utilization": "not_measured:this system's GPU Engine perf-counter set has no NPU-labeled instance -- see _real_inference_smoke_log.md's utilization section"
   }
 }

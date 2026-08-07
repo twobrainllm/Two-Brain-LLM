@@ -181,6 +181,17 @@ button, input, textarea {
   padding: 12px;
 }
 
+.backend-status {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.backend-status[data-live="true"] { color: #2E8B57; }
+.backend-status[data-live="false"] { color: var(--text-secondary); }
+
 .brain-toggle-label {
   display: block;
   font-size: 11px;
@@ -303,6 +314,12 @@ button, input, textarea {
 
 .profiler-dot[data-tier="local"] { background: var(--brain-local); }
 .profiler-dot[data-tier="cloud"] { background: var(--brain-cloud); }
+/* A split decision is literally half of each, so the dot is too -- rather than
+   inventing a third colour that would read as a third *place* the query went.
+   Both brains answered; nowhere new was involved. */
+.profiler-dot[data-tier="hybrid"] {
+  background: linear-gradient(90deg, var(--brain-local) 0 50%, var(--brain-cloud) 50% 100%);
+}
 
 .profiler-card {
   position: absolute;
@@ -499,6 +516,9 @@ button, input, textarea {
 
 .tier-dot[data-tier="local"] { background: var(--brain-local); }
 .tier-dot[data-tier="cloud"] { background: var(--brain-cloud); }
+.tier-dot[data-tier="hybrid"] {
+  background: linear-gradient(90deg, var(--brain-local) 0 50%, var(--brain-cloud) 50% 100%);
+}
 
 /* ---------- Robot avatar ---------- */
 
@@ -527,6 +547,15 @@ button, input, textarea {
 .robot-avatar[data-tier="cloud"] .rb-face-outer,
 .robot-avatar[data-tier="cloud"] .rb-face-inner {
   fill: var(--brain-cloud);
+}
+
+/* The avatar's face is a single `fill`, so it can't be split the way the dots
+   are. It takes the local colour on a hybrid decision because the local brain
+   is the one that spoke first and produced the answer the user reads at the
+   top of the bubble; the badge next to it says "split" in words. */
+.robot-avatar[data-tier="hybrid"] .rb-face-outer,
+.robot-avatar[data-tier="hybrid"] .rb-face-inner {
+  fill: var(--brain-local);
 }
 
 .rb-face-outer { opacity: 0.22; transition: fill 0.25s ease; }

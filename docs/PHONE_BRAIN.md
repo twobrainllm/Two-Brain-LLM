@@ -4,9 +4,16 @@ Summary of the work in `src/phone_brain/` (branch `local_brain`, commit
 `e7130ce`), what it decides, what it verifies, and how it connects to the
 router in `src/two_brain_router/`.
 
-**In one line:** the Mobile tier's fast brain, built end-to-end — the real
-thing that `routing/brains.py::LocalFastBrain` is currently a labeled stub
-for — plus a mock server so orchestrator work isn't blocked on hardware.
+**In one line:** the Mobile tier's fast brain, built end-to-end — plus a mock
+server so orchestrator work isn't blocked on hardware.
+
+> **Now wired in.** This document was written as an audit *before* the phone
+> brain was connected to the router. It has since been absorbed as
+> `routing/brains.py::PhoneFastBrain` on branch `js/orchestrator`, resolving
+> four of the five reconciliation points below. For how the router actually
+> uses it today, read [`ORCHESTRATOR.md`](ORCHESTRATOR.md); this file is kept
+> as the record of what was built on the phone side and what it cost to
+> integrate.
 
 | | |
 |---|---|
@@ -123,7 +130,7 @@ a hard prompt. That's what produced the measured tradeoff already cited in the
 README: **self-consistency spends a fixed 3 calls regardless of difficulty;
 hybrid spends 1 on the easy prompt and 2 on the hard one.**
 
-### Plus: benchmark harness — `test_phone_brain.py`
+### Plus: benchmark harness — `bench_phone_brain.py`
 
 Five prompts tagged easy/medium/hard, reporting latency and tokens/sec each
 plus a summary table. It's a smoke test *and* the source of the real numbers
@@ -142,9 +149,9 @@ sustained NPU load throttles on a phone in ways it wouldn't on a PC.
 
 | | |
 |---|---|
-| **Verified working** | Everything on the mock path — mock server, all three confidence strategies, the benchmark harness against the mock |
+| **Verified working** | Everything on the mock path — mock server, all three confidence strategies, the benchmark harness against the mock. Since integration, also the full router path: `TwoBrainRouter --tier mobile` routes real confidence-driven decisions against the mock server, covered by `tests/test_orchestrator.py` |
 | **Written, not yet run** | The export (needs AI Hub token + gated Llama access), device push/serve, and every real-device number |
-| **Explicitly open** | Shared vs. split weights for the orchestrator — does O reuse this same L with a routing-only system prompt, or get its own smaller model? Recommended default: reuse L with a small `max_new_tokens` |
+| **Explicitly open** | Shared vs. split weights for the orchestrator — does O reuse this same L with a routing-only system prompt, or get its own smaller model? Moot for now: O does no inference of its own, so it needs no weights. The question returns if the router ever summarizes context with the fast brain ([WALKTHROUGH next-step #5](WALKTHROUGH.md#next-steps)) |
 
 The Track A / Track B split (needs the phone / needs nothing) is the same
 instinct as this project's `data/` fixtures: keep the dependent work
@@ -157,93 +164,105 @@ unblocked while the hardware path is still in progress.
 It fills **two** of our seams, one of which is
 [next step #4](WALKTHROUGH.md#next-steps) — the biggest quality win available:
 
-| Our seam | What phone_brain provides |
-|---|---|
-| `routing/brains.py::LocalFastBrain` | A real HTTP-backed brain for the Mobile tier |
-| `signals/difficulty.py::DifficultyEstimator` | `confidence_estimator.py`, inverted — `score = 1 - confidence` |
-| `data/profile_workload/mobile_1b.json` (mocked) | `test_phone_brain.py` produces exactly the real numbers this mock stands in for |
+| Our seam | What phone_brain provides | Status |
+|---|---|---|
+| `routing/brains.py::LocalFastBrain` | A real HTTP-backed brain for the Mobile tier | **Absorbed** as `PhoneFastBrain` |
+| `signals/difficulty.py::DifficultyEstimator` | `confidence_estimator.py`, inverted — `score = 1 - confidence` | **Absorbed** as `signals/confidence.py` |
+| `data/profile_workload/mobile_1b.json` (mocked) | `bench_phone_brain.py` produces exactly the real numbers this mock stands in for | **Still open** — needs a real S25 run |
 
 Vocabulary maps directly: **L** = fast brain, **O** = router, **C** = deep brain.
 
-### Five things to reconcile before merging
+### Five things to reconcile before merging — 4 of 5 resolved
 
-**1. Privacy ordering — the one that matters.** Our invariant is
-mask-before-any-routing-decision. Self-reported confidence sends the **raw
-prompt** to L. On-device that's defensible (nothing leaves the phone), but
-`--base-url` is a plain argument — point it at a non-local host and raw PII
-goes off-device silently. Needs a hard localhost/on-device assertion on that
-call, or masked text passed in.
+Resolved on branch `js/orchestrator`. See
+[`ORCHESTRATOR.md`](ORCHESTRATOR.md) for how the routing actually works now.
 
-**2. Self-report merges two steps of `route()`.** The answer and the confidence
-score arrive in the *same* call. Our router currently scores difficulty and
-*then* calls the brain; here escalation means discarding an answer already paid
-for. That's a structural change to `route()`, not a drop-in.
+**1. Privacy ordering — the one that matters. ✅ Resolved.** The original
+concern: self-reported confidence sends the **raw prompt** to L, and
+`--base-url` is a plain argument, so pointing it off-device would leak raw PII
+silently. Fixed structurally rather than by convention — `PhoneFastBrain`
+implements the `Brain` protocol, whose parameter is literally `masked_query`,
+and the router masks before it calls *any* brain. Belt and braces:
+`PhoneFastBrain` also refuses a non-loopback host unless `allow_remote=True`.
+`tests/test_orchestrator.py::test_pii_never_reaches_the_phone_or_the_cloud_unmasked`
+asserts on the bytes that actually crossed the socket.
 
-**3. The threshold lives in two places.** `confidence_estimator.py` returns
-`should_escalate` using its own `confidence_threshold=0.5`; our
-`RoutePolicy.escalate_threshold` is `0.55`. Their own contract says O owns the
-decision — so consume `confidence` and ignore `should_escalate`, or the two
-drift apart.
+**2. Self-report merges two steps of `route()`. ✅ Resolved.** Confirmed as a
+real structural change, and made deliberately: `Brain.reports_confidence`
+selects between two decision shapes, and the self-rating shape asks the brain
+before deciding. Escalating does discard a paid-for answer — that cost is
+reported in `RouteDecision.est_latency_ms` and called out in the notes rather
+than hidden. One refinement fell out of building it: the latency budget is
+checked *before* the call, never after, because re-checking it while holding a
+finished answer could only make total latency worse.
 
-**4. Model mismatch with our fixtures.** They're on Llama-3.2-3B w4a16; our
-`data/*/mobile_1b.json` says Qwen2.5-1.5B int4 (ttft 180 ms, 27.5 ms/token).
-Those need real numbers from `test_phone_brain.py`, with a receipt per the
-`CLAUDE.md` rule.
+**3. The threshold lives in two places. ✅ Resolved.** O consumes `confidence`
+and ignores `confidence_estimator.py`'s `should_escalate` entirely, exactly as
+their contract prescribes. `signals/confidence.py` inverts confidence into a
+difficulty so the existing `RoutePolicy.escalate_threshold` is still the only
+threshold in the system — which is also why `routing/policy.py` needed no
+changes at all.
 
-**5. `test_phone_brain.py` is not a pytest test.** The name matches
-`python_files = ["test_*.py"]` in `pyproject.toml`. If it ever lands under
-`testpaths`, pytest will collect it and it will fail or hang waiting on a live
-endpoint. Rename to `bench_phone_brain.py` when absorbing.
+**4. Model mismatch with our fixtures. ⬜ Still open.** They're on
+Llama-3.2-3B w4a16; `data/*/mobile_1b.json` still says Qwen2.5-1.5B int4
+(ttft 180 ms, 27.5 ms/token) and is still `_mock: true`. Real numbers need a
+`bench_phone_brain.py` run against the actual S25, with a receipt per the
+`CLAUDE.md` rule. **This is not cosmetic:** that fixture drives the latency
+budget pre-check that decides whether the phone is asked at all, so the mobile
+tier is currently reasoning about the wrong model's speed.
+
+**5. `test_phone_brain.py` is not a pytest test. ✅ Resolved.** Renamed to
+`bench_phone_brain.py`, with references updated across the phone-brain docs.
+(The byte-identical `PHONE_DEPLOYMENT_GUIDE_final.md` duplicate flagged under
+Housekeeping below was deleted in the same pass.)
 
 ---
 
-## Where this code should live
+## Where this code lives — done
 
-**Superseded by what actually merged — read this before doing the split
-below.** This section originally proposed breaking `routing/brains.py` into
-a `routing/brains/` subpackage (`base.py`/`stub.py`/`openai_http.py`). Since
-then, the AI-PC tier's real brain (`NpuFastBrain`, see `../CLAUDE.md`'s
-Branch state section) merged into `main` and **did not do that split** — it
-added a fourth class (`NpuFastBrain`, alongside `Brain`, `BrainResponse`,
-`LocalFastBrain`, `CloudDeepBrain`) straight into the existing flat
-`brains.py`, imported `onnxruntime_qnn` lazily inside a method so the module
-stays importable without it, and registered itself via a tier/env-var switch
-in `router.py::_build_fast_brain` (`TWO_BRAIN_NPU_BRAIN=1`). That's now the
-working, tested precedent for "add a real brain without breaking the base
-package" — follow it instead of introducing a subpackage split the codebase
-has already diverged from:
+This section originally proposed breaking `routing/brains.py` into a
+`routing/brains/` subpackage (`base.py`/`stub.py`/`openai_http.py`). That
+didn't happen, and shouldn't: `NpuFastBrain` had already established the
+opposite precedent — add a class to the **flat** module, import its runtime
+lazily, and register it in `router.py::_build_fast_brain` behind an env var.
+`PhoneFastBrain` followed that precedent. What actually landed:
 
 ```
 src/two_brain_router/
-  routing/brains.py   # stays flat -- add OpenAIHttpBrain here, next to
-                      # NpuFastBrain, LocalFastBrain, CloudDeepBrain.
-                      # Import urllib/requests lazily inside the method,
-                      # same as NpuFastBrain's lazy `import onnxruntime_qnn`.
-  routing/router.py   # _build_fast_brain grows a phone branch, gated behind
-                      # its own env var (e.g. TWO_BRAIN_PHONE_BRAIN=1),
-                      # same shape as the existing NPU-tier switch.
+  routing/brains.py   # PhoneFastBrain, alongside NpuFastBrain /
+                      # LocalFastBrain / CloudDeepBrain. urllib imported
+                      # lazily inside the method, mirroring NpuFastBrain's
+                      # lazy `import onnxruntime_qnn`. Generic over any
+                      # OpenAI-shaped endpoint -- not phone-specific.
+  routing/router.py   # _build_fast_brain grew a mobile branch behind
+                      # TWO_BRAIN_PHONE_BRAIN=1, same shape as the NPU switch
   signals/
-    confidence.py     # <- absorbs the three strategies; replaces difficulty.py
+    confidence.py     # self-report parsing + confidence->difficulty. Pure,
+                      # no I/O -- so it unit-tests like policy.py does.
 
-tools/phone/          # per-device by nature, outside the package
+src/phone_brain/      # unchanged, still per-device tooling by nature
   export_phone_brain.sh
   mock_phone_brain_server.py
   bench_phone_brain.py            # renamed from test_phone_brain.py (see #5)
   verify_confidence_estimator.sh
+  confidence_estimator.py         # kept: the strategy *comparison* harness
 
-docs/
-  L_INTERFACE_CONTRACT.md         # promote -- it's cross-cutting, not phone-only
-  phone-deployment.md             # the deployment guides, deduplicated
+docs/ORCHESTRATOR.md              # how the router decides, both shapes
 ```
 
-The original point still holds even without the subpackage: `OpenAIHttpBrain`
-should be **one** class that serves the phone today and any other
-OpenAI-shaped served model later — including a future hosted AI-PC or cloud
-endpoint — not a phone-specific class. Just implement it as an addition to
-the existing `brains.py`, not a new file tree, so the two real-brain efforts
-don't leave the module split two different ways.
+Two deviations from the plan above, both deliberate:
 
-**Housekeeping:** `PHONE_DEPLOYMENT_GUIDE.md` and
-`PHONE_DEPLOYMENT_GUIDE_final.md` are byte-identical duplicates. Keep one.
-`src/phone_brain/.gitignore` (genie bundles, etc.) should fold into the root
-`.gitignore` when the folder moves.
+- **Only the `self_reported` strategy was absorbed**, not all three.
+  `L_INTERFACE_CONTRACT.md` decided self-report, and `hybrid`/`self_consistency`
+  are multi-call strategies whose value is in *comparing* costs — that belongs
+  in `confidence_estimator.py`'s harness, not on the router's hot path. If
+  self-report turns out badly calibrated on the real device, `hybrid` is the
+  documented fallback and porting it is a `signals/confidence.py` change only.
+- **`signals/confidence.py` does not replace `difficulty.py`.** The heuristic
+  is still the signal for every brain with `reports_confidence = False`, and
+  the fallback when a self-rating brain returns an unparseable confidence.
+
+Still-open tidying: `src/phone_brain/.gitignore` (genie bundles, etc.) could
+fold into the root `.gitignore`, and `L_INTERFACE_CONTRACT.md` is arguably
+cross-cutting enough to promote into `docs/` now that the router depends on
+it. Neither blocks anything.
