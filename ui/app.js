@@ -136,6 +136,9 @@ const state = {
   //: back to mockRespond() rather than failing -- the UI was built to run
   //: standalone and should keep doing so.
   backend: null,
+  //: True while a reply is streaming; suppresses re-renders that
+  //: would destroy the bubble being painted into.
+  streaming: false,
   searchQuery: "",
 };
 
@@ -150,8 +153,86 @@ function loadChats() {
   }
 }
 
+/**
+ * Persist chats, surviving a full store.
+ *
+ * localStorage is ~5 MB and throws QuotaExceededError when full. This used to
+ * be an unguarded setItem, so once attached images pushed the store over the
+ * limit the exception propagated out of handleSend *before* the assistant
+ * reply was pushed -- losing the reply and freezing storage at the last good
+ * save, which read as "earlier chats disappear".
+ *
+ * Attachments are stored as small thumbnails rather than full images (see
+ * makeThumbnail), so this should be rare; if it still happens, the oldest
+ * chats are dropped until the rest fits. Losing the oldest history is bad, but
+ * silently losing the conversation in front of you is worse.
+ */
 function saveChats() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state.chats));
+  for (let attempt = 0; attempt < 12; attempt++) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.chats));
+      return true;
+    } catch (err) {
+      const isQuota =
+        err instanceof DOMException &&
+        (err.name === "QuotaExceededError" || err.code === 22 || err.code === 1014);
+      if (!isQuota) {
+        console.error("saveChats failed", err);
+        return false;
+      }
+      // Drop the oldest chat that is not the one being written to.
+      const oldest = state.chats
+        .filter((c) => c.id !== state.activeChatId)
+        .sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0))[0];
+      if (!oldest) {
+        // Nothing left to evict: strip images from the active chat instead.
+        let freed = false;
+        for (const chat of state.chats) {
+          for (const msg of chat.messages) {
+            if (msg.image) {
+              delete msg.image;
+              freed = true;
+            }
+          }
+        }
+        if (!freed) {
+          console.error("saveChats: cannot fit chats in localStorage");
+          return false;
+        }
+        continue;
+      }
+      state.chats = state.chats.filter((c) => c !== oldest);
+      console.warn("saveChats: storage full, dropped oldest chat", oldest.title);
+    }
+  }
+  return false;
+}
+
+/**
+ * Shrink an image to a thumbnail data URL for persistence.
+ *
+ * The full-resolution image still goes to the model; only this small copy is
+ * kept in localStorage and shown in history. A 2 MB photo is ~2.7 MB as base64
+ * and would blow the quota on its own.
+ */
+function makeThumbnail(dataUrl, maxPx = 320) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxPx / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      try {
+        resolve(canvas.toDataURL("image/jpeg", 0.7));
+      } catch {
+        resolve(null); // tainted canvas or unsupported type; history just loses the preview
+      }
+    };
+    img.onerror = () => resolve(null);
+    img.src = dataUrl;
+  });
 }
 
 function escapeHtml(str) {
@@ -640,12 +721,20 @@ async function handleSend(e) {
   if (!chat) chat = createChat(query);
 
   const attachment = state.attachment;
-  chat.messages.push({
-    role: "user",
-    content: query,
-    image: attachment?.dataUrl || null,
-    timestamp: Date.now(),
-  });
+  // The full-resolution image goes to the model; only a thumbnail is kept in
+  // the chat, because localStorage cannot hold full images (see saveChats).
+  const userMessage = { role: "user", content: query, timestamp: Date.now() };
+  chat.messages.push(userMessage);
+  if (attachment?.dataUrl) {
+    makeThumbnail(attachment.dataUrl).then((thumb) => {
+      if (!thumb) return;
+      userMessage.image = thumb;
+      saveChats();
+      // Re-rendering mid-stream would destroy the bubble being painted into.
+      const active = state.chats.find((c) => c.id === state.activeChatId);
+      if (!state.streaming && active === chat) renderMessages(chat);
+    });
+  }
   chat.updatedAt = Date.now();
   saveChats();
   renderMessages(chat);
@@ -682,6 +771,21 @@ async function handleSend(e) {
   let answer;
   let answeredTier = tier;
   let metrics;
+  // The assistant message is added to the chat *before* streaming and filled in
+  // as tokens arrive, so a reload part-way through keeps what was received. A
+  // local reply can run for minutes; losing all of it to an accidental refresh
+  // would be its own bug.
+  const streamingMessage = {
+    role: "assistant",
+    content: "",
+    tier,
+    timestamp: Date.now(),
+    partial: true,
+  };
+  chat.messages.push(streamingMessage);
+  state.streaming = true;
+  let lastPersistAt = 0;
+
   if (state.backend) {
     try {
       // Paint into the placeholder bubble as tokens arrive, so a long local
@@ -692,11 +796,21 @@ async function handleSend(e) {
         tier,
         attachment?.dataUrl,
         (soFar) => {
-          if (!liveText) return;
-          thinkingAvatar?.classList.remove("thinking");
-          liveText.className = "markdown";
-          liveText.innerHTML = renderMarkdown(soFar);
-          scrollToBottom();
+          streamingMessage.content = soFar;
+          if (liveText) {
+            thinkingAvatar?.classList.remove("thinking");
+            liveText.className = "markdown";
+            liveText.innerHTML = renderMarkdown(soFar);
+            scrollToBottom();
+          }
+          // Persist at most once a second: saving every token would serialise
+          // the whole history on each delta.
+          const now = performance.now();
+          if (now - lastPersistAt > 1000) {
+            lastPersistAt = now;
+            chat.updatedAt = Date.now();
+            saveChats();
+          }
         },
       );
       answer = result.answer;
@@ -721,13 +835,13 @@ ${err.message}`;
     metrics = computeMetrics(query, tier);
   }
   metrics.actualLatencyMs = performance.now() - thinkingStartedAt;
-  chat.messages.push({
-    role: "assistant",
-    content: answer,
-    tier: answeredTier,
-    timestamp: Date.now(),
-    metrics,
-  });
+  // Finalise the message that was streamed into, rather than pushing a second
+  // one -- it is already in chat.messages.
+  streamingMessage.content = answer;
+  streamingMessage.tier = answeredTier;
+  streamingMessage.metrics = metrics;
+  delete streamingMessage.partial;
+  state.streaming = false;
   chat.updatedAt = Date.now();
   saveChats();
   renderMessages(chat);
