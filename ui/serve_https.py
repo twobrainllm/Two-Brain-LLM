@@ -155,11 +155,14 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_error(404, "no such endpoint")
 
     def end_headers(self) -> None:
-        # Static assets are versioned in index.html, but a phone that already
-        # cached an unversioned copy needs telling. Cheap insurance on a demo
-        # server; this is not a production static host.
+        # index.html references app.js/styles.css without a version query, so
+        # a phone will happily serve a cached copy after a pull -- new markup
+        # driven by old script, which reads as "the buttons don't work" rather
+        # than as a caching problem. Cost an hour to diagnose once already.
+        # no-store rather than no-cache: no-cache still permits a stored copy
+        # revalidated by ETag, and mobile browsers are inconsistent about it.
         if not self.path.split("?")[0] in PROXY_PATHS:
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", "no-store, must-revalidate")
         super().end_headers()
 
 
