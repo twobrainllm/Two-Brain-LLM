@@ -382,8 +382,12 @@ function tierLabel(tier) {
 
 function formatPrivacy(metrics) {
   if (!metrics.piiCount) return "No PII detected";
-  const parts = metrics.piiEntities.map((e) => `${e.count} ${e.type}`);
-  return `${metrics.piiCount} masked (${parts.join(", ")})`;
+  // A live decision reports only how many entities were masked -- the server
+  // deliberately never sends the vault or the entity types, so there is
+  // nothing to break down here and claiming one would be inventing it.
+  const parts = (metrics.piiEntities || []).map((e) => `${e.count} ${e.type}`);
+  const suffix = parts.length ? ` (${parts.join(", ")})` : "";
+  return `${metrics.piiCount} masked${suffix}`;
 }
 
 /** Renders the profiler pill + card from one message's computed metrics (see profiler.js). */
@@ -391,7 +395,11 @@ function renderProfiler(metrics, tier) {
   els.profiler.dataset.hasData = "true";
   els.profilerDot.dataset.tier = tier;
   els.profilerCardDot.dataset.tier = tier;
-  els.profilerCardTier.textContent = `${tierLabel(tier)} brain`;
+  // Say plainly whether these numbers came from the router or from the JS
+  // port of its formulas. A profiler that cannot be trusted to distinguish
+  // the two is worse than no profiler.
+  els.profilerCardTier.textContent =
+    `${tierLabel(tier)} brain` + (metrics.live ? "" : " (simulated)");
 
   const summaryLatencyMs = Math.round(metrics.actualLatencyMs ?? metrics.estLatencyMs);
   els.profilerSummary.textContent = `${tierLabel(tier)} · ${summaryLatencyMs}ms`;
@@ -443,10 +451,97 @@ function toggleProfilerCard() {
   else openProfilerCard();
 }
 
+/* ---------- Talking to the real router ----------
+ *
+ * `ui/server.py` exposes TwoBrainRouter over HTTP. When it is reachable, the
+ * tier badge, the difficulty score, the PII count and the notes are all the
+ * router's own -- a real routing decision, not the sidebar toggle.
+ *
+ * When it is not reachable the UI falls back to mockRespond() and says so, so
+ * the page still works opened straight off the filesystem. What it must never
+ * do is show a mock answer that looks real: `metrics.live` drives that label.
+ */
+
+const API_ROUTE = "/api/route";
+const API_HEALTH = "/api/health";
+
+const backend = { live: false, info: null };
+
+async function checkBackend() {
+  try {
+    const res = await fetch(API_HEALTH, { method: "GET" });
+    if (!res.ok) throw new Error(String(res.status));
+    backend.info = await res.json();
+    backend.live = backend.info.ok === true;
+  } catch {
+    backend.live = false;
+    backend.info = null;
+  }
+  renderBackendStatus();
+  return backend.live;
+}
+
+function renderBackendStatus() {
+  const hint = els.emptyState.querySelector(".empty-state-hint");
+  if (backend.live) {
+    const info = backend.info;
+    if (hint) {
+      hint.textContent =
+        `Answers are real. Fast brain: ${info.fast_brain} (${info.tier} tier) · ` +
+        `deep brain: ${info.deep_brain}. The router decides which one answers.`;
+    }
+    els.brainToggle?.closest(".brain-toggle")?.setAttribute(
+      "title",
+      "Routing is decided by TwoBrainRouter. This toggle no longer picks the tier."
+    );
+  } else if (hint) {
+    hint.textContent =
+      "Replies are simulated — ui/server.py is not running. " +
+      "Start it to route through the real two-brain router.";
+  }
+}
+
 /**
- * MOCK: stands in for TwoBrainRouter.route(query, context). The tier is
- * whatever the sidebar toggle is set to, not a real routing decision -- see
- * README.md for the real contract this needs to match.
+ * Calls the router. Returns {answer, tier, metrics} with metrics.live=true,
+ * or null when the backend is unreachable so the caller can fall back.
+ */
+async function routeViaBackend(query, context = "") {
+  try {
+    const res = await fetch(API_ROUTE, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, context }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || String(res.status));
+
+    return {
+      answer: body.answer,
+      tier: body.tier,
+      metrics: {
+        live: true,
+        difficulty: body.difficulty,
+        escalateThreshold: body.escalate_threshold,
+        piiCount: body.pii_entities_masked,
+        // The server never sends the vault -- only how many entities it held.
+        piiEntities: [],
+        estLatencyMs: body.est_latency_ms,
+        estCostUsd: body.est_cost_usd,
+        actualLatencyMs: body.actual_latency_ms,
+        notes: body.notes || [],
+        deviceContext: `${body.fast_brain} · ${body.deep_brain} · ${body.router_tier} tier`,
+      },
+    };
+  } catch (err) {
+    backend.live = false;
+    return { error: String(err.message || err) };
+  }
+}
+
+/**
+ * MOCK: stands in for TwoBrainRouter.route(query, context). Only used when
+ * ui/server.py is not reachable. The tier is whatever the sidebar toggle is
+ * set to, not a real routing decision.
  */
 function mockRespond(query, tier) {
   const tierLabel = tier === "cloud" ? "Cloud AI 100 (simulated)" : "local fast brain (simulated)";
@@ -970,7 +1065,14 @@ async function handleSend(e) {
   autoGrow();
   updateSendState();
 
+  // Kick the router off immediately, in parallel with the thinking animation
+  // below -- the avatar choreography is personality, and must not be added to
+  // a real model's latency. Whichever finishes last decides when the answer
+  // lands. `tier` here is only the *provisional* colour for the thinking
+  // avatar; when the backend is live the router's own decision replaces it.
   const tier = state.currentTier;
+  const routePromise = backend.live ? routeViaBackend(query) : null;
+
   const thinkingStartedAt = performance.now();
   const thinkingRow = renderMessageEl({ role: "assistant", content: "…", tier });
   const thinkingAvatar = thinkingRow.querySelector(".robot-avatar");
@@ -992,16 +1094,42 @@ async function handleSend(e) {
   playExpression(thinkingAvatar, "happy", HAPPY_LEAD_MS);
   await sleep(HAPPY_LEAD_MS);
 
-  const answer = mockRespond(query, tier);
-  const metrics = computeMetrics(query, tier);
+  let answer;
+  let answeredTier = tier;
+  let metrics;
+
+  const routed = routePromise ? await routePromise : null;
+  if (routed && !routed.error) {
+    // Real decision: the router says which brain answered, not the toggle.
+    answer = routed.answer;
+    answeredTier = routed.tier;
+    metrics = routed.metrics;
+  } else {
+    answer = mockRespond(query, tier);
+    metrics = computeMetrics(query, tier);
+    metrics.live = false;
+    if (routed?.error) {
+      answer =
+        `The router could not be reached (${routed.error}), so this is a ` +
+        `simulated reply.\n\n${answer}`;
+      renderBackendStatus();
+    }
+  }
   metrics.actualLatencyMs = performance.now() - thinkingStartedAt;
-  chat.messages.push({ role: "assistant", content: answer, tier, timestamp: Date.now(), metrics });
+  const tierAtSend = answeredTier;
+  chat.messages.push({
+    role: "assistant",
+    content: answer,
+    tier: tierAtSend,
+    timestamp: Date.now(),
+    metrics,
+  });
   chat.updatedAt = Date.now();
   saveChats();
   renderMessages(chat);
   renderChatList();
   playExpression(els.messages.querySelector(".message.assistant:last-child .robot-avatar"), "happy");
-  renderProfiler(metrics, tier);
+  renderProfiler(metrics, tierAtSend);
 }
 
 function autoGrow() {
@@ -1122,6 +1250,7 @@ document.addEventListener("keydown", (e) => {
 
 initVoice();
 initVideoMode();
+checkBackend();
 renderChatList();
 showEmptyState();
 renderAttachments();
