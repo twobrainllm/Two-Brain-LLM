@@ -8,6 +8,9 @@ dist/
 # Virtual environments
 .venv/
 venv/
+# x64 venv for the AI Hub export toolchain -- qai-hub-models pins torch==2.10.0,
+# which has no win_arm64 wheel, so it needs the emulated x86-64 interpreter.
+venv-x64/
 
 # Tests / coverage
 .pytest_cache/
@@ -45,6 +48,9 @@ data/npu_model/**/*.gguf
 # Local scratch space -- drafts, PR bodies, throwaway notes. Never committed.
 scratch/
 
+# Personal Claude Code permission overrides -- not team policy.
+.claude/settings.local.json
+
 # Credentials for the Cloud AI 100 deep brain (Cirrascale AI Suite endpoint).
 # Never commit. CloudDeepBrain reads INFERENCE_CLOUD_API_KEY /
 # INFERENCE_CLOUD_ENDPOINT from the environment, not from a tracked file.
@@ -59,3 +65,9 @@ secrets.txt
 .llama-cpp-opencl/
 data/vlm_gpu_model/**/raw/
 data/vlm_gpu_model/**/*.gguf
+
+# GPU (Adreno/OpenCL) phone tier -- llama-cli/llama-server/libOpenCL.so
+# cross-compiled for Android arm64-v8a (S25 Ultra), same rationale as above.
+# See docs/PHONE_BRAIN.md and PHONE_DEPLOYMENT_GUIDE_final.md for the build
+# recipe. Not vendored -- rebuild from src/phone_brain if this is missing.
+.llama-cpp-opencl-android/

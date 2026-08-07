@@ -165,3 +165,110 @@ to fix it purely by rewording the prompt.
 
 - Exact GenieX on-device install packaging (Part 4) — check its own docs once downloaded; I haven't personally confirmed the exact command.
 - Whether the real model's self-reported confidence is actually well-calibrated — Part 8 is where you find out, not before.
+
+---
+
+## Alternative path — GPU (Adreno/OpenCL), no QNN/AI-Hub account needed
+
+Built in parallel with the NPU path above (2026-08-07) so there's a working
+demo either way before the hackathon deadline, following the same pattern
+hollowbyte proved for the AI-PC tier: the NPU needs a vendor-precompiled
+binary (Hexagon's toolchain is closed), but the Adreno GPU needs no vendor
+binary at all — just a stock quantized GGUF run through llama.cpp's OpenCL
+backend. **This path never touches Qualcomm AI Hub, torch, or the gated HF
+weights download for compilation** — only the GGUF (a public quant) is
+needed at deploy time.
+
+### What's already built
+
+Cross-compiled for Android arm64-v8a with `GGML_OPENCL=ON`, targeting the
+S25 Ultra's Adreno 830. Artifacts live in
+**`.llama-cpp-opencl-android/`** at the repo root (gitignored, same as the
+existing `.llama-cpp-opencl/` for the AI-PC tier — rebuild from source if
+missing, don't expect it to be vendored):
+
+| File | What it is |
+|---|---|
+| `llama-cli` | Android arm64 CLI binary — `ELF ... interpreter /system/bin/linker64` |
+| `llama-server` | Android arm64 OpenAI-compatible server binary — same interpreter |
+| `libOpenCL.so` | ICD loader stub the phone's real Adreno driver resolves against at runtime |
+
+### The cross-compile problem, and how it was solved
+
+This was the hard part — worth recording so it isn't re-derived. The
+Android NDK's own bundled clang is **x86_64-Linux only**; this dev
+environment cross-compiles from WSL2 on an ARM64 Windows host, so the NDK's
+clang can't execute at all (`Exec format error`, no x86 emulation
+registered in this WSL kernel, no sudo to add it). Two workarounds were
+tried and abandoned before landing on the one that works:
+
+- **qemu-x86_64 user-mode emulation** of the NDK's clang: got the emulator
+  running (Ubuntu's `qemu-user-static` `.deb`, extracted without root via
+  `apt-get download` + `dpkg-deb -x`), but the NDK's clang is dynamically
+  linked against glibc, which this filesystem doesn't have at all — would
+  need a full foreign-arch glibc rootfs too. Abandoned.
+- **Zig** (`zig cc -target aarch64-linux-android`): aarch64-native,
+  self-contained, looked ideal — but Zig 0.16.0 does not bundle
+  Android/Bionic libc support at all (confirmed: its `lib/libc/` has
+  darwin/freebsd/glibc/mingw/musl/netbsd/openbsd/wasi, no android). Trivial
+  compiles succeed and mask this; anything that includes a real libc header
+  fails. Zig's own external-libc mechanism (a `--libc <file>`
+  description file) isn't accepted by the `cc` subcommand. Abandoned.
+- **What actually works:** a real, **native aarch64-Linux** build of
+  upstream LLVM/clang (`LLVM-<ver>-Linux-ARM64.tar.xz` from
+  `github.com/llvm/llvm-project` releases — note the unusual naming, it's
+  `LLVM-*` not `clang+llvm-*` for this platform, but clang is bundled in
+  `bin/`), pointed at the **NDK's sysroot** via plain `--sysroot=` (headers
+  and `.so` stubs are architecture-independent data, not executables — the
+  NDK's x86_64-only clang *binary* was never actually needed, only its
+  sysroot contents). Two extra fixes were needed beyond that:
+  1. Don't set `-resource-dir` to the NDK's own clang-18 resource
+     directory — it shadows the native clang's own `arm_neon.h` with an
+     older, incompatible NEON-intrinsics ABI and breaks ggml's SIMD code
+     across dozens of files.
+  2. `libclang_rt.builtins.a` and `libunwind.a` (the two Android-target
+     runtime archives the NDK provides that upstream LLVM's target doesn't
+     ship) need copying into place by hand — `libunwind.a` resolves via a
+     normal `-B`/`-L` search, but `libclang_rt.builtins.a` is looked up by
+     clang at a **hardcoded resource-dir-relative path**
+     (`<llvm>/lib/clang/<ver>/lib/aarch64-unknown-linux-android28/libclang_rt.builtins.a`)
+     that ignores `-B`/`-L` entirely — the fix is literally copying the
+     file there.
+
+  Full recipe, wrapper scripts, and every dead end: see the
+  `two-brain-phone-deploy-progress` memory entry from this session, or ask
+  to have this section expanded into a standalone build script if
+  rebuilding from scratch.
+
+### Deploying to the phone
+
+```bash
+adb devices                         # confirm the S25 Ultra shows as "device"
+
+adb push .llama-cpp-opencl-android/llama-server /data/local/tmp/
+adb push .llama-cpp-opencl-android/libOpenCL.so  /data/local/tmp/
+adb shell chmod +x /data/local/tmp/llama-server
+
+# Pull a Q4_0 GGUF of Llama-3.2-3B-Instruct onto the dev machine first --
+# Q4_0 specifically: Qualcomm's OpenCL backend (GGML_OPENCL_USE_ADRENO_KERNELS)
+# is tuned for Q4_0, and stock GGUF repos (e.g. Qwen's own) often only ship
+# Q4_K_M/Q8_0 -- an unsloth-style Q4_0 reupload may be needed.
+adb push Llama-3.2-3B-Instruct-Q4_0.gguf /data/local/tmp/
+
+adb reverse tcp:8080 tcp:8080
+adb shell "cd /data/local/tmp && \
+  LD_LIBRARY_PATH=/data/local/tmp \
+  OCL_ICD_FILENAMES=/data/local/tmp/libOpenCL.so \
+  ./llama-server -m Llama-3.2-3B-Instruct-Q4_0.gguf -ngl 99 -c 4096 --port 8080"
+```
+
+`-c`/`--n-ctx` is mandatory per hollowbyte's AI-PC notes — without it,
+llama.cpp's auto-fit context sizing can blow past device memory. `-ngl 99`
+offloads all layers to the Adreno GPU via OpenCL. Smoke-test from the dev
+machine against `http://localhost:8000` the same way as the NPU path's
+Part 7, once `adb reverse` is set up.
+
+**Not yet done:** actually running this on the physical S25 Ultra (no
+device was connected when the binaries were built), and getting a Q4_0
+GGUF onto the phone. Both are the immediate next steps once hardware is
+available.
