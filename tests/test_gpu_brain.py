@@ -21,6 +21,8 @@ import pytest
 from two_brain_router.routing.brains import (
     _GPU_MODEL_PATH,
     _LLAMA_BIN_DIR,
+    _VLM_MMPROJ_PATH,
+    _VLM_MODEL_PATH,
     BrainResponse,
     GpuLocalBrain,
 )
@@ -136,3 +138,41 @@ def test_gate_is_off_by_default(monkeypatch):
     monkeypatch.delenv("TWO_BRAIN_NPU_BRAIN", raising=False)
 
     assert isinstance(TwoBrainRouter(tier="pc").fast_brain, LocalFastBrain)
+
+
+_VLM_PRESENT = _VLM_MODEL_PATH.exists() and _VLM_MMPROJ_PATH.exists()
+
+
+@pytest.mark.skipif(not _VLM_PRESENT, reason="VLM weights not present (gitignored)")
+def test_for_vision_uses_the_eval_winning_defaults(tmp_path):
+    """The recommended VLM config is a default, not folklore in a doc.
+
+    Pins the outcome of data/vlm_gpu_model/_eval/RESULTS.md: 8B Q4_0 scored
+    7/7, ahead of 4B Q8_0 and even 4B BF16 at 6/7. If someone changes the
+    default, this should make them justify it against the eval.
+
+    mmproj_offload MUST be False here: the 8B's vision tower is head_dim 72,
+    llama.cpp's OpenCL flash-attention kernels cover only 64/128, and leaving
+    offload on segfaults the process.
+    """
+    brain = GpuLocalBrain.for_vision(
+        "pc", TierSignals.load("pc_3b", "ai_pc"), log_path=tmp_path / "srv.log"
+    )
+    try:
+        assert "8B" in brain._model_path.name and "Q4_0" in brain._model_path.name
+        assert brain._mmproj_path is not None, "vision defaults must load a projector"
+        assert brain._mmproj_offload is False, "8B vision encoder must stay off the GPU"
+
+        response = brain.answer("Name three primary colours.")
+        assert response.text.strip()
+        assert brain.verify_gpu_placement(), "language model should still be on the GPU"
+        log = (tmp_path / "srv.log").read_text(encoding="utf-8", errors="replace")
+        assert "CLIP using CPU backend" in log, "vision encoder must be on CPU for the 8B"
+    finally:
+        brain.close()
+
+
+@pytest.mark.skipif(not _VLM_PRESENT, reason="VLM weights not present (gitignored)")
+def test_for_vision_rejects_an_unknown_preference():
+    with pytest.raises(ValueError, match="quality.*speed"):
+        GpuLocalBrain.for_vision("pc", TierSignals.load("pc_3b", "ai_pc"), prefer="cheapest")

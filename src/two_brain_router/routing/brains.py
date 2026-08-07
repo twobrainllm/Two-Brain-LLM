@@ -485,6 +485,28 @@ _LLAMA_BIN_DIR = DATA_DIR.parent / ".llama-cpp-opencl" / "extracted"
 #: are a like-for-like comparison of device rather than of model.
 _GPU_MODEL_PATH = DATA_DIR / "npu_model" / "phi-3.5-mini-instruct" / "gguf" / "Phi-3.5-mini-instruct-Q4_0.gguf"
 
+#: Recommended vision defaults, chosen by measurement rather than by size.
+#: `data/vlm_gpu_model/_eval/RESULTS.md` scored four variants on 7
+#: objectively-checkable items with deterministic decoding:
+#:
+#:     8B Q4_0  7/7   <- this default
+#:     4B Q8_0  6/7
+#:     4B BF16  6/7   (full precision buys nothing over Q8_0, at 1.9x the size)
+#:     4B Q4_0  5/7
+#:
+#: The 8B at 4-bit beats the 4B at *full precision*, so parameters matter more
+#: than bit-width here. It costs ~1.6x the latency and cannot keep its vision
+#: encoder on the GPU -- its vision tower is head_dim 72 and llama.cpp's OpenCL
+#: flash-attention kernels cover only 64/128, so `mmproj_offload=False` is
+#: mandatory or the process segfaults.
+_VLM_DIR = DATA_DIR / "vlm_gpu_model"
+_VLM_MODEL_PATH = _VLM_DIR / "qwen3-vl-8b-instruct" / "raw" / "Qwen3-VL-8B-Instruct-Q4_0.gguf"
+_VLM_MMPROJ_PATH = _VLM_DIR / "qwen3-vl-8b-instruct" / "raw" / "mmproj-F16.gguf"
+#: The speed-oriented alternative: one point behind on the eval, but keeps the
+#: vision encoder on the GPU (head_dim 64) and is ~39% faster.
+_VLM_FAST_MODEL_PATH = _VLM_DIR / "qwen3-vl-4b-instruct" / "raw" / "Qwen3-VL-4B-Instruct-Q8_0.gguf"
+_VLM_FAST_MMPROJ_PATH = _VLM_DIR / "qwen3-vl-4b-instruct" / "raw" / "mmproj-Qwen3VL-4B-Instruct-f16.gguf"
+
 
 class GpuLocalBrain:
     """On-device fast brain running on the Adreno GPU, running for real.
@@ -579,6 +601,32 @@ class GpuLocalBrain:
             return False
         text = self._log_path.read_text(encoding="utf-8", errors="replace")
         return any(marker in text for marker in self.GPU_PLACEMENT_MARKERS)
+
+    @classmethod
+    def for_vision(cls, tier: str, signals: TierSignals, prefer: str = "quality", **kw) -> "GpuLocalBrain":
+        """Construct with the measured-best vision weights.
+
+        `prefer="quality"` -> Qwen3-VL-8B-Instruct-Q4_0 (7/7 on the eval), with
+        `mmproj_offload=False` because its vision encoder cannot run on the GPU.
+        `prefer="speed"` -> Qwen3-VL-4B-Instruct-Q8_0 (6/7), vision encoder on
+        the GPU, ~39% faster.
+
+        Both are still text-in/text-out today: `answer()` does not accept an
+        image, for the protocol and privacy reasons in this class's docstring.
+        Loading the projector means the instance is ready when that lands, and
+        it makes the recommended weights a default rather than folklore.
+        See data/vlm_gpu_model/_eval/RESULTS.md.
+        """
+        if prefer not in ("quality", "speed"):
+            raise ValueError(f"prefer must be 'quality' or 'speed', got {prefer!r}")
+        if prefer == "quality":
+            kw.setdefault("model_path", _VLM_MODEL_PATH)
+            kw.setdefault("mmproj_path", _VLM_MMPROJ_PATH)
+            kw.setdefault("mmproj_offload", False)  # mandatory for the 8B; segfaults otherwise
+        else:
+            kw.setdefault("model_path", _VLM_FAST_MODEL_PATH)
+            kw.setdefault("mmproj_path", _VLM_FAST_MMPROJ_PATH)
+        return cls(tier, signals, **kw)
 
     def _server_exe(self) -> Path:
         exe = self._bin_dir / ("llama-server.exe" if os.name == "nt" else "llama-server")
