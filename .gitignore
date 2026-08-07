@@ -21,3 +21,41 @@ htmlcov/
 
 # Secrets -- never commit
 .env
+
+# NPU deployment work (superpowers/deploy-local-brain-npu.md)
+# Dedicated ARM64 runtime venv -- keep separate from the router's own
+# stdlib-only .venv (see run.ps1); not vendored.
+.venv-npu/
+# Model artifacts are large binaries fetched from public URLs, not vendored --
+# the _real_*_log.md receipt in each data/npu_model/<model>/ dir documents
+# exactly what was downloaded, from where, and with what checksum, so the
+# fetch is reproducible without committing gigabytes of weights.
+data/npu_model/**/raw/
+data/npu_model/**/*.zip
+data/npu_model/**/*.bin
+data/npu_model/**/*.dll
+data/npu_model/**/*.so
+data/npu_model/**/*.cat
+data/npu_model/**/*.onnx
+data/npu_model/**/*.gguf
+
+# GenieX experiment venv (source-only sdist, auto-provisions a native SDK)
+.venv-geniex/
+
+# Local scratch space -- drafts, PR bodies, throwaway notes. Never committed.
+scratch/
+
+# Credentials for the Cloud AI 100 deep brain (Cirrascale AI Suite endpoint).
+# Never commit. CloudDeepBrain reads INFERENCE_CLOUD_API_KEY /
+# INFERENCE_CLOUD_ENDPOINT from the environment, not from a tracked file.
+secrets.txt
+.env
+*.key
+
+# GPU (Adreno/OpenCL) VLM work -- same rationale as the NPU section above.
+# Pre-built llama.cpp OpenCL binary + a copy of the Adreno driver package
+# (needed for the no-admin-rights OCL_ICD_FILENAMES workaround -- see
+# data/vlm_gpu_model/*/_real_inference_smoke_log.md); not vendored.
+.llama-cpp-opencl/
+data/vlm_gpu_model/**/raw/
+data/vlm_gpu_model/**/*.gguf

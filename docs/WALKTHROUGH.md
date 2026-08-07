@@ -256,8 +256,8 @@ The vault never leaves the process.
 |---|---|---|
 | PII masked | 3 entities (EMAIL, PHONE, SSN) | `privacy/patterns.py` |
 | Difficulty | `0.40` | 178 chars → 0.4 (capped); no hard markers; single `?` |
-| Local latency est. | `3007 ms` | `140 + 64 × 44.8` from `profile_workload/pc_3b.json` |
-| Decision | **escalate** | `0.40 < 0.55`, but `3007 > 3000` — **latency, not difficulty** |
+| Local latency est. | `6190 ms` | `142 + 64 × 94.5` from `profile_workload/pc_3b.json` (real capture as of the NPU deployment workflow — see `superpowers/deploy-local-brain-npu.md`) |
+| Decision | **escalate** | `0.40 < 0.55`, but `6190 > 3000` — **latency, not difficulty** |
 | Sent off-device | `My email is [PII_EMAIL_1] and my phone is [PII_PHONE_1] … SSN [PII_SSN_1] …` | masked text only |
 | Cloud latency | `1159 ms` | `45 rtt + 320 ttft + 64 × 12.4` from `cloud_large.json` |
 | Cloud cost | `$0.11520` | `64/1000 × $1.80` |
@@ -303,6 +303,11 @@ installing anything.
 Ordered by what unblocks the most. Items 1 and 2 are not fixable from this
 client — they need someone with server or SDK access.
 
+> **Update:** item 3 is now done for the AI-PC tier (see below) — bypassing
+> item 1 rather than waiting on it. The Mobile tier's counterpart is a
+> separate, unmerged, in-progress effort — see `../CLAUDE.md`'s "Branch
+> state" section for the full picture across branches.
+
 ### 1. Unblock `convert_model` (P0 — blocks 3, 4, 5)
 
 Two independent defects, both with complete repro steps already written down.
@@ -318,24 +323,40 @@ Either one being fixed unblocks a real artifact for its path.
 **Action:** file both upstream with the logs as-is. **Done when:** a real
 `.bin`/`.dlc` exists for `pc_3b`.
 
-### 2. Replace the mocked `data/` files with real captures (P1 — depends on 1)
+### 2. Replace the mocked `data/` files with real captures (P1 — depends on 1) — DONE for `pc_3b`
 
-With an artifact in hand, re-run `profile_workload` and `orchestrate_workload`
-per tier. Point `TWO_BRAIN_DATA_DIR` at the new captures first and diff the
-router's behavior before overwriting anything — **the logged mocks are evidence
-and should not be silently replaced.** Expect the thresholds to need retuning:
-`3000 ms` and `0.55` were chosen against estimated per-token rates, and real
-numbers will move the local/cloud boundary. `test_routing.py` asserts on
-*routing outcomes*, so a genuine shift will surface there.
+Item 1 (`convert_model`) is still genuinely blocked (see `docs/GAPS.md`
+#3/#3b) — but `pc_3b` didn't end up depending on it. See item 3: a
+different, real toolchain produced a real artifact, and
+`data/profile_workload/pc_3b.json` / `data/orchestrate_workload/pc_3b.json`
+are now real captures (`_mock: false`) from it, diffed against the old
+mocked values in each directory's `_real_call_log.md`. `mobile_1b.json` and
+`cloud_large.json` remain mocked — still genuinely blocked by 1 (mobile) and
+gap #4 (cloud), out of scope for the NPU workflow below.
 
-### 3. Run a real fast brain (P1 — depends on 1)
+### 3. Run a real fast brain (P1 — depends on 1) — DONE, via a different path than planned
 
-Implement a third `Brain` against the real runtime and register it in
-`TwoBrainRouter.__init__`. `onnxruntime-qnn` is installable into the parent
-repo's arm64 venv (the workspace `CLAUDE.md` documents the QNN EP registration
-snippet) and is currently the only thing between this project and real
-on-device inference once an artifact exists. **Nothing above `brains.py` should
-need to change** — if it does, the seam is wrong.
+This item assumed an artifact from `convert_model`, which is still blocked.
+Instead of waiting on item 1,
+[`superpowers/deploy-local-brain-npu.md`](../superpowers/deploy-local-brain-npu.md)
+routes around QUAD's compiler entirely — Qualcomm's own pre-built
+Genie/QNN context binary for Phi-3.5-mini-instruct, run in-process via
+`ctypes` against `Genie.dll`. `NpuFastBrain` in `routing/brains.py`
+implements the `Brain` protocol for real, real inference runs on this
+machine's Hexagon NPU (confirmed via `QnnGraph_execute` logs and a real
+QNN profiler capture — see that workflow doc's Phase 3/6), and it's wired
+into `TwoBrainRouter` behind the `TWO_BRAIN_NPU_BRAIN=1` env var so the
+base package stays stdlib-only by default. Nothing above `brains.py`
+changed — the seam held. `tests/test_npu_brain.py` has the Phase 6
+verification suite (skips without the real runtime/artifact, passes for
+real under `.venv-npu`).
+
+**This closes the AI-PC tier only.** The Mobile tier's fast brain is a
+separate, still-open effort — `src/phone_brain/` on branch `local_brain`
+has a working Genie/QNN server for Llama-3.2-3B-Instruct on a Galaxy S25,
+but it isn't wired into `Brain`/`TwoBrainRouter` yet and has real issues to
+resolve first (it currently sends the raw, unmasked query off-device before
+any routing decision). See `docs/PHONE_BRAIN.md`.
 
 ### 4. Replace the difficulty heuristic with a real confidence signal (P2 — depends on 3)
 

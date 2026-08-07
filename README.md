@@ -29,12 +29,12 @@ one where each tool's output can actually feed the next (`profile`/
 | Tool | Mobile (1B) | AI PC (3B) | Cloud AI 100 (large) |
 |---|---|---|---|
 | `hardware_detect` | **real** -- direct `adb shell` probe of a Galaxy S25 Ultra (see below) | **real** -- `quad-client detect --json`, Snapdragon X Elite X1E80100, Hexagon v73 @ 45 TOPS | **mocked** -- no cloud platform value exists in the tool schema at all |
-| `convert_model` | mocked | mocked | mocked |
-| `profile_workload` | mocked | mocked | mocked |
-| `orchestrate_workload` | mocked | mocked | n/a (cloud tier isn't an on-device op-placement problem) |
+| `convert_model` | mocked | mocked (QUAD's own tool -- still blocked, see below) | mocked |
+| `profile_workload` | mocked | **real** -- see note below | mocked |
+| `orchestrate_workload` | mocked | **real** -- see note below | n/a (cloud tier isn't an on-device op-placement problem) |
 
 `convert_model`/`profile_workload`/`orchestrate_workload` are mocked for
-**every** tier. The hosted server's `qairt-converter` cannot even import
+mobile and cloud. The hosted server's `qairt-converter` cannot even import
 (missing `libpython3.10.so.1.0`) -- a real, reproducible server-side defect.
 Bypassing the server and running the SDK's own Windows-native converter
 *locally* got much further (four real environment bugs fixed, real ops
@@ -50,6 +50,20 @@ the `_real_*_log.md` files under `data/` for the exact calls, arguments,
 and error strings. Nothing in this project's `data/` folder is a guess with
 no receipt -- every mocked file states which real attempt(s) preceded it
 and why they failed.
+
+**AI PC `profile_workload`/`orchestrate_workload` -- real, but not from
+QUAD's own tool call.** `convert_model` (QUAD's tool) is still genuinely
+blocked -- the table entry above stays "mocked" for it, honestly. But
+`data/profile_workload/pc_3b.json` and
+`data/orchestrate_workload/pc_3b.json` are real captures (`_mock: false`)
+from a *different* toolchain that routes around QUAD's compiler entirely:
+Qualcomm's own pre-built Genie/QNN artifact for Phi-3.5-mini-instruct,
+downloaded from Hugging Face and run for real on this machine's Hexagon
+NPU. See [`superpowers/deploy-local-brain-npu.md`](superpowers/deploy-local-brain-npu.md)
+for the full workflow and `data/npu_model/phi-3.5-mini-instruct/` for the
+receipts -- real per-token latency (~94.5 ms/token, ~2.1x slower than the
+old mock's guess), real `QnnGraph_execute` HTP-execution evidence, and a
+real QNN profiler capture.
 
 **Mobile hardware_detect:** `adb` was missing entirely (installed Android
 SDK platform-tools mid-session after winget's own package failed a hash
@@ -127,7 +141,7 @@ text is what actually leaves the device, the final answer is rehydrated):
 > My email is jane.doe@example.com and my phone is 555-123-4567 -- can you draft a reply telling the sender their SSN 123-45-6789 was found in an old backup and needs to be rotated?
   routed to: cloud | difficulty=0.40 | est_latency_ms=1159 | est_cost_usd=0.11520
   - masked 3 PII entities before any routing decision
-  - escalating: difficulty=0.40 (threshold 0.55) or local_latency_est=3007ms > budget 3000ms
+  - escalating: difficulty=0.40 (threshold 0.55) or local_latency_est=6190ms > budget 3000ms
   - sent off-device (masked): 'My email is [PII_EMAIL_1] and my phone is [PII_PHONE_1] -- can you draft a reply telling the sender their SSN [PII_SSN_1] was found in an old backup and needs to be rotated?'
   answer: [cloud:ai100 mock deep-brain response to: 'My email is jane.doe@example.com and my phone is 555-123-4567 -- can you draft a reply telling the sender their SSN 123-45-6789 was found in an old backup and needs to be rotated?' | context_used='']
 ```
@@ -156,7 +170,7 @@ two_brain_privacy_router/
       difficulty.py         #   SEAM: swap for a real logprob/entropy signal
     routing/
       policy.py             #   RoutePolicy (thresholds, compression) + RouteDecision
-      brains.py             #   SEAM: LocalFastBrain / CloudDeepBrain -> real inference
+      brains.py             #   SEAM: NpuFastBrain (real, pc_3b) / LocalFastBrain (mobile stub) / CloudDeepBrain (stub)
       router.py             #   TwoBrainRouter: mask -> decide -> answer -> rehydrate
   tests/
     conftest.py             # puts src/ on sys.path (no install needed)
@@ -167,6 +181,7 @@ two_brain_privacy_router/
     convert_model/{mobile_1b,pc_3b,cloud_large}.json + _real_attempts_log.md
     profile_workload/{mobile_1b,pc_3b,cloud_large}.json + _real_call_log.md
     orchestrate_workload/{mobile_1b,pc_3b}.json + _real_call_log.md
+    npu_model/phi-3.5-mini-instruct/ # real Genie/QNN artifact (gitignored) + receipts, see superpowers/deploy-local-brain-npu.md
   docs/GAPS.md
 ```
 
@@ -176,7 +191,7 @@ two_brain_privacy_router/
 |---|---|
 | A new PII entity type | `src/two_brain_router/privacy/patterns.py` |
 | The real `quad.privacy` guardrail | replace `privacy/guard.py`; keep the `PIIGuard` contract |
-| A real fast/deep brain (once `convert_model` works) | a new `Brain` implementation in `routing/brains.py` |
+| A real fast/deep brain | a new `Brain` implementation in `routing/brains.py` -- `NpuFastBrain` (pc_3b, real) didn't need `convert_model`; see `superpowers/deploy-local-brain-npu.md` |
 | A different escalation rule | `routing/policy.py` -- `should_escalate` is pure and unit-tested |
 | A new tier (e.g. a second PC SKU) | a `data/<tool>/<name>.json` set + an entry in `routing/router.py`'s `_TIER_FILES` |
 | A new tool response to consume | `signals/loader.py` |
@@ -203,14 +218,26 @@ Summarized here; the prioritized version with owners, dependencies, and
 done-when criteria is in
 [`docs/WALKTHROUGH.md` § Next steps](docs/WALKTHROUGH.md#next-steps).
 
+- **The PC tier now has a real fast brain (`NpuFastBrain`)** -- built by
+  routing around `convert_model` entirely (Qualcomm's pre-built Genie/QNN
+  artifact instead of a self-compiled one); see
+  `superpowers/deploy-local-brain-npu.md`. `convert_model` itself is still
+  broken.
+- **The Mobile tier's real fast brain is in progress, not yet merged in.**
+  `src/phone_brain/` (branch `local_brain`) has a working Genie/QNN server
+  for Llama-3.2-3B-Instruct on a Galaxy S25 and a confidence-estimation
+  reference implementation, built as a standalone package rather than a
+  `Brain` implementation. `docs/PHONE_BRAIN.md` audits it against this
+  project's actual code and lists what has to change before it's absorbed --
+  most importantly, it currently sends the raw, unmasked query off-device
+  before any routing decision, which is not this project's privacy guarantee.
 - **A fixed QAIRT `ReshapeOp::calculateShape`** (the uninitialized-memory
   bug found locally, gap #3b) or a fixed hosted-server install (missing
   `libpython3.10.so.1.0`, gap #3) -- either would unblock real
-  `convert_model` for the Mobile/PC tiers -> real
-  `profile_workload`/`orchestrate_workload` numbers -> a real
-  `LocalFastBrain.answer` in `routing/brains.py` instead of a labeled stub.
-  Both are
-  reported with exact repro steps; neither is fixable from this client.
+  `convert_model` for the Mobile tier -> real `profile_workload`/
+  `orchestrate_workload` numbers -> a real `LocalFastBrain.answer` for
+  mobile, the one tier that's still a labeled stub. Both are reported with
+  exact repro steps; neither is fixable from this client.
 - **Real calibration data (representative prompts) for INT4 static QDQ
   quantization** would sharpen the Mobile-tier conversion once a compiler
   path works -- not attempted here since the compiler blockers (#3/#3b

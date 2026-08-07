@@ -1,15 +1,24 @@
 {
-  "_mock": true,
-  "_reason": "No real artifact to orchestrate (convert_model blocked). Shape copied from the real orchestrate_workload call in _real_call_log.md.",
-  "model_id": "qwen2.5-3b-instruct",
+  "_mock": false,
+  "_reason": "Real capture, replacing the earlier no-artifact mock -- see ../npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md. Genie doesn't report per-op allocation the way QUAD's orchestrate_workload schema models it (no graph-level unsupported-op fallback mechanism); the fields below reflect what the real run actually showed: every graph loaded onto QnnHtp, zero forced-to-CPU decisions logged.",
+  "model_id": "phi-3.5-mini-instruct",
   "device_tier": "AI PC",
-  "power_mode": "balanced",
+  "power_mode": "burst",
   "allocation": {"embed": "npu", "attn_blocks": "npu", "lm_head": "npu"},
-  "npu_utilization_pct": 91.0,
-  "cpu_utilization_pct": 9.0,
+  "npu_utilization_pct": 100.0,
+  "cpu_utilization_pct": 0.0,
   "gpu_utilization_pct": 0.0,
   "fallback_layers": [],
   "decisions": [
-    {"category": "power_mode", "choice": "balanced", "reason": "Plugged-in AI PC tier -- no unsupported ops for this checkpoint, full NPU placement."}
+    {
+      "category": "power_mode",
+      "choice": "burst",
+      "reason": "real value from htp_backend_ext_config.json's perf_profile (Qualcomm's own shipped config for this artifact), not 'balanced' as the mock assumed."
+    },
+    {
+      "category": "op_allocation",
+      "choice": "all 40 graphs (LUT/DECODER/LMHEAD variants, 4-way weight-sharing split x 10 context-length/autoregressive buckets) placed on QnnHtp",
+      "reason": "Genie's backend for this bundle is fixed to QnnHtp; zero unsupported-op-forced-to-CPU messages logged across the real run (contrast with the degenerate placeholder call in _real_call_log.md, which did see a forced-to-CPU decision)."
+    }
   ]
 }

@@ -1,0 +1,602 @@
+{
+    "model": {
+        "bos_token_id": 1,
+        "context_length": 4096,
+        "decoder": {
+            "session_options": {
+                "log_id": "onnxruntime-genai",
+                "provider_options": [],
+                "log_severity_level": 0
+            },
+            "filename": "model.onnx",
+            "head_size": 96,
+            "hidden_size": 3072,
+            "inputs": {
+                "input_ids": "input_ids",
+                "attention_mask": "attention_mask_before_processor",
+                "position_ids": "position_ids",
+                "past_key_names": "past_key_%d_in",
+                "past_value_names": "past_value_%d_in"
+            },
+            "outputs": {
+                "logits": "logits_dequantized",
+                "present_key_names": "past_key_%d_out",
+                "present_value_names": "past_value_%d_out"
+            },
+            "num_attention_heads": 32,
+            "num_hidden_layers": 32,
+            "num_key_value_heads": 32,
+            "sliding_window_key_value_cache": {
+                "window_size": 128,
+                "pad_value": 128
+            },
+            "pipeline": [
+                {
+                    "position_processor": {
+                        "filename": "position-processor.onnx",
+                        "inputs": [
+                            "attention_mask_before_processor",
+                            "position_ids"
+                        ],
+                        "outputs": [
+                            "attention_mask_before_quantizer",
+                            "position_ids_cos_before_quantizer",
+                            "position_ids_sin_before_quantizer"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.position_processor",
+                            "provider_options": [
+                                {}
+                            ]
+                        },
+                        "run_on_token_gen": false
+                    },
+                    "position_shifter": {
+                        "filename": "position-shifter.onnx",
+                        "inputs": [
+                            "attention_mask_before_processor",
+                            "position_ids"
+                        ],
+                        "outputs": [
+                            "attention_mask_shifted",
+                            "position_ids_shifted",
+                            "attention_mask_before_quantizer",
+                            "position_ids_cos_before_quantizer",
+                            "position_ids_sin_before_quantizer"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.position_shifter",
+                            "provider_options": [
+                                {}
+                            ]
+                        },
+                        "run_on_prompt": false
+                    },
+                    "quantizer": {
+                        "filename": "quantizer.onnx",
+                        "inputs": [
+                            "attention_mask_before_quantizer",
+                            "position_ids_cos_before_quantizer",
+                            "position_ids_sin_before_quantizer"
+                        ],
+                        "outputs": [
+                            "attention_mask",
+                            "position_ids_cos",
+                            "position_ids_sin"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.quantizer",
+                            "provider_options": [
+                                {}
+                            ]
+                        }
+                    },
+                    "prompt-processor-1": {
+                        "filename": "ar128_cl4096_1_of_4_qnn_ctx.onnx",
+                        "inputs": [
+                            "input_ids",
+                            "past_key_0_in",
+                            "past_key_5_in",
+                            "past_value_5_in",
+                            "past_value_0_in",
+                            "past_key_6_in",
+                            "past_value_6_in",
+                            "past_key_7_in",
+                            "past_value_7_in",
+                            "past_key_1_in",
+                            "past_value_1_in",
+                            "past_key_2_in",
+                            "past_value_2_in",
+                            "past_key_3_in",
+                            "past_value_3_in",
+                            "past_key_4_in",
+                            "past_value_4_in",
+                            "position_ids_cos",
+                            "position_ids_sin",
+                            "attention_mask"
+                        ],
+                        "outputs": [
+                            "past_value_0_out",
+                            "past_key_0_out",
+                            "past_value_1_out",
+                            "past_key_1_out",
+                            "past_value_2_out",
+                            "past_key_2_out",
+                            "past_value_3_out",
+                            "past_key_3_out",
+                            "past_value_4_out",
+                            "past_key_4_out",
+                            "past_value_5_out",
+                            "past_key_5_out",
+                            "past_value_6_out",
+                            "past_key_6_out",
+                            "past_value_7_out",
+                            "past_key_7_out",
+                            "_model_layers_7_Add_1_Add_output_0"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.pp1",
+                            "provider_options": [
+                                {
+                                    "qnn": {
+                                        "backend_path": "QnnHtp.dll",
+                                        "htp_performance_mode": "burst",
+                                        "enable_htp_shared_memory_allocator": "1",
+                                        "qnn_context_priority": "high"
+                                    }
+                                }
+                            ]
+                        },
+                        "run_on_token_gen": false
+                    },
+                    "prompt-processor-2": {
+                        "filename": "ar128_cl4096_2_of_4_qnn_ctx.onnx",
+                        "inputs": [
+                            "_model_layers_7_Add_1_Add_output_0",
+                            "past_key_8_in",
+                            "past_key_13_in",
+                            "past_value_13_in",
+                            "past_value_8_in",
+                            "past_key_14_in",
+                            "past_value_14_in",
+                            "past_key_15_in",
+                            "past_value_15_in",
+                            "past_key_9_in",
+                            "past_value_9_in",
+                            "past_key_10_in",
+                            "past_value_10_in",
+                            "past_key_11_in",
+                            "past_value_11_in",
+                            "past_key_12_in",
+                            "past_value_12_in",
+                            "position_ids_cos",
+                            "position_ids_sin",
+                            "attention_mask"
+                        ],
+                        "outputs": [
+                            "past_value_8_out",
+                            "past_key_8_out",
+                            "past_value_9_out",
+                            "past_key_9_out",
+                            "past_value_10_out",
+                            "past_key_10_out",
+                            "past_value_11_out",
+                            "past_key_11_out",
+                            "past_value_12_out",
+                            "past_key_12_out",
+                            "past_value_13_out",
+                            "past_key_13_out",
+                            "past_value_14_out",
+                            "past_key_14_out",
+                            "past_value_15_out",
+                            "past_key_15_out",
+                            "_model_layers_15_Add_1_Add_output_0"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.pp2",
+                            "provider_options": [
+                                {
+                                    "qnn": {
+                                        "backend_path": "QnnHtp.dll",
+                                        "htp_performance_mode": "burst",
+                                        "enable_htp_shared_memory_allocator": "1",
+                                        "qnn_context_priority": "high"
+                                    }
+                                }
+                            ]
+                        },
+                        "run_on_token_gen": false
+                    },
+                    "prompt-processor-3": {
+                        "filename": "ar128_cl4096_3_of_4_qnn_ctx.onnx",
+                        "inputs": [
+                            "_model_layers_15_Add_1_Add_output_0",
+                            "past_key_16_in",
+                            "past_key_21_in",
+                            "past_value_21_in",
+                            "past_value_16_in",
+                            "past_key_22_in",
+                            "past_value_22_in",
+                            "past_key_23_in",
+                            "past_value_23_in",
+                            "past_key_17_in",
+                            "past_value_17_in",
+                            "past_key_18_in",
+                            "past_value_18_in",
+                            "past_key_19_in",
+                            "past_value_19_in",
+                            "past_key_20_in",
+                            "past_value_20_in",
+                            "position_ids_cos",
+                            "position_ids_sin",
+                            "attention_mask"
+                        ],
+                        "outputs": [
+                            "past_value_16_out",
+                            "past_key_16_out",
+                            "past_value_17_out",
+                            "past_key_17_out",
+                            "past_value_18_out",
+                            "past_key_18_out",
+                            "past_value_19_out",
+                            "past_key_19_out",
+                            "past_value_20_out",
+                            "past_key_20_out",
+                            "past_value_21_out",
+                            "past_key_21_out",
+                            "past_value_22_out",
+                            "past_key_22_out",
+                            "past_value_23_out",
+                            "past_key_23_out",
+                            "_model_layers_23_Add_1_Add_output_0"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.pp3",
+                            "provider_options": [
+                                {
+                                    "qnn": {
+                                        "backend_path": "QnnHtp.dll",
+                                        "htp_performance_mode": "burst",
+                                        "enable_htp_shared_memory_allocator": "1",
+                                        "qnn_context_priority": "high"
+                                    }
+                                }
+                            ]
+                        },
+                        "run_on_token_gen": false
+                    },
+                    "prompt-processor-4": {
+                        "filename": "ar128_cl4096_4_of_4_qnn_ctx.onnx",
+                        "inputs": [
+                            "_model_layers_23_Add_1_Add_output_0",
+                            "past_key_24_in",
+                            "past_key_29_in",
+                            "past_value_29_in",
+                            "past_value_24_in",
+                            "past_key_30_in",
+                            "past_value_30_in",
+                            "past_key_31_in",
+                            "past_value_31_in",
+                            "past_key_25_in",
+                            "past_value_25_in",
+                            "past_key_26_in",
+                            "past_value_26_in",
+                            "past_key_27_in",
+                            "past_value_27_in",
+                            "past_key_28_in",
+                            "past_value_28_in",
+                            "position_ids_cos",
+                            "position_ids_sin",
+                            "attention_mask"
+                        ],
+                        "outputs": [
+                            "past_value_24_out",
+                            "past_key_24_out",
+                            "past_value_25_out",
+                            "past_key_25_out",
+                            "past_value_26_out",
+                            "past_key_26_out",
+                            "past_value_27_out",
+                            "past_key_27_out",
+                            "past_value_28_out",
+                            "past_key_28_out",
+                            "past_value_29_out",
+                            "past_key_29_out",
+                            "past_value_30_out",
+                            "past_key_30_out",
+                            "past_value_31_out",
+                            "past_key_31_out",
+                            "logits"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.pp4",
+                            "provider_options": [
+                                {
+                                    "qnn": {
+                                        "backend_path": "QnnHtp.dll",
+                                        "htp_performance_mode": "burst",
+                                        "enable_htp_shared_memory_allocator": "1",
+                                        "qnn_context_priority": "high"
+                                    }
+                                }
+                            ]
+                        },
+                        "run_on_token_gen": false
+                    },
+                    "token-generator-1": {
+                        "filename": "ar1_cl4096_1_of_4_qnn_ctx.onnx",
+                        "inputs": [
+                            "input_ids",
+                            "past_key_0_in",
+                            "past_key_5_in",
+                            "past_value_5_in",
+                            "past_value_0_in",
+                            "past_key_6_in",
+                            "past_value_6_in",
+                            "past_key_7_in",
+                            "past_value_7_in",
+                            "past_key_1_in",
+                            "past_value_1_in",
+                            "past_key_2_in",
+                            "past_value_2_in",
+                            "past_key_3_in",
+                            "past_value_3_in",
+                            "past_key_4_in",
+                            "past_value_4_in",
+                            "position_ids_cos",
+                            "position_ids_sin",
+                            "attention_mask"
+                        ],
+                        "outputs": [
+                            "past_value_0_out",
+                            "past_key_0_out",
+                            "past_value_1_out",
+                            "past_key_1_out",
+                            "past_value_2_out",
+                            "past_key_2_out",
+                            "past_value_3_out",
+                            "past_key_3_out",
+                            "past_value_4_out",
+                            "past_key_4_out",
+                            "past_value_5_out",
+                            "past_key_5_out",
+                            "past_value_6_out",
+                            "past_key_6_out",
+                            "past_value_7_out",
+                            "past_key_7_out",
+                            "_model_layers_7_Add_1_Add_output_0"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.tg1",
+                            "provider_options": [
+                                {
+                                    "qnn": {
+                                        "backend_path": "QnnHtp.dll",
+                                        "htp_performance_mode": "burst",
+                                        "enable_htp_shared_memory_allocator": "1",
+                                        "qnn_context_priority": "high"
+                                    }
+                                }
+                            ]
+                        },
+                        "run_on_prompt": false
+                    },
+                    "token-generator-2": {
+                        "filename": "ar1_cl4096_2_of_4_qnn_ctx.onnx",
+                        "inputs": [
+                            "_model_layers_7_Add_1_Add_output_0",
+                            "past_key_8_in",
+                            "past_key_13_in",
+                            "past_value_13_in",
+                            "past_value_8_in",
+                            "past_key_14_in",
+                            "past_value_14_in",
+                            "past_key_15_in",
+                            "past_value_15_in",
+                            "past_key_9_in",
+                            "past_value_9_in",
+                            "past_key_10_in",
+                            "past_value_10_in",
+                            "past_key_11_in",
+                            "past_value_11_in",
+                            "past_key_12_in",
+                            "past_value_12_in",
+                            "position_ids_cos",
+                            "position_ids_sin",
+                            "attention_mask"
+                        ],
+                        "outputs": [
+                            "past_value_8_out",
+                            "past_key_8_out",
+                            "past_value_9_out",
+                            "past_key_9_out",
+                            "past_value_10_out",
+                            "past_key_10_out",
+                            "past_value_11_out",
+                            "past_key_11_out",
+                            "past_value_12_out",
+                            "past_key_12_out",
+                            "past_value_13_out",
+                            "past_key_13_out",
+                            "past_value_14_out",
+                            "past_key_14_out",
+                            "past_value_15_out",
+                            "past_key_15_out",
+                            "_model_layers_15_Add_1_Add_output_0"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.tg2",
+                            "provider_options": [
+                                {
+                                    "qnn": {
+                                        "backend_path": "QnnHtp.dll",
+                                        "htp_performance_mode": "burst",
+                                        "enable_htp_shared_memory_allocator": "1",
+                                        "qnn_context_priority": "high"
+                                    }
+                                }
+                            ]
+                        },
+                        "run_on_prompt": false
+                    },
+                    "token-generator-3": {
+                        "filename": "ar1_cl4096_3_of_4_qnn_ctx.onnx",
+                        "inputs": [
+                            "_model_layers_15_Add_1_Add_output_0",
+                            "past_key_16_in",
+                            "past_key_21_in",
+                            "past_value_21_in",
+                            "past_value_16_in",
+                            "past_key_22_in",
+                            "past_value_22_in",
+                            "past_key_23_in",
+                            "past_value_23_in",
+                            "past_key_17_in",
+                            "past_value_17_in",
+                            "past_key_18_in",
+                            "past_value_18_in",
+                            "past_key_19_in",
+                            "past_value_19_in",
+                            "past_key_20_in",
+                            "past_value_20_in",
+                            "position_ids_cos",
+                            "position_ids_sin",
+                            "attention_mask"
+                        ],
+                        "outputs": [
+                            "past_value_16_out",
+                            "past_key_16_out",
+                            "past_value_17_out",
+                            "past_key_17_out",
+                            "past_value_18_out",
+                            "past_key_18_out",
+                            "past_value_19_out",
+                            "past_key_19_out",
+                            "past_value_20_out",
+                            "past_key_20_out",
+                            "past_value_21_out",
+                            "past_key_21_out",
+                            "past_value_22_out",
+                            "past_key_22_out",
+                            "past_value_23_out",
+                            "past_key_23_out",
+                            "_model_layers_23_Add_1_Add_output_0"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.tg3",
+                            "provider_options": [
+                                {
+                                    "qnn": {
+                                        "backend_path": "QnnHtp.dll",
+                                        "htp_performance_mode": "burst",
+                                        "enable_htp_shared_memory_allocator": "1",
+                                        "qnn_context_priority": "high"
+                                    }
+                                }
+                            ]
+                        },
+                        "run_on_prompt": false
+                    },
+                    "token-generator-4": {
+                        "filename": "ar1_cl4096_4_of_4_qnn_ctx.onnx",
+                        "inputs": [
+                            "_model_layers_23_Add_1_Add_output_0",
+                            "past_key_24_in",
+                            "past_key_29_in",
+                            "past_value_29_in",
+                            "past_value_24_in",
+                            "past_key_30_in",
+                            "past_value_30_in",
+                            "past_key_31_in",
+                            "past_value_31_in",
+                            "past_key_25_in",
+                            "past_value_25_in",
+                            "past_key_26_in",
+                            "past_value_26_in",
+                            "past_key_27_in",
+                            "past_value_27_in",
+                            "past_key_28_in",
+                            "past_value_28_in",
+                            "position_ids_cos",
+                            "position_ids_sin",
+                            "attention_mask"
+                        ],
+                        "outputs": [
+                            "past_value_24_out",
+                            "past_key_24_out",
+                            "past_value_25_out",
+                            "past_key_25_out",
+                            "past_value_26_out",
+                            "past_key_26_out",
+                            "past_value_27_out",
+                            "past_key_27_out",
+                            "past_value_28_out",
+                            "past_key_28_out",
+                            "past_value_29_out",
+                            "past_key_29_out",
+                            "past_value_30_out",
+                            "past_key_30_out",
+                            "past_value_31_out",
+                            "past_key_31_out",
+                            "logits"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.tg4",
+                            "provider_options": [
+                                {
+                                    "qnn": {
+                                        "backend_path": "QnnHtp.dll",
+                                        "htp_performance_mode": "burst",
+                                        "enable_htp_shared_memory_allocator": "1",
+                                        "qnn_context_priority": "high"
+                                    }
+                                }
+                            ]
+                        },
+                        "run_on_prompt": false
+                    },
+                    "dequantizer": {
+                        "filename": "dequantizer.onnx",
+                        "inputs": [
+                            "logits"
+                        ],
+                        "outputs": [
+                            "logits_dequantized"
+                        ],
+                        "session_options": {
+                            "log_id": "onnxruntime-genai.dequantizer",
+                            "provider_options": [
+                                {}
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "eos_token_id": [
+            32007,
+            32001,
+            32000,
+            2
+        ],
+        "pad_token_id": 32000,
+        "type": "decoder-pipeline",
+        "vocab_size": 32064
+    },
+    "search": {
+        "diversity_penalty": 0.0,
+        "do_sample": false,
+        "early_stopping": true,
+        "length_penalty": 1.0,
+        "max_length": 131072,
+        "min_length": 0,
+        "no_repeat_ngram_size": 0,
+        "num_beams": 1,
+        "num_return_sequences": 1,
+        "past_present_share_buffer": true,
+        "repetition_penalty": 1.0,
+        "temperature": 1.0,
+        "top_k": 1,
+        "top_p": 1.0
+    }
+}

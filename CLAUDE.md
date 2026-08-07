@@ -14,6 +14,10 @@ Before starting non-trivial work here, read
 [`docs/WALKTHROUGH.md`](docs/WALKTHROUGH.md) — it has the build history, a
 worked trace of a routed query, and the prioritized next steps with their
 dependencies. Picking up an item from that list is usually the right default.
+If the item you're picking up touches the fast-brain seam (`routing/brains.py`
+or `signals/difficulty.py`), read the Branch state section below first — one
+tier's seam is already closed, and there's unmerged, in-progress work on the
+other.
 
 ---
 
@@ -42,6 +46,46 @@ is a GitHub ZIP download with no `.git`). Consequences:
 - Commit messages carry **no AI-assistant attribution** (no `Co-Authored-By:`
   naming a model or vendor, no "Generated with …" footer). This is the
   workspace policy from `QUAD-Client-main/CLAUDE.md` and it applies here.
+
+---
+
+## Branch state — one seam closed, two more efforts in flight
+
+This sample has grown beyond `main`'s original architecture, across several
+branches, faster than the docs. Know which branch you're on before assuming
+what exists:
+
+| Branch | Adds | Status |
+|---|---|---|
+| `main` | Everything in the base architecture, **plus the AI-PC-tier `NpuFastBrain`** (merged via PR #1, `ca97bdd`) | Merged, stable |
+| `local_brain` (this branch, if you're reading this on it) | `main`, merged in — so it has `NpuFastBrain` too — **plus** `src/phone_brain/`, a real Mobile-tier fast brain (Genie/QNN on a Galaxy S25), built by Nikhita | `NpuFastBrain`: done. `phone_brain`: **not wired into `routing/brains.py`** |
+| `p4-eval-demo` (`origin` only — not checked out here) | `evaluation/` — a benchmark/scenario harness, built by THRISHA | In progress; not reviewed against this branch |
+
+**The AI-PC tier's fast-brain seam is closed for real.** `NpuFastBrain`
+(`routing/brains.py`) runs Qualcomm's pre-built Phi-3.5-mini-instruct
+Genie/QNN artifact in-process via `ctypes`, confirmed executing on this
+machine's Hexagon NPU, wired into `TwoBrainRouter` for the `pc_3b` tier
+behind `TWO_BRAIN_NPU_BRAIN=1` (`router.py::_build_fast_brain` — unset by
+default so the base package stays stdlib-only). `data/profile_workload/
+pc_3b.json` and `data/orchestrate_workload/pc_3b.json` are now real
+captures. Full build history, real bugs found and fixed, and every receipt:
+[`superpowers/deploy-local-brain-npu.md`](superpowers/deploy-local-brain-npu.md)
+(the finished version) and [`docs/npu-deployment.md`](docs/npu-deployment.md)
+(short architecture summary). See also [next step #3](docs/WALKTHROUGH.md#next-steps).
+
+**The Mobile tier's fast-brain seam is still open**, and `src/phone_brain/`
+is real, substantial progress toward it — but it is a standalone package,
+not yet absorbed. Read **[`docs/PHONE_BRAIN.md`](docs/PHONE_BRAIN.md)** before
+touching it — it audits what was actually built there against the code (not
+just the docs it shipped with), and lists five concrete things to reconcile
+before it can be merged: privacy ordering (self-reported confidence currently
+sends the **raw, unmasked** prompt to the phone — a direct violation of
+invariant #1 below if wired in as-is), a duplicated escalation threshold, a
+structural change to `route()` (answer and confidence arrive in one call, so
+escalating means discarding a paid-for answer), a model/fixture mismatch with
+`data/profile_workload/mobile_1b.json`, and a pytest-collection footgun in
+`test_phone_brain.py`'s filename. **Do not wire `phone_brain` into
+`TwoBrainRouter` without reading that list first.**
 
 ---
 
@@ -79,13 +123,35 @@ a piece that is currently mocked:
 |---|---|---|
 | `privacy/guard.py` | `quad.privacy` (gap G8) becomes available here | `mask` / `rehydrate` / invariant |
 | `signals/difficulty.py` | a fast-brain artifact can emit real logprobs | `score(query) -> float` in `[0, 1]` |
-| `routing/brains.py` | `convert_model` produces a real artifact | the `Brain` protocol → `BrainResponse` |
+| `routing/brains.py` | a tier gets a real artifact | the `Brain` protocol → `BrainResponse` |
 
 When swapping a mock for the real thing, **change only that module** — if the
 swap forces edits in `router.py`, the seam was drawn in the wrong place.
+`routing/brains.py`'s AI-PC filler (`NpuFastBrain`) is the worked example: it
+needed a two-line addition to `router.py` (`_build_fast_brain`'s env-gated
+tier switch), nothing in `policy.py` or `signals/`.
 
 `routing/policy.py` is pure (no I/O, no brain calls) on purpose, so escalation
 rules can be unit-tested directly. Keep it that way.
+
+**One of the remaining seams already has a real, unmerged candidate
+filler** — see Branch state above before starting from scratch:
+
+- `routing/brains.py` (Mobile tier) — `src/phone_brain/` (this branch)
+  built a working Genie/QNN on-device server speaking an OpenAI-shaped HTTP
+  contract for a Llama-3.2-3B-Instruct fast brain. Absorb it as another class
+  in the existing flat `brains.py` (an `OpenAIHttpBrain`, generic over any
+  OpenAI-shaped endpoint) — following the precedent `NpuFastBrain` already
+  set, not as a new `routing/brains/` subpackage; see `docs/PHONE_BRAIN.md`
+  for the corrected layout — after resolving its five reconciliation points,
+  not as-is. (Contrast with `NpuFastBrain`, which deliberately avoided an
+  HTTP hop for the AI-PC tier — see `docs/npu-deployment.md` for why; the
+  phone case is different because the model has to run on a physically
+  separate device.)
+- `signals/difficulty.py` — `src/phone_brain/confidence_estimator.py` is a
+  candidate real signal (self-reported / self-consistency / hybrid), but it
+  returns *confidence*, not this seam's *difficulty*. Invert it
+  (`score = 1 - confidence`) rather than importing it directly.
 
 ---
 
@@ -155,3 +221,12 @@ Gaps 3/3b are not fixable from this client. Do not spend a session retrying
 `convert_model` variations — attempts 1–5 are already logged in
 `data/convert_model/_real_attempts_log.md` with the exact failure mode of each.
 If you have a reason to believe the environment changed, verify that first.
+
+**Bypass, not a fix, for 3/3b's AI PC tier — done.**
+`superpowers/deploy-local-brain-npu.md` routed around `convert_model`
+entirely via Qualcomm AI Hub's pre-built artifact — a different toolchain,
+not a retry — and got a real model (`NpuFastBrain`) executing on this
+machine's NPU, wired into the router. It doesn't close gap 3/3b (QUAD's own
+compiler is still broken, and the Mobile tier still needs it or an
+equivalent bypass); it just means the AI-PC fast-brain seam no longer has to
+wait on that fix. See Branch state above.

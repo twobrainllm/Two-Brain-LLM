@@ -29,6 +29,9 @@ class PIIGuard:
 
     def __init__(self) -> None:
         self._counters: dict[str, int] = {}
+        #: value -> placeholder, so the same entity masks identically across
+        #: every call on this guard and the vaults can be merged safely.
+        self._seen: dict[str, str] = {}
 
     def detect(self, text: str) -> list[tuple[str, str]]:
         """Return [(entity_type, matched_value), ...] in match order."""
@@ -42,21 +45,30 @@ class PIIGuard:
     def mask(self, text: str) -> MaskResult:
         """Replace every detected entity with a `[PII_<TYPE>_<n>]` placeholder.
 
-        The placeholder is generated fresh per call (self._counters resets via a
-        new PIIGuard per request in the router) so it never collides with text
-        already in the prompt.
+        Numbering continues across calls on the same guard (`self._counters`),
+        and the router creates one guard per request. This matters: a request
+        masks the query, then separately masks the context and -- for an
+        image-bearing query -- the locally generated description. With
+        per-call numbering, two different emails in two different calls would
+        both become `[PII_EMAIL_1]`, and merging their vaults would silently
+        drop one and rehydrate the *wrong* value into the user's answer.
+
+        The same value seen twice within one request maps to the same
+        placeholder, which is what makes the vaults safe to merge.
         """
         vault: dict[str, str] = {}
-        counters: dict[str, int] = {}
         masked = text
         # Replace longest matches first so a credit-card-shaped substring inside
         # a longer match doesn't get double-masked.
         entities = sorted(set(self.detect(text)), key=lambda e: -len(e[1]))
         for entity_type, value in entities:
-            counters[entity_type] = counters.get(entity_type, 0) + 1
-            placeholder = f"[PII_{entity_type}_{counters[entity_type]}]"
-            vault[placeholder] = value
-            masked = masked.replace(value, placeholder)
+            existing = self._seen.get(value)
+            if existing is None:
+                self._counters[entity_type] = self._counters.get(entity_type, 0) + 1
+                existing = f"[PII_{entity_type}_{self._counters[entity_type]}]"
+                self._seen[value] = existing
+            vault[existing] = value
+            masked = masked.replace(value, existing)
         return MaskResult(masked_text=masked, vault=vault)
 
     def rehydrate(self, text: str, vault: dict[str, str]) -> str:
