@@ -828,3 +828,8 @@ button, input, textarea {
 }
 .backend-status.live .dot { background: #2E9E5B; }
 .backend-status.mock .dot { background: #C08A00; }
+
+/* `hidden` must actually hide: the class above sets display:flex, which beats
+   the UA stylesheet's [hidden] { display: none } on specificity, so an empty
+   preview rendered with a broken thumbnail until this was added. */
+.attachment-preview[hidden] { display: none; }

@@ -25,8 +25,8 @@
     <nav class="chat-list" id="chat-list" aria-label="Chat history"></nav>
 
     <div class="sidebar-footer">
-      <div class="brain-toggle" title="Mock control — see ui/README.md. Not wired to TwoBrainRouter yet.">
-        <span class="brain-toggle-label">Simulated brain</span>
+      <div class="brain-toggle" id="brain-toggle-wrap" title="Which brain answers. Authoritative only when the server runs with UI_TEST=1.">
+        <span class="brain-toggle-label" id="brain-toggle-label">Answering brain</span>
         <div class="segmented" id="brain-toggle" role="radiogroup" aria-label="Simulated brain tier">
           <button class="segment active" data-tier="local" role="radio" aria-checked="true" type="button">Local</button>
           <button class="segment" data-tier="cloud" role="radio" aria-checked="false" type="button">Cloud</button>
@@ -141,7 +141,7 @@
           </svg>
         </div>
         <h1>How can I help you today?</h1>
-        <p class="empty-state-hint">Replies are simulated right now — use the brain toggle in the sidebar to preview the local/cloud color switch.</p>
+        <p class="empty-state-hint" id="empty-state-hint">Connecting to the router…</p>
       </div>
       <div class="messages" id="messages"></div>
     </section>

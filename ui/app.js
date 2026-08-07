@@ -465,10 +465,15 @@ function renderBackendStatus() {
     el.className = "backend-status";
     document.querySelector(".sidebar-footer")?.prepend(el);
   }
+  const hint = document.getElementById("empty-state-hint");
+  const toggleLabel = document.getElementById("brain-toggle-label");
   const b = state.backend;
   if (!b) {
     el.className = "backend-status mock";
     el.innerHTML = '<span class="dot"></span>Mock mode — no backend. Run <code>ui/server.py</code>.';
+    if (hint) hint.textContent =
+      "Replies are simulated — no backend is running. Start ui/server.py for real answers.";
+    if (toggleLabel) toggleLabel.textContent = "Simulated brain";
     els.attachBtn.disabled = true;
     els.attachBtn.title = "Attaching needs the backend (ui/server.py)";
     return;
@@ -478,6 +483,12 @@ function renderBackendStatus() {
   if (!b.vision) bits.push("no vision");
   if (!b.ui_test) bits.push("UI_TEST off — policy decides, switch is a preference");
   el.innerHTML = `<span class="dot"></span>Live — ${bits.join(" · ")}`;
+  if (hint) {
+    hint.textContent = b.ui_test
+      ? `Answers are real. The ${b.vision ? "local VLM" : "local brain"} and the cloud deep brain are both live — pick one in the sidebar.`
+      : "Answers are real. The router decides which brain replies; the sidebar switch is only a preference (UI_TEST is off).";
+  }
+  if (toggleLabel) toggleLabel.textContent = b.ui_test ? "Answering brain" : "Preferred brain (policy decides)";
   els.attachBtn.disabled = !b.vision;
   els.attachBtn.title = b.vision
     ? "Attach an image (stays on-device)"
