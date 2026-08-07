@@ -107,6 +107,7 @@ const EXPORTS = [
   "finalizeAssistantRow",
   "renderCloudPending",
   "cloudPendingHtml",
+  "keepStreamedLocal",
   "setRowTier",
   "renderCrossing",
   "renderMessageEl",
@@ -127,15 +128,24 @@ const load = new Function(
   `${source}\n;return { ${EXPORTS.join(", ")} };`
 );
 
-const app = load(
-  makeDocument(),
-  { addEventListener() {} },
-  { getItem: () => null, setItem: () => {} },
-  { search: "" },
-  (...args) => fetchImpl(...args),
-  { now: () => 0 },
-  { warn() {}, log() {}, error() {} }
-);
+/** Load app.js against a specific page `location`.
+ *
+ * API_BASE_URL is computed once at load time from `location`, so testing how
+ * it is derived means loading the module again per case rather than poking at
+ * a value that is already fixed. */
+function loadWith(location) {
+  return load(
+    makeDocument(),
+    { addEventListener() {} },
+    { getItem: () => null, setItem: () => {} },
+    location,
+    (...args) => fetchImpl(...args),
+    { now: () => 0 },
+    { warn() {}, log() {}, error() {} }
+  );
+}
+
+const app = loadWith({ search: "" });
 
 // --------------------------------------------------------------------------
 // Tiny assertion harness.
@@ -640,6 +650,78 @@ await test("crossing: starts collapsed", () => {
   assert(el, "no disclosure element");
   // `<details>` is closed unless the `open` attribute is set; never set here.
   assert(!el.allText.includes(" open"), "the disclosure should start collapsed");
+});
+
+// --------------------------------------------------------------------------
+// API_BASE_URL derivation
+//
+// Regression cover for a real outage: deriving the API host from the page so
+// a phone on the LAN could reach it also handed `localhost` back on the
+// ordinary desktop setup. `localhost` resolves to `::1` first on the dev host
+// while api.py's ThreadingHTTPServer binds IPv4 only, so every request paid a
+// dead IPv6 connection first -- which on the SSE endpoint reads as "streaming
+// stopped working" rather than as latency.
+// --------------------------------------------------------------------------
+
+await test("api url: a ?api= override wins, trailing slash trimmed", () => {
+  const a = loadWith({ search: "?api=http://10.0.0.4:9999/", protocol: "http:", hostname: "localhost" });
+  assertEqual(a.API_BASE_URL, "http://10.0.0.4:9999");
+});
+
+await test("api url: file:// has no host to borrow, so loopback", () => {
+  assertEqual(loadWith({ search: "", protocol: "file:", hostname: "" }).API_BASE_URL,
+    "http://127.0.0.1:8765");
+});
+
+await test("api url: localhost is pinned to 127.0.0.1, not echoed back", () => {
+  // The regression itself: `http://localhost:8765` here is the bug.
+  assertEqual(loadWith({ search: "", protocol: "http:", hostname: "localhost" }).API_BASE_URL,
+    "http://127.0.0.1:8765");
+});
+
+await test("api url: 127.0.0.1 stays 127.0.0.1", () => {
+  assertEqual(loadWith({ search: "", protocol: "http:", hostname: "127.0.0.1" }).API_BASE_URL,
+    "http://127.0.0.1:8765");
+});
+
+await test("api url: https means serve_https.py's proxy, so same-origin", () => {
+  // Must beat the loopback rule: serve_https.py is normally opened on
+  // localhost too, and an https page may not fetch http://127.0.0.1:8765.
+  assertEqual(loadWith({ search: "", protocol: "https:", hostname: "localhost" }).API_BASE_URL, "");
+  assertEqual(loadWith({ search: "", protocol: "https:", hostname: "192.168.1.5" }).API_BASE_URL, "");
+});
+
+await test("api url: a LAN host is borrowed -- 127.0.0.1 would mean the phone", () => {
+  assertEqual(loadWith({ search: "", protocol: "http:", hostname: "192.168.1.5" }).API_BASE_URL,
+    "http://192.168.1.5:8765");
+});
+
+// --------------------------------------------------------------------------
+// keepStreamedLocal
+// --------------------------------------------------------------------------
+
+await test("split: a cloud answer after a restart keeps the local half", () => {
+  // route_stream re-routes the whole query when the fast brain wants help but
+  // named no gap. The local text already streamed and is not inside `answer`,
+  // so dropping it erased an answer the user had just watched arrive.
+  assert(app.keepStreamedLocal("cloud", true, "the local half"),
+    "the streamed local answer must survive the final re-render");
+});
+
+await test("split: a local answer is not duplicated", () => {
+  assert(!app.keepStreamedLocal("local", true, "the local half"),
+    "on a local decision `answer` IS this text -- keeping both shows it twice");
+});
+
+await test("split: an offline fallback keeps whatever streamed first", () => {
+  assert(app.keepStreamedLocal("local", false, "the local half"),
+    "the request failed after the local half arrived; it should not be replaced");
+});
+
+await test("split: nothing streamed means nothing to keep", () => {
+  for (const empty of ["", undefined, null]) {
+    assert(!app.keepStreamedLocal("cloud", true, empty), `empty local text kept: ${empty}`);
+  }
 });
 
 // --------------------------------------------------------------------------

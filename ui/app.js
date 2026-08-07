@@ -44,6 +44,10 @@ const HISTORY_MAX_CHARS_TOTAL = 1200;
  * loopback address `api.py` binds by default, so the common case needs no
  * query string at all.
  */
+/** Hostnames that mean "this machine", and so must not be echoed back verbatim
+ *  -- see the loopback branch below for why that matters. */
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
 const API_BASE_URL = (() => {
   const override = new URLSearchParams(location.search).get("api");
   if (override) return override.replace(/\/$/, "");
@@ -56,8 +60,19 @@ const API_BASE_URL = (() => {
   // Served over HTTPS means ui/serve_https.py, which proxies the API on its
   // own origin. Use that origin: an HTTPS page may not fetch an http:// URL
   // at all (mixed content), so naming :8765 directly would be blocked by the
-  // browser no matter which host it pointed at.
+  // browser no matter which host it pointed at. Checked before the loopback
+  // case below, because serve_https.py is normally reached on localhost too.
   if (protocol === "https:") return "";
+
+  // Same machine, over plain HTTP -- the ordinary `python -m http.server`
+  // setup. **Pin 127.0.0.1 rather than echoing the hostname back.** Borrowing
+  // it hands back `localhost`, which on this host resolves to `::1` first
+  // (verified with getaddrinfo) while `ThreadingHTTPServer` binds IPv4 only.
+  // Every request then pays a failed IPv6 connection before falling back --
+  // the same ~2s-per-call trap the rest of this project documents, except
+  // here it lands on the SSE stream, where a stalled connection reads as
+  // "streaming stopped working" rather than as latency.
+  if (LOOPBACK_HOSTNAMES.has(hostname)) return "http://127.0.0.1:8765";
 
   // Plain HTTP from another device -- a phone on the LAN. 127.0.0.1 would
   // mean *the phone*, which is not running the router, so borrow the host
@@ -636,6 +651,32 @@ function renderCloudPending(row, gap) {
   pending.className = "cloud-pending";
   pending.innerHTML = cloudPendingHtml(gap);
   replaceBubbleBody(row, [pending]);
+}
+
+/**
+ * Should the local half that already streamed be persisted as its own message?
+ *
+ * The turn ends with `renderMessages`, which rebuilds the transcript from
+ * `chat.messages` -- so anything not pushed here vanishes from the screen the
+ * instant the answer lands, however long the user spent watching it arrive.
+ *
+ * Keep it whenever the final answer is **not** it:
+ *
+ * - `live === false` -- the request failed after the local half had streamed,
+ *   so it is kept rather than replaced by an offline-preview blob.
+ * - `tier === "cloud"` -- the stream restarted mid-turn. `route_stream`
+ *   re-routes the whole query when the fast brain wants help but named no gap
+ *   (see its `restarted` meta), so `answer` is the cloud's alone and the local
+ *   text the user watched arrive is nowhere in it. Dropping it there erased an
+ *   answer that was on screen a moment earlier -- the bug this guards.
+ *
+ * Not on `tier === "local"`, where `answer` *is* the streamed text: pushing
+ * both showed the same reply twice. Not on `"hybrid"` either -- that path
+ * pushes both halves explicitly from `local_answer`/`cloud_answer`.
+ */
+function keepStreamedLocal(tier, live, localText) {
+  if (!localText) return false;
+  return live === false || tier === "cloud";
 }
 
 function scrollToBottom() {
@@ -1306,14 +1347,8 @@ async function handleSend(e) {
       crossing: crossing || body_crossed,
     });
   } else {
-    // `live === false` means we fell into the catch: the request failed after
-    // the local half had already streamed and been read, so it is kept rather
-    // than replaced by an offline-preview blob.
-    //
-    // Only on that path. On success `answer` *is* the local text, and pushing
-    // both produced the same reply twice -- once from the stream, once from
-    // the final decision.
-    const streamedLocal = live === false ? bubbles.get("local")?.text : null;
+    const localText = bubbles.get("local")?.text?.trim();
+    const streamedLocal = keepStreamedLocal(tier, live, localText) ? localText : null;
     if (streamedLocal) {
       chat.messages.push({ role: "assistant", content: streamedLocal, tier: "local", live: true, timestamp: at });
     }
