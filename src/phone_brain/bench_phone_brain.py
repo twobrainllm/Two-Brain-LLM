@@ -8,7 +8,7 @@ locally on the phone via an OpenAI-compatible endpoint (e.g. GenieX's
 
 Typical setup before running this:
 
-    adb reverse tcp:8000 tcp:8000
+    adb forward tcp:8000 tcp:8000
     # on-device (adb shell, or however GenieX exposes it):
     geniex serve --bundle /data/local/tmp/genie_bundle_l --port 8000
 

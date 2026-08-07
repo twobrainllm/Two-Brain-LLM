@@ -78,7 +78,7 @@ adb push genie_bundle_l_phone /data/local/tmp/genie_bundle_l
 
 # Install GenieX (or the raw Genie/QAIRT runtime) on-device, then serve
 # an OpenAI-compatible endpoint, e.g.:
-adb reverse tcp:8000 tcp:8000
+adb forward tcp:8000 tcp:8000
 adb shell geniex serve --bundle /data/local/tmp/genie_bundle_l --port 8000
 ```
 

@@ -146,8 +146,10 @@ def step_device(adb_path: str) -> str | None:
 def step_forward(adb_path: str, serial: str, port: int) -> bool:
     """adb forward, not adb reverse. `forward` opens a port on the HOST that
     tunnels to the device -- the server is on the phone and the caller is here.
-    (L_INTERFACE_CONTRACT.md says `reverse`, which is backwards; see
-    docs/phone-wiring.md.)"""
+    `reverse` is the opposite (a port on the device tunnelling to the host) and
+    is what every doc in this repo used to say; they were corrected against
+    real hardware. See `src/phone_brain/L_INTERFACE_CONTRACT.md` for why the
+    mock server hides the difference."""
     code, out = adb(adb_path, "-s", serial, "forward", f"tcp:{port}", f"tcp:{port}")
     if code != 0:
         report(FAIL, f"adb forward tcp:{port}", out)

@@ -96,13 +96,21 @@ adb shell ls -la /data/local/tmp/genie_bundle_l
 ## Part 6 — Start serving, on-device
 
 ```bash
-adb reverse tcp:8000 tcp:8000
+adb forward tcp:8000 tcp:8000
 adb shell geniex serve --bundle /data/local/tmp/genie_bundle_l --port 8000
 ```
 
-Leave this running. `adb reverse` is what lets your dev machine reach
+Leave this running. `adb forward` is what lets your dev machine reach
 `localhost:8000` and transparently have it land on the phone — nothing on
 the calling side needs to know ADB is involved at all.
+
+> **`forward`, not `reverse`.** This guide said `reverse` until the wiring was
+> run against a real S25. `forward` opens the port on the **host** and tunnels
+> it to the device, which is what you need when the server is on the phone and
+> the caller is your dev machine; `reverse` does the opposite. See
+> `L_INTERFACE_CONTRACT.md` for why the mistake was invisible until hardware
+> was attached. `python tools/phone/live_test.py` performs this step for you
+> and reports where it fails.
 
 ## Part 7 — Smoke test from the dev machine
 
@@ -156,7 +164,7 @@ to fix it purely by rewording the prompt.
 
 - **Device not found by ADB** — different cable/port, re-check USB
   debugging authorization, `adb kill-server && adb start-server`.
-- **Port already in use** — `adb reverse --remove tcp:8000` then redo Part 6.
+- **Port already in use** — `adb forward --remove tcp:8000` then redo Part 6.
 - **Hugging Face access still pending** — check email for the gated-repo approval; it isn't instant.
 - **Compile job stuck or slow** — check the AI Hub Workbench dashboard for job status rather than assuming it's hung.
 - **Server crashes or OOMs on the 3B model** — check `adb shell dumpsys meminfo`; consider lowering `CONTEXT_LEN` in `export_phone_brain.sh` and re-exporting.

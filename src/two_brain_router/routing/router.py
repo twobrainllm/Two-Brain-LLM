@@ -20,7 +20,7 @@ measurably costing answer quality: a model asked to draft a reply to
 So the boundary is where the mask goes, and `Brain.trusted_with_raw_pii` is
 what marks which side of it a brain sits on. Everything outside -- both cloud
 brains, and `PhoneFastBrain`, which runs on a physically separate device even
-though `adb reverse` makes the hop look like loopback -- still receives masked
+though `adb forward` makes the hop look like loopback -- still receives masked
 text and nothing else. That flag defaults to False wherever it is read, so a
 brain that forgets to declare it gets masked input rather than a leak.
 
@@ -93,7 +93,7 @@ _CLOUD_BRAIN_ENV_VAR = "TWO_BRAIN_CLOUD_BRAIN"
 #: Opt-in switch for the real phone fast brain (mobile tier), plus where to
 #: reach it. Same rationale as the NPU switch: unset by default so nothing in
 #: the base suite depends on a served endpoint being up. The URL defaults to
-#: the `adb reverse` loopback address from L_INTERFACE_CONTRACT.md.
+#: the `adb forward` loopback address from L_INTERFACE_CONTRACT.md.
 _PHONE_BRAIN_ENV_VAR = "TWO_BRAIN_PHONE_BRAIN"
 _PHONE_URL_ENV_VAR = "TWO_BRAIN_PHONE_URL"
 _PHONE_MODEL_ENV_VAR = "TWO_BRAIN_PHONE_MODEL"

@@ -181,7 +181,7 @@ must preserve all four:
    user typed it**, because nothing they are given is transmitted and masking
    them would cost answer quality while protecting nothing. Everything else —
    both cloud brains, and `PhoneFastBrain`, which runs on a physically separate
-   device even though `adb reverse` makes the hop look like loopback — receives
+   device even though `adb forward` makes the hop look like loopback — receives
    masked text only.
 
    > **This inverted in the Shape C work.** It previously read "mask first…

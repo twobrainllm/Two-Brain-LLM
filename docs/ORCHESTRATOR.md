@@ -55,7 +55,7 @@ contains.**
 | `NpuFastBrain` | **Yes** | in-process, `ctypes` → `Genie.dll`, this machine's NPU |
 | `GpuLocalBrain` | **Yes** | a `llama-server` child process this class started, bound to `127.0.0.1` |
 | `LocalFastBrain` (stub) | **Yes** | in-process; a stub that got different input from the real thing would make the default path a bad rehearsal |
-| `PhoneFastBrain` | **No** | a physically separate device. `adb reverse` makes the hop *look* like loopback, which is exactly why this is declared and not inferred from the URL |
+| `PhoneFastBrain` | **No** | a physically separate device. `adb forward` makes the hop *look* like loopback, which is exactly why this is declared and not inferred from the URL |
 | `CloudDeepBrain` / `CirrascaleDeepBrain` | **No** | the boundary itself |
 
 Trusted brains get the query **exactly as the user typed it**. Everything else
@@ -702,7 +702,7 @@ piece (which brain answers this tier) — see "Where code goes" in
 |---|---|---|---|---|---|
 | AI PC (`pc_3b`) | `NpuFastBrain` — Phi-3.5-mini-instruct on Hexagon NPU | **C** | Cloud, and only for the named gap (no escalation brain on this tier) | in-process `ctypes`/Genie | self-report **+ named gap** |
 | AI PC (`pc_3b`) | `GpuLocalBrain` — GGUF on the Adreno GPU, wins if both are set | **C** | as above | `llama-server` on loopback | self-report **+ named gap** |
-| Mobile (`mobile_1b`) | `PhoneFastBrain` — Llama-3.2-3B on a Galaxy S25 | **B** | **The AI PC's brain** (if `TWO_BRAIN_GPU_BRAIN`/`NPU_BRAIN=1`), else cloud | HTTP to loopback (`adb reverse`) | model's own self-report |
+| Mobile (`mobile_1b`) | `PhoneFastBrain` — Llama-3.2-3B on a Galaxy S25 | **B** | **The AI PC's brain** (if `TWO_BRAIN_GPU_BRAIN`/`NPU_BRAIN=1`), else cloud | HTTP to loopback (`adb forward`) | model's own self-report |
 | Cloud | `CloudDeepBrain` (stub) / `CirrascaleDeepBrain` (real) | — | — | — | n/a — escalation target |
 
 ### Confidence is weak on this tier; the gap field is not
@@ -846,7 +846,7 @@ $env:TWO_BRAIN_NPU_BRAIN=1
 ```
 
 Against the real device, the only change is that the server is the phone
-(`adb reverse tcp:8000 tcp:8000` first) — which is the property
+(`adb forward tcp:8000 tcp:8000` first) — which is the property
 `L_INTERFACE_CONTRACT.md` exists to guarantee.
 
 | Env var | Default | Meaning |

@@ -1477,7 +1477,7 @@ class GpuLocalBrain:
 
 
 #: Hosts that mean "this device". The phone is reached over
-#: `adb reverse tcp:8000 tcp:8000`, which is precisely what makes it appear on
+#: `adb forward tcp:8000 tcp:8000`, which is precisely what makes it appear on
 #: loopback -- so loopback is the honest test for "the masked query is not
 #: traversing a network", not a proxy for it.
 _ON_DEVICE_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -1525,13 +1525,13 @@ class PhoneFastBrain:
     #: **Outside the boundary, unlike the AI-PC brains.** The AI PC's models run
     #: on this machine and are handed the raw query; this one runs on a
     #: physically separate device reached over HTTP, so it keeps receiving
-    #: masked text only. `adb reverse` makes that hop *look* like loopback,
+    #: masked text only. `adb forward` makes that hop *look* like loopback,
     #: which is exactly why this is declared rather than inferred from the URL:
     #: the packets really do leave the host. `_assert_on_device` guards the
     #: same distinction from the other direction.
     trusted_with_raw_pii = False
 
-    #: `adb reverse tcp:8000 tcp:8000` puts the phone here (L contract).
+    #: `adb forward tcp:8000 tcp:8000` puts the phone here (L contract).
     #:
     #: `127.0.0.1`, not `localhost`, and this is measured rather than
     #: stylistic: on this Windows host `localhost` resolves to `::1` first,
@@ -1637,7 +1637,7 @@ class PhoneFastBrain:
             return
         raise RemoteBrainRefused(
             f"refusing to send queries to non-on-device host {host!r}: the mobile "
-            f"fast brain is reached over loopback (adb reverse). Pass "
+            f"fast brain is reached over loopback (adb forward). Pass "
             f"allow_remote=True (or set TWO_BRAIN_PHONE_ALLOW_REMOTE=1) if the "
             f"model really is meant to run off-device."
         )

@@ -416,7 +416,7 @@ def test_an_off_device_brain_is_still_given_masked_text():
     """`trusted_with_raw_pii` is per-brain, not per-tier.
 
     `PhoneFastBrain` is the real case: it runs on a physically separate device,
-    and `adb reverse` makes that hop *look* like loopback, so the distinction
+    and `adb forward` makes that hop *look* like loopback, so the distinction
     has to be declared rather than inferred. A brain that simply forgets to
     declare the flag lands here too, which is the safe direction.
     """

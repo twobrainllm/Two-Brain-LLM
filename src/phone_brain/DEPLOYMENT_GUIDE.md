@@ -91,7 +91,7 @@ trying to hand you an orchestrator, just the piece it depends on.
 
 Nothing in your code should change — only the `--base-url` / base URL you
 point at. When the real S25 is ready, it'll be reachable the same way
-(`http://localhost:8000/...` via `adb reverse tcp:8000 tcp:8000`, or the
+(`http://localhost:8000/...` via `adb forward tcp:8000 tcp:8000`, or the
 phone's IP directly). If making that switch requires changing your code,
 the contract has drifted — flag it so `L_INTERFACE_CONTRACT.md` gets fixed
 rather than working around it in O.

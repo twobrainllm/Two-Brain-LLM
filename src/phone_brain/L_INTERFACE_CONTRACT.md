@@ -12,8 +12,26 @@ POST http://<host>:8000/v1/chat/completions
 Content-Type: application/json
 ```
 
-- Real device: `<host>` is the S25's IP (or `localhost` via `adb reverse tcp:8000 tcp:8000`).
+- Real device: `<host>` is the S25's IP (or `localhost` via `adb forward tcp:8000 tcp:8000`).
 - Local dev: `<host>` is `localhost`, backed by `mock_phone_brain_server.py`.
+
+> **`forward`, not `reverse` — and this document said `reverse` until it was
+> run against real hardware.** The two are opposites, and only one of them
+> works here:
+>
+> - `adb forward tcp:8000 tcp:8000` opens port 8000 **on the host** and tunnels
+>   it to the device. The server is on the phone and the caller (`O`, the
+>   router) is on the dev machine, so this is the one you want.
+> - `adb reverse tcp:8000 tcp:8000` opens port 8000 **on the device** and
+>   tunnels it to the host. That is for an app on the phone calling a server on
+>   your machine — the opposite of this contract.
+>
+> The error survived a long time because it is invisible against
+> `mock_phone_brain_server.py`: the mock listens on the dev machine's own
+> loopback, so `http://localhost:8000` works whether or not any adb tunnel
+> exists, and works even if the wrong one was set up. It only fails with a
+> phone actually attached. `tools/phone/live_test.py` runs the correct command
+> and is the executable statement of this.
 
 ## Request
 
