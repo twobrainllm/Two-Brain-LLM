@@ -784,11 +784,14 @@ async function handleSend(e) {
   // second and then left the avatar idle for the rest of a generation that can
   // take minutes -- fine for the old mock reply with its fake delay, wrong the
   // moment a real backend arrived. `thinking` stays true until the first token.
-  const thinking = { active: true };
+  // `avatar` is re-pointed when a new bubble opens, so on a hybrid answer the
+  // looks follow the brain that is currently speaking rather than staying on
+  // the first one.
+  const thinking = { active: true, avatar: thinkingAvatar };
   (async () => {
     const order = shuffled(LOOK_EXPRESSIONS); // flat / shrunk / expanded, mixed
     for (let i = 0; thinking.active; i++) {
-      playExpression(thinkingAvatar, order[i % order.length], THINK_RHYTHM_MS);
+      playExpression(thinking.avatar, order[i % order.length], THINK_RHYTHM_MS);
       await sleep(THINK_RHYTHM_MS);
     }
   })();
@@ -835,6 +838,8 @@ async function handleSend(e) {
     chat.messages.push(b.message);
     streamingMessages.push(b.message);
     bubbles.set(bubbleTier, b);
+    // Follow the brain that is now speaking.
+    if (thinking) thinking.avatar = b.avatar;
     return b;
   };
 
@@ -853,11 +858,12 @@ async function handleSend(e) {
         tier,
         attachment?.dataUrl,
         ({ text, tier: deltaTier }) => {
-          // First token: the model is answering, so stop looking around.
-          if (thinking.active) {
-            thinking.active = false;
-            thinkingAvatar?.classList.remove("thinking");
-          }
+          // The first token ends the *idle pulse* -- there is content now -- but
+          // not the looking around. Generation is the long part: a local reply
+          // runs for minutes after its first token, and stopping here would
+          // leave the avatar frozen for almost all of it. The loop runs until
+          // the answer is finished.
+          thinkingAvatar?.classList.remove("thinking");
           const b = bubbleFor(deltaTier);
           b.message.content += text;
           if (b.textEl) {
