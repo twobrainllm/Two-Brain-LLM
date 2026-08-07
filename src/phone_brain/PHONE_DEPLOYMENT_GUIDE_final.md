@@ -179,19 +179,27 @@ backend. **This path never touches Qualcomm AI Hub, torch, or the gated HF
 weights download for compilation** — only the GGUF (a public quant) is
 needed at deploy time.
 
-### What's already built
+### What's already built — use these directly, don't rebuild
 
-Cross-compiled for Android arm64-v8a with `GGML_OPENCL=ON`, targeting the
-S25 Ultra's Adreno 830. Artifacts live in
-**`.llama-cpp-opencl-android/`** at the repo root (gitignored, same as the
-existing `.llama-cpp-opencl/` for the AI-PC tier — rebuild from source if
-missing, don't expect it to be vendored):
+Already cross-compiled for Android arm64-v8a with `GGML_OPENCL=ON`,
+targeting the S25 Ultra's Adreno 830, and sitting on disk on this same
+machine **right now** — if you're tunneled into this box, skip straight to
+"Deploying to the phone" below with these exact paths (gitignored, so they
+won't show up via `git pull` — that's expected, read them straight off
+disk):
 
-| File | What it is |
-|---|---|
-| `llama-cli` | Android arm64 CLI binary — `ELF ... interpreter /system/bin/linker64` |
-| `llama-server` | Android arm64 OpenAI-compatible server binary — same interpreter |
-| `libOpenCL.so` | ICD loader stub the phone's real Adreno driver resolves against at runtime |
+| File | Full path | What it is |
+|---|---|---|
+| `llama-server` | `C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\llama-server` | Android arm64 OpenAI-compatible server binary — `ELF ... interpreter /system/bin/linker64` |
+| `llama-cli` | `C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\llama-cli` | Android arm64 CLI binary — same interpreter |
+| `libOpenCL.so` | `C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\libOpenCL.so` | ICD loader stub the phone's real Adreno driver resolves against at runtime |
+
+From WSL (e.g. to `adb push` them — `adb` itself runs from the Windows
+side, see below), the same files are at
+`/mnt/c/Users/qc_de/Two-Brain-LLM/.llama-cpp-opencl-android/`.
+
+Only rebuild from the recipe below if these files are gone or you need a
+different target (different API level, different quant kernel set, etc).
 
 ### The cross-compile problem, and how it was solved
 
@@ -245,8 +253,11 @@ tried and abandoned before landing on the one that works:
 ```bash
 adb devices                         # confirm the S25 Ultra shows as "device"
 
-adb push .llama-cpp-opencl-android/llama-server /data/local/tmp/
-adb push .llama-cpp-opencl-android/libOpenCL.so  /data/local/tmp/
+# adb.exe isn't on PATH on this machine -- full path:
+# C:\Users\qc_de\AppData\Local\Android\Sdk\platform-tools\adb.exe
+
+adb push "C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\llama-server" /data/local/tmp/
+adb push "C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\libOpenCL.so"  /data/local/tmp/
 adb shell chmod +x /data/local/tmp/llama-server
 
 # Pull a Q4_0 GGUF of Llama-3.2-3B-Instruct onto the dev machine first --

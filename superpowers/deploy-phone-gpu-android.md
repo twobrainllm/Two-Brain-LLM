@@ -24,7 +24,7 @@ the hackathon deadline, and both ended up working.
 
 | Track | Status |
 |---|---|
-| **GPU** | **Build complete.** `llama-cli` / `llama-server` / `libOpenCL.so` cross-compiled for Android arm64-v8a with `GGML_OPENCL=ON`, verified as real Android PIE executables. **Not yet deployed** — no phone was connected via `adb` when built. Artifacts in `.llama-cpp-opencl-android/` at repo root (gitignored — see below). |
+| **GPU** | **Build complete.** `llama-cli` / `llama-server` / `libOpenCL.so` cross-compiled for Android arm64-v8a with `GGML_OPENCL=ON`, verified as real Android PIE executables. **Not yet deployed** — no phone was connected via `adb` when built. **Use them as-is, don't rebuild** — they're sitting right now at `C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\{llama-cli,llama-server,libOpenCL.so}` on this machine (gitignored, so `git pull` won't show them — that's expected, read straight off disk; from WSL: `/mnt/c/Users/qc_de/Two-Brain-LLM/.llama-cpp-opencl-android/`). If you're tunneled into this same box, that's all you need — skip to step 3 below. |
 | **NPU** | Export environment fixed and verified (`export.py --help` runs clean, defaults to our exact device). A real compile job was submitted to Qualcomm AI Hub and was still running locally (ONNX/quantization step, ~24GB RAM) when this doc was written — no AI Hub job ID/URL had appeared yet. Check `src/phone_brain/_real_export_attempts_log.md` Attempt 4 and the running job's own output for current state. |
 
 ## GPU track — what to do next
