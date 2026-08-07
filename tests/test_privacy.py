@@ -46,3 +46,34 @@ def test_known_gap_person_names_are_not_masked():
         "EXPECTED FAILURE ONCE FIXED: person names are still unmasked. "
         "If this assertion fails, name masking now works -- invert this test."
     )
+
+
+def test_placeholders_do_not_collide_across_calls_on_one_guard():
+    """Regression: two mask() calls must not reuse the same placeholder.
+
+    The router masks the query, then the context, then -- for an image-bearing
+    query -- the locally generated description, all on one guard. Numbering
+    used to reset per call, so two different emails in two different calls both
+    became [PII_EMAIL_1]. Merging those vaults silently dropped one and
+    rehydrated the WRONG value into the user's answer.
+    """
+    guard = PIIGuard()
+    a = guard.mask("write to alice@example.com")
+    b = guard.mask("now write to bob@example.com")
+
+    assert set(a.vault) != set(b.vault), "distinct values must get distinct placeholders"
+
+    merged = {**a.vault, **b.vault}
+    assert len(merged) == 2, "merging vaults must not lose an entity"
+    assert guard.rehydrate(a.masked_text, merged) == "write to alice@example.com"
+    assert guard.rehydrate(b.masked_text, merged) == "now write to bob@example.com"
+
+
+def test_same_value_masks_identically_across_calls():
+    """The same entity twice in one request should reuse its placeholder."""
+    guard = PIIGuard()
+    first = guard.mask("mail alice@example.com")
+    second = guard.mask("again: alice@example.com")
+
+    assert first.masked_text.split()[-1] == second.masked_text.split()[-1]
+    assert {**first.vault, **second.vault} == first.vault

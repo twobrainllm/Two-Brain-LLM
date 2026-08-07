@@ -44,6 +44,25 @@ class Brain(Protocol):
     def answer(self, masked_query: str, context: str = "") -> BrainResponse: ...
 
 
+class VisionBrain(Brain, Protocol):
+    """A `Brain` that can also see.
+
+    Kept separate from `Brain` on purpose: the cloud deep brain is a text-only
+    LLM and must never be asked for either of these. The router checks for this
+    capability rather than assuming it, so a text-only fast brain stays valid.
+
+    `describe_image` is the load-bearing one. Images cannot cross the device
+    boundary -- the cloud tier has no VLM at all (see
+    data/cloud_ai100/_real_endpoint_log.md) -- so escalating an image-bearing
+    query means converting the image to *words* locally, masking those words
+    like any other text, and sending only that.
+    """
+
+    def answer(self, masked_query: str, context: str = "", image: Path | None = None) -> BrainResponse: ...
+
+    def describe_image(self, image: Path, question: str = "") -> BrainResponse: ...
+
+
 def _estimate_tokens(masked_query: str) -> int:
     """Token count the latency/cost estimates are driven off."""
     return max(len(masked_query.split()) * 2, 16)
@@ -552,6 +571,7 @@ class GpuLocalBrain:
     """
 
     _MAX_NEW_TOKENS = 48
+    _MAX_DESCRIBE_TOKENS = 512
     _N_CTX = 4096
     _STARTUP_TIMEOUT_S = 120.0
 
@@ -720,18 +740,75 @@ class GpuLocalBrain:
         self.close()
         raise GpuBrainError(f"llama-server did not become ready within {self._STARTUP_TIMEOUT_S:.0f}s")
 
-    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+    @property
+    def can_see(self) -> bool:
+        """True when a multimodal projector is loaded, so image input works."""
+        return self._mmproj_path is not None
+
+    def describe_image(self, image: Path, question: str = "") -> BrainResponse:
+        """Turn an image into words, on-device, for a text-only tier to reason over.
+
+        This is how an image-bearing query reaches the cloud at all. The deep
+        brain is a text LLM with no vision support of any kind, so the image
+        stays here and only this description -- after masking by the router --
+        ever crosses the boundary.
+
+        `question` steers what gets described. A physics problem needs the
+        mechanical arrangement, angles and labelled quantities; "what is this?"
+        needs identification. Describing for the question rather than in general
+        is what makes the downstream text-only answer possible.
+        """
+        if not self.can_see:
+            raise GpuBrainError("no multimodal projector loaded -- construct via GpuLocalBrain.for_vision()")
+        if question:
+            prompt = (
+                "Describe this image in precise, complete detail for someone who cannot see it "
+                "and must answer the following question from your description alone. "
+                "State every quantity, label, number, angle, position and spatial relationship "
+                "that could matter. Do not attempt to answer the question yourself.\n\n"
+                f"Question: {question}"
+            )
+        else:
+            prompt = (
+                "Describe this image in precise, complete detail for someone who cannot see it. "
+                "State every quantity, label, number, angle, position and spatial relationship."
+            )
+        return self.answer(prompt, image=image)
+
+    @staticmethod
+    def _image_data_uri(image: Path) -> str:
+        import base64
+        import mimetypes
+
+        mime = mimetypes.guess_type(str(image))[0] or "image/png"
+        return f"data:{mime};base64," + base64.b64encode(image.read_bytes()).decode("ascii")
+
+    def answer(self, masked_query: str, context: str = "", image: Path | None = None) -> BrainResponse:
         import urllib.error
         import urllib.request
+
+        if image is not None and not self.can_see:
+            raise GpuBrainError(
+                "image passed to a text-only brain -- construct via GpuLocalBrain.for_vision()"
+            )
 
         messages = []
         if context:
             messages.append({"role": "system", "content": context})
-        messages.append({"role": "user", "content": masked_query})
+        if image is not None:
+            # OpenAI-shaped content parts; llama-server routes these through mtmd.
+            messages.append({"role": "user", "content": [
+                {"type": "text", "text": masked_query},
+                {"type": "image_url", "image_url": {"url": self._image_data_uri(image)}},
+            ]})
+        else:
+            messages.append({"role": "user", "content": masked_query})
         payload = json.dumps(
             {
                 "messages": messages,
-                "max_tokens": self._MAX_NEW_TOKENS,
+                # A description has to carry the whole image; the 48-token
+                # budget that suits a fast-brain reply would truncate it.
+                "max_tokens": self._MAX_DESCRIBE_TOKENS if image is not None else self._MAX_NEW_TOKENS,
                 "temperature": 0.7,
                 "stream": False,
             }
