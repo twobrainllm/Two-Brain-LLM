@@ -15,8 +15,37 @@
 const STORAGE_KEY = "twoBrainChats";
 const GROUP_ORDER = ["Today", "Yesterday", "Previous 7 Days", "Previous 30 Days", "Older"];
 
-//: `src/two_brain_router/api.py`'s default bind address/port.
-const API_BASE_URL = "http://127.0.0.1:8765";
+/** How much prior conversation is sent back with each query.
+ *
+ * The router is deliberately stateless -- `api.py` shares ONE `TwoBrainRouter`
+ * across every request and every browser tab (the NPU's Genie session is far
+ * too expensive to rebuild per request), so history kept there would leak
+ * between unrelated chats. The client owns it instead, and this is where the
+ * bound lives.
+ *
+ * Bounded on three axes because an unbounded history is expensive in three
+ * ways: the on-device model's prompt grows (it already takes 4-12s per query
+ * and its compiled context length is finite), and on an escalation the history
+ * is masked and sent to the cloud -- so every extra turn is both latency and
+ * privacy surface. `compress_context` truncates to 800 chars server-side
+ * anyway; keeping the client's budget near that avoids shipping text that is
+ * only going to be thrown away.
+ */
+const HISTORY_MAX_MESSAGES = 6; // ~3 turns
+const HISTORY_MAX_CHARS_PER_MESSAGE = 300;
+const HISTORY_MAX_CHARS_TOTAL = 1200;
+
+/** Where `two_brain_router.api` is listening.
+ *
+ * Overridable with `?api=http://host:port` so a second router can be pointed
+ * at without editing this file -- two servers on different ports (comparing
+ * `--tier pc` against `--tier mobile`, or a new build against a running one),
+ * or a LAN demo where the API is on another machine. The default is the
+ * loopback address `api.py` binds by default, so the common case needs no
+ * query string at all.
+ */
+const API_BASE_URL =
+  new URLSearchParams(location.search).get("api") || "http://127.0.0.1:8765";
 
 // data/hardware_detect/{ai_pc,mobile}.json -- real quad-client detect /
 // adb shell captures, matching profiler.js's own DEVICE_CONTEXT convention.
@@ -52,8 +81,27 @@ const els = {
   profilerCostValue: document.getElementById("profiler-cost-value"),
   profilerNotes: document.getElementById("profiler-notes"),
   profilerFooter: document.getElementById("profiler-footer"),
-  backendStatus: document.getElementById("backend-status"),
+  emptyStateHint: document.getElementById("empty-state-hint"),
+  brainToggleLabel: document.getElementById("brain-toggle-label"),
+  attachBtn: document.getElementById("attach-btn"),
+  attachInput: document.getElementById("attach-input"),
+  attachmentPreview: document.getElementById("attachment-preview"),
+  attachmentThumb: document.getElementById("attachment-thumb"),
+  attachmentName: document.getElementById("attachment-name"),
+  attachmentRemove: document.getElementById("attachment-remove"),
+  brainToggleWrap: document.getElementById("brain-toggle-wrap"),
+  expressionPreviewWrap: document.getElementById("expression-preview-wrap"),
+  modelPicker: document.getElementById("model-picker"),
+  modelSelect: document.getElementById("model-select"),
+  modelDetail: document.getElementById("model-detail"),
 };
+
+/** Ceiling on an attached image, matching `api.py`'s `MAX_IMAGE_CHARS`.
+ *
+ * Checked here as well as server-side so an oversized file is refused before
+ * it is base64'd and pushed over the wire, rather than after. Base64 inflates
+ * by ~4/3, hence the ratio. */
+const MAX_IMAGE_BYTES = 3_300_000;
 
 const LOOK_DIRECTIONS = ["left", "right", "up", "down"];
 const LOOK_VARIANTS = ["look", "shrink-look", "expand-look"];
@@ -123,7 +171,13 @@ async function playThinkingLooksUntilSettled(avatarEl, pending, rhythmMs) {
   );
   let i = 0;
   do {
-    playExpression(avatarEl, order[i % order.length], rhythmMs);
+    // `avatarEl` may be a getter rather than an element: on a split, the local
+    // bubble finalises mid-flight and a *new* pending row opens for the cloud,
+    // so the avatar that should be animating changes while this loop runs.
+    // Resolving each beat lets the animation follow it instead of drumming its
+    // fingers on a bubble that has already been answered.
+    const el = typeof avatarEl === "function" ? avatarEl() : avatarEl;
+    playExpression(el, order[i % order.length], rhythmMs);
     i++;
     await sleep(rhythmMs);
   } while (!settled);
@@ -160,11 +214,18 @@ function activePreviewAvatar() {
   return els.emptyStateAvatar;
 }
 
-/** Badge text per `tier_answered`. `"hybrid"` is a real third outcome, not a
- * flavour of "cloud": the on-device model answered part of the query and only
- * the part it flagged as beyond it was sent on. Saying "Cloud brain" there
- * would understate what stayed local, and "Local brain" would hide that
- * anything left at all. */
+/** Badge text per message tier.
+ *
+ * A split turn is rendered as **two messages** -- the local answer, then the
+ * cloud's completion beneath it -- so `local` and `cloud` are what new messages
+ * ever carry. Two bubbles beat one merged bubble here because the whole point
+ * of this architecture is that two different models answered two different
+ * parts, and a single blob with a combined label hides exactly that.
+ *
+ * `hybrid` survives for two reasons: chats saved before the split-render change
+ * still hold merged messages, and the profiler still describes the *turn* as a
+ * whole (where "Local + Cloud" is the accurate summary).
+ */
 const TIER_BADGE_LABEL = {
   local: "Local brain",
   cloud: "Cloud brain",
@@ -180,6 +241,9 @@ const state = {
   currentTier: "local",
   searchQuery: "",
   backendLive: null, // null = not checked yet, true/false after checkBackend()
+  attachment: null,  // {name, dataUrl} while one is staged for the next send
+  models: [],        // from GET /models -- only what is installed
+  modelId: null,     // the selected local model, sent with every query
 };
 
 function loadChats() {
@@ -368,12 +432,157 @@ function renderMessageEl(msg) {
     bubble.appendChild(badge);
   }
 
+  // A user message can carry an image. Shown inline so the transcript records
+  // what was actually asked -- and it never left this machine: `api.py` decodes
+  // it to a temp file the local VLM reads, and only a masked *textual*
+  // description is ever eligible to cross the boundary.
+  if (msg.role === "user" && msg.image) {
+    const img = document.createElement("img");
+    img.className = "message-image";
+    img.src = msg.image;
+    img.alt = "Attached image";
+    bubble.appendChild(img);
+  }
+
   const text = document.createElement("div");
-  text.innerHTML = escapeHtml(msg.content).replace(/\n/g, "<br>");
+  // Assistant replies arrive as Markdown -- headings, **bold**, numbered lists,
+  // fenced code -- and were rendering literally, so cloud answers arrived full
+  // of asterisks and hashes. `renderMarkdown` (markdown.js) escapes the model's
+  // output *first* and only then applies a fixed pattern set, so untrusted
+  // output still cannot inject HTML.
+  //
+  // User messages stay plain on purpose: the user typed them, and silently
+  // reformatting someone's own words is worse than showing them verbatim.
+  if (msg.role === "assistant" && typeof renderMarkdown === "function") {
+    text.className = "markdown";
+    text.innerHTML = renderMarkdown(msg.content ?? "");
+  } else {
+    text.innerHTML = escapeHtml(msg.content ?? "").replace(/\n/g, "<br>");
+  }
   bubble.appendChild(text);
 
   row.appendChild(bubble);
   return row;
+}
+
+/**
+ * Retags a live row as belonging to a different brain -- badge text, badge dot
+ * and avatar colour together.
+ *
+ * Needed because a row's tier is not always known when it is created: a turn
+ * opens as a blue "local" pending row, and only the `escalating` progress event
+ * reveals that the local model produced nothing and the cloud is answering
+ * instead. Repainting beats guessing, and beats leaving it blue while the cloud
+ * works.
+ */
+/**
+ * Renders the "what crossed the boundary" disclosure into a bubble.
+ *
+ * Shows the masked text that was actually sent, plus each substitution as
+ * `typed -> placeholder`. The raw values are the user's own words, already on
+ * their screen -- and showing them beside the placeholders is the whole point:
+ * a masked string on its own proves nothing without what it replaced.
+ *
+ * Inserted above whatever else the bubble holds so it stays visible as the
+ * answer streams in beneath it.
+ */
+function renderCrossing(bubble, payload) {
+  if (!bubble || !payload || bubble.crossingEl) return;
+  const subs = payload.substitutions || [];
+  const rows = subs
+    .map((s) =>
+      `<div class="crossing-sub"><code>${escapeHtml(s.value)}</code>` +
+      `<span class="crossing-arrow">-></span>` +
+      `<code class="crossing-mask">${escapeHtml(s.placeholder)}</code></div>`
+    )
+    .join("");
+
+  const el = document.createElement("details");
+  el.className = "crossing";
+  el.innerHTML =
+    `<summary><span class="crossing-lock">&#128274;</span>` +
+    (subs.length
+      ? `${subs.length} item${subs.length === 1 ? "" : "s"} masked before leaving this device`
+      : `Sent to the cloud (no PII found)`) +
+    `</summary>` +
+    (rows ? `<div class="crossing-subs">${rows}</div>` : "") +
+    `<div class="crossing-label">Sent off-device:</div>` +
+    `<pre class="crossing-text">${escapeHtml(payload.query || "")}</pre>` +
+    (payload.context
+      ? `<div class="crossing-label">With context:</div>` +
+        `<pre class="crossing-text">${escapeHtml(payload.context)}</pre>`
+      : "");
+
+  const container = bubble.row?.querySelector(".bubble");
+  if (!container) return;
+  const badge = container.querySelector(".tier-badge");
+  if (badge && badge.nextSibling) container.insertBefore(el, badge.nextSibling);
+  else container.appendChild(el);
+  bubble.crossingEl = el;
+}
+
+function setRowTier(row, tier) {
+  const avatar = row.querySelector(".robot-avatar");
+  if (avatar) avatar.dataset.tier = tier;
+  const badge = row.querySelector(".tier-badge");
+  if (badge) {
+    badge.innerHTML =
+      `<span class="tier-dot" data-tier="${tier}"></span>` +
+      (TIER_BADGE_LABEL[tier] ?? TIER_BADGE_LABEL.local);
+  }
+}
+
+/** Replaces everything in a row's bubble except its tier badge. */
+function replaceBubbleBody(row, nodes) {
+  const bubble = row.querySelector(".bubble");
+  if (!bubble) return null;
+  [...bubble.children].forEach((el) => {
+    if (!el.classList.contains("tier-badge")) el.remove();
+  });
+  for (const node of nodes) bubble.appendChild(node);
+  return bubble;
+}
+
+/**
+ * Turns a pending row into a finished answer from one brain.
+ *
+ * Used for the local half of a split the moment it arrives, so it reads as a
+ * completed message from the local brain rather than as a half-drawn one --
+ * which is the point of showing it early at all.
+ */
+function finalizeAssistantRow(row, { tier, content }) {
+  row.querySelector(".robot-avatar")?.classList.remove("thinking");
+  setRowTier(row, tier);
+  const text = document.createElement("div");
+  // Same Markdown treatment as a persisted message, so the local half looks
+  // identical live and after the turn is saved and re-rendered.
+  if (typeof renderMarkdown === "function") {
+    text.className = "markdown";
+    text.innerHTML = renderMarkdown(content ?? "");
+  } else {
+    text.innerHTML = escapeHtml(content ?? "").replace(/\n/g, "<br>");
+  }
+  replaceBubbleBody(row, [text]);
+}
+
+/**
+ * Marks a row as waiting on the cloud, optionally naming the gap being asked.
+ *
+ * `gap` is the interesting part when there is one: it says exactly what the
+ * local model could not do, and therefore exactly what is crossing the
+ * boundary. With no gap (`escalating`) the whole query is going, and the row
+ * says that instead of implying a split that isn't happening.
+ */
+function renderCloudPending(row, gap) {
+  setRowTier(row, "cloud");
+  const pending = document.createElement("div");
+  pending.className = "cloud-pending";
+  pending.innerHTML =
+    `<span class="cloud-pending-dots"><i></i><i></i><i></i></span>` +
+    (gap
+      ? `Answering the rest: ${escapeHtml(gap)}`
+      : `Escalating the whole query…`);
+  replaceBubbleBody(row, [pending]);
 }
 
 function scrollToBottom() {
@@ -493,11 +702,296 @@ async function sendToRouter(query, context) {
   const res = await fetch(`${API_BASE_URL}/route`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, context }),
+    body: JSON.stringify({ query, context, model: state.modelId || undefined }),
   });
   const body = await res.json();
   if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
   return body;
+}
+
+/* ── Image attachment ───────────────────────────────────────────────────── */
+
+function clearAttachment() {
+  state.attachment = null;
+  if (els.attachInput) els.attachInput.value = "";
+  if (els.attachmentPreview) els.attachmentPreview.hidden = true;
+  els.attachBtn?.classList.remove("has-image");
+  updateSendState();
+}
+
+/**
+ * Reads a chosen file into a data URL and shows a preview.
+ *
+ * The image never leaves this machine: `api.py` decodes it to a temp file, the
+ * local VLM reads it, and — if the query escalates — only a *masked textual
+ * description* crosses the boundary, never the pixels. The cloud tier has no
+ * vision model at all, so there is nowhere for an image to go even if we
+ * wanted to send one. The preview says so, because "where did my photo go" is
+ * the first thing anyone should be able to answer.
+ */
+function setAttachment(file) {
+  if (!file) return;
+  if (file.size > MAX_IMAGE_BYTES) {
+    alert(
+      `That image is ${(file.size / 1e6).toFixed(1)} MB; the limit is ` +
+      `${(MAX_IMAGE_BYTES / 1e6).toFixed(1)} MB.`
+    );
+    clearAttachment();
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    state.attachment = { name: file.name, dataUrl: String(reader.result) };
+    if (els.attachmentThumb) els.attachmentThumb.src = state.attachment.dataUrl;
+    if (els.attachmentName) els.attachmentName.textContent = file.name;
+    if (els.attachmentPreview) els.attachmentPreview.hidden = false;
+    els.attachBtn?.classList.add("has-image");
+    updateSendState();
+  };
+  reader.readAsDataURL(file);
+}
+
+/**
+ * Token-level streaming over Server-Sent Events (`POST /route/sse`).
+ *
+ * `onEvent(kind, payload)` is called per frame:
+ *
+ *   meta  {tier, streaming}      once, before any text
+ *   delta {text, tier}           repeatedly, tier-attributed
+ *   tier  {tier, gap}            a split opening the cloud's bubble
+ *   done  {...RouteDecision}     once
+ *   error {error}                in-band, since the status line is long sent
+ *
+ * `EventSource` cannot be used: it is GET-only, and this request carries a JSON
+ * body with an optional base64 image. So the `fetch` body is read as a stream
+ * and the frames parsed by hand.
+ *
+ * **Only the local model's `solution` field arrives as deltas** — the router
+ * strips the surrounding JSON before it ever reaches the wire, so a bubble is
+ * never seen filling with `{"solution": "`.
+ *
+ * Frames are separated by a blank line and split across chunk boundaries
+ * arbitrarily, so `buffer` holds the incomplete tail between reads.
+ */
+async function sendToRouterSSE(query, context, imageDataUrl, onEvent, signal) {
+  const res = await fetch(`${API_BASE_URL}/route/sse`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query,
+      context,
+      image: imageDataUrl || undefined,
+      // Sent every time, so the server cannot drift out of sync with the
+      // dropdown. An unchanged id is a no-op server-side.
+      model: state.modelId || undefined,
+    }),
+    signal,
+  });
+  if (res.status === 404) {
+    // A server older than this endpoint. Degrade to the non-streaming path
+    // rather than to the offline preview -- the API *is* reachable, and
+    // claiming "no model ran" about a working router is a lie that sends
+    // someone hunting the wrong problem. (This is exactly what happened: a
+    // stale server kept port 8765, the new one failed to bind, and the UI
+    // reported the backend as down.)
+    console.warn("/route/sse not found — falling back to /route/stream");
+    const body = await sendToRouterStreaming(query, context, (progress) => {
+      if (progress.phase === "local_answer") {
+        onEvent("delta", { text: progress.local_answer, tier: "local" });
+        if (progress.gap) onEvent("tier", { tier: "cloud", gap: progress.gap });
+      }
+    });
+    // The pre-SSE endpoints deliver whole halves, not tokens, so emit whatever
+    // the deltas above did not already cover.
+    if (body.tier_answered === "hybrid") {
+      onEvent("delta", { text: body.cloud_answer, tier: "cloud" });
+    } else {
+      onEvent("delta", { text: body.answer, tier: body.tier_answered });
+    }
+    onEvent("done", body);
+    return body;
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `HTTP ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      if (!data) continue;
+      let payload;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        continue; // keep-alive or a partial frame; not fatal
+      }
+      if (event === "error") throw new Error(payload.error || "stream failed");
+      if (event === "done") result = payload;
+      onEvent(event, payload);
+    }
+  }
+  if (!result) throw new Error("stream ended without a result");
+  return result;
+}
+
+/**
+ * Streaming call: POSTs to `/route/stream` and resolves with the final result,
+ * calling `onProgress` with the local half as soon as the server has it.
+ *
+ * Why bother: the local model answers in ~4s and the cloud gap-fill has been
+ * measured at 15s+, so the non-streaming `/route` spends most of its wall-clock
+ * sitting on an answer that was ready the whole time. This shows that answer
+ * immediately and lets the cloud half land when it lands.
+ *
+ * NDJSON, one JSON object per line. Lines can be split across chunk
+ * boundaries, so `buf` holds the incomplete tail between reads -- parsing per
+ * chunk instead would fail intermittently on exactly the long answers this
+ * feature exists for.
+ *
+ * Falls back to non-streaming `/route` on 404, so a UI newer than its server
+ * degrades to "slower" rather than to the offline preview, which would wrongly
+ * claim nothing ran.
+ */
+async function sendToRouterStreaming(query, context, onProgress) {
+  const res = await fetch(`${API_BASE_URL}/route/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, context, model: state.modelId || undefined }),
+  });
+  if (res.status === 404) return sendToRouter(query, context);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let result = null;
+
+  const handleLine = (line) => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    if (msg.type === "progress") onProgress?.(msg);
+    else if (msg.type === "result") result = msg;
+    else if (msg.type === "error") throw new Error(msg.error);
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop(); // keep the (possibly incomplete) tail for the next read
+    for (const line of lines) handleLine(line);
+  }
+  if (buf.trim()) handleLine(buf);
+
+  if (!result) throw new Error("stream ended without a result");
+  return result;
+}
+
+/**
+ * Builds the `context` string sent with a query: the recent turns of *this*
+ * chat, oldest-first, so "explain in more detail" has something to refer to.
+ *
+ * `excludeLast` drops the message just pushed -- the current query is sent
+ * separately as `query`, and repeating it in the context would have the local
+ * model answering it twice.
+ *
+ * Truncation is oldest-first (`slice(-N)`) because recency is what resolves a
+ * pronoun. The per-message cap keeps one long answer from crowding out the
+ * turns around it, which is the case that actually breaks reference
+ * resolution -- a single 4000-char reply would otherwise be the entire budget.
+ */
+function buildConversationContext(chat, excludeLast = true) {
+  if (!chat) return "";
+  let msgs = chat.messages.filter((m) => m.role === "user" || m.role === "assistant");
+  if (excludeLast) msgs = msgs.slice(0, -1);
+  msgs = msgs.slice(-HISTORY_MAX_MESSAGES);
+  if (!msgs.length) return "";
+
+  const lines = msgs.map((m) => {
+    const who = m.role === "user" ? "User" : "Assistant";
+    let body = (m.content || "").replace(/\s+/g, " ").trim();
+    if (body.length > HISTORY_MAX_CHARS_PER_MESSAGE) {
+      body = body.slice(0, HISTORY_MAX_CHARS_PER_MESSAGE) + "…";
+    }
+    return `${who}: ${body}`;
+  });
+
+  let out = `Earlier in this conversation:\n${lines.join("\n")}`;
+  if (out.length > HISTORY_MAX_CHARS_TOTAL) {
+    // Trim from the front: the newest turns are the ones a follow-up refers to.
+    out = "Earlier in this conversation (truncated):\n" +
+      out.slice(out.length - HISTORY_MAX_CHARS_TOTAL);
+  }
+  return out;
+}
+
+/**
+ * Loads the installed local models and populates the picker.
+ *
+ * `GET /models` returns only what is actually on disk, so the dropdown never
+ * offers something that will fail 17 seconds into a cold load. Hidden entirely
+ * when the backend is down or there is nothing to choose between -- a
+ * single-entry dropdown is a decoration, not a control.
+ */
+async function loadModels() {
+  try {
+    const res = await fetch(`${API_BASE_URL}/models`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    state.models = body.models || [];
+    state.modelId = body.active || state.modelId || state.models[0]?.id || null;
+  } catch {
+    state.models = [];
+    state.modelId = null;
+  }
+  renderModelPicker();
+}
+
+function renderModelPicker() {
+  if (!els.modelPicker || !els.modelSelect) return;
+  const show = state.models.length > 1;
+  els.modelPicker.hidden = !show;
+  if (!show) return;
+
+  els.modelSelect.innerHTML = state.models
+    .map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`)
+    .join("");
+  if (state.modelId) els.modelSelect.value = state.modelId;
+  const active = state.models.find((m) => m.id === els.modelSelect.value);
+  if (els.modelDetail) els.modelDetail.textContent = active ? active.detail : "";
+}
+
+/**
+ * Switching model closes the running brain and cold-loads the new one -- 12s
+ * for the NPU, ~17s for the 8B. The server does that work on the next query
+ * rather than eagerly, so the select is only disabled while a query is
+ * actually in flight; here it just records the choice and updates the caption.
+ */
+function onModelChange() {
+  state.modelId = els.modelSelect.value;
+  const active = state.models.find((m) => m.id === state.modelId);
+  if (els.modelDetail) {
+    els.modelDetail.textContent = active
+      ? `${active.detail} - first query after a switch pays a cold load`
+      : "";
+  }
 }
 
 /** Adapts a /route response into the metrics shape `renderProfiler` and
@@ -540,11 +1034,32 @@ async function checkBackend() {
 
 function setBackendStatus(live, tier) {
   state.backendLive = live;
-  if (!els.backendStatus) return;
-  els.backendStatus.textContent = live
-    ? `● Live — routing as ${tier}`
-    : "○ API offline — replies use the offline preview";
-  els.backendStatus.dataset.live = String(live);
+  // Reported in the empty state rather than a permanent sidebar box: it is
+  // read once, when you are deciding whether to trust the next reply, and a
+  // status chip sitting in the corner for the whole session is noise after
+  // that. The tier toggle's own label doubles as the reminder, since offline
+  // is the only time that toggle does anything.
+  if (els.emptyStateHint) {
+    els.emptyStateHint.textContent = live
+      ? `Connected to the two-brain router — routing as ${tier}.`
+      : `Router not reachable at ${API_BASE_URL}. Replies fall back to an offline preview.`;
+    els.emptyStateHint.dataset.live = String(live);
+  }
+  if (els.brainToggleLabel) {
+    els.brainToggleLabel.textContent = live
+      ? "Preview tier (unused while live)"
+      : "Preview tier (offline)";
+  }
+
+  // Both sidebar panels are demo controls. When the router is live the tier
+  // toggle cannot force anything -- `route()` decides -- and the expression
+  // buttons only preview animations. Hidden rather than left present-but-inert:
+  // a control that looks live and does nothing is worse than no control. When
+  // the backend is *down* the toggle is the only thing that does anything, so
+  // it comes back.
+  for (const el of [els.brainToggleWrap, els.expressionPreviewWrap]) {
+    if (el) el.hidden = Boolean(live);
+  }
 }
 
 /**
@@ -572,7 +1087,12 @@ async function handleSend(e) {
   let chat = state.chats.find((c) => c.id === state.activeChatId);
   if (!chat) chat = createChat(query);
 
-  chat.messages.push({ role: "user", content: query, timestamp: Date.now() });
+  chat.messages.push({
+    role: "user",
+    content: query,
+    image: state.attachment?.dataUrl,
+    timestamp: Date.now(),
+  });
   chat.updatedAt = Date.now();
   saveChats();
   renderMessages(chat);
@@ -597,11 +1117,81 @@ async function handleSend(e) {
     await sleep(EXPRESSION_HOLD_MS.surprised);
   }
 
-  // In flight immediately; the animation below just watches it settle.
-  const routed = sendToRouter(query, "");
-  const looping = playThinkingLooksUntilSettled(thinkingAvatar, routed, THINK_RHYTHM_MS);
+  // Built from `chat.messages`, which already had the current query pushed --
+  // hence `excludeLast`. Read *before* awaiting anything, so a second send
+  // while this one is in flight can't fold a half-finished turn into it.
+  const attachment = state.attachment;
+  clearAttachment();
+  const history = buildConversationContext(chat);
 
-  let tier, answer, metrics, live;
+  // One bubble per tier that actually speaks, created on that tier's first
+  // delta. A split therefore shows the on-device partial in the local colour
+  // and the cloud's gap-fill in its own, filling in as the tokens land.
+  const bubbles = new Map(); // tier -> {row, textEl, text}
+  let pendingRow = thinkingRow; // whichever row is currently animating
+
+  const bubbleFor = (tier) => {
+    let b = bubbles.get(tier);
+    if (b) return b;
+    let row;
+    if (bubbles.size === 0) {
+      row = thinkingRow; // reuse the placeholder already on screen
+    } else {
+      row = renderMessageEl({ role: "assistant", content: "", tier });
+      row.querySelector(".robot-avatar")?.classList.add("thinking");
+      els.messages.appendChild(row);
+    }
+    setRowTier(row, tier);
+    const textEl = document.createElement("div");
+    textEl.className = "markdown";
+    replaceBubbleBody(row, [textEl]);
+    b = { row, textEl, text: "" };
+    bubbles.set(tier, b);
+    pendingRow = row; // the animation follows whichever brain is speaking
+    scrollToBottom();
+    return b;
+  };
+
+  const onEvent = (kind, payload) => {
+    if (kind === "delta") {
+      const b = bubbleFor(payload.tier || "local");
+      b.text += payload.text || "";
+      // Re-render the whole bubble each delta rather than appending text: a
+      // Markdown document is not append-safe -- a list or fence half-arrived is
+      // not valid Markdown, and rendering it incrementally would leave broken
+      // structure behind once the rest lands.
+      b.textEl.innerHTML =
+        typeof renderMarkdown === "function"
+          ? renderMarkdown(b.text)
+          : escapeHtml(b.text).replace(/\n/g, "<br>");
+      scrollToBottom();
+    } else if (kind === "crossing") {
+      // What actually left the device, shown *while* the cloud is working --
+      // the point is to see it during the wait it bought, not as a footnote
+      // afterwards. Collapsed by default: it is evidence, not content.
+      renderCrossing(bubbleFor("cloud"), payload);
+    } else if (kind === "tier" && payload.gap) {
+      // The cloud is about to start on a named gap. Its bubble opens with the
+      // gap visible, so the wait is explained rather than blank.
+      const b = bubbleFor("cloud");
+      if (!b.text) {
+        b.textEl.innerHTML =
+          `<span class="cloud-pending"><span class="cloud-pending-dots"><i></i><i></i><i></i></span>` +
+          `Answering the rest: ${escapeHtml(payload.gap)}</span>`;
+      }
+    }
+  };
+
+  const routed = sendToRouterSSE(query, history, attachment?.dataUrl, onEvent, null);
+  // A getter, not the element: `pendingRow` moves when a split opens the
+  // cloud's row, and the animation should follow it there.
+  const looping = playThinkingLooksUntilSettled(
+    () => pendingRow.querySelector(".robot-avatar"),
+    routed,
+    THINK_RHYTHM_MS
+  );
+
+  let tier, answer, metrics, live, splitAnswers = null;
   try {
     const body = await routed;
     await looping; // let the current beat finish instead of cutting it off
@@ -609,6 +1199,11 @@ async function handleSend(e) {
     answer = body.answer;
     metrics = metricsFromRouteResponse(body);
     live = true;
+    if (tier === "hybrid") {
+      // Two messages, not one: two models answered two different parts, and a
+      // single merged bubble hides precisely that.
+      splitAnswers = { local: body.local_answer, cloud: body.cloud_answer };
+    }
     setBackendStatus(true, body.tier);
   } catch (err) {
     console.warn("two-brain-router API unreachable, using offline preview:", err);
@@ -617,7 +1212,7 @@ async function handleSend(e) {
     // loop instead of a near-instant reply, same rhythm the mock always had.
     const fallbackTier = state.currentTier;
     await playThinkingLooks(
-      thinkingAvatar,
+      pendingRow.querySelector(".robot-avatar"),
       THINK_MS_BY_TIER[fallbackTier] ?? THINK_MS_BY_TIER.local,
       THINK_RHYTHM_MS
     );
@@ -628,16 +1223,39 @@ async function handleSend(e) {
     setBackendStatus(false);
   }
 
-  playExpression(thinkingAvatar, "happy", HAPPY_LEAD_MS);
+  playExpression(pendingRow.querySelector(".robot-avatar"), "happy", HAPPY_LEAD_MS);
   await sleep(HAPPY_LEAD_MS);
 
   metrics.actualLatencyMs = performance.now() - thinkingStartedAt;
-  chat.messages.push({ role: "assistant", content: answer, tier, live, timestamp: Date.now(), metrics });
-  chat.updatedAt = Date.now();
+  const at = Date.now();
+  if (splitAnswers) {
+    // Metrics ride on the cloud message alone: they describe the whole turn
+    // (total latency, total cost, what was masked), and `renderMessages` picks
+    // the last assistant message carrying them for the profiler. Duplicating
+    // them onto the local half would double-count the turn in that view.
+    chat.messages.push({ role: "assistant", content: splitAnswers.local, tier: "local", live, timestamp: at });
+    chat.messages.push({ role: "assistant", content: splitAnswers.cloud, tier: "cloud", live, timestamp: at, metrics });
+  } else {
+    // `live === false` means we fell into the catch: the request failed after
+    // the local half had already streamed and been read, so it is kept rather
+    // than replaced by an offline-preview blob.
+    //
+    // Only on that path. On success `answer` *is* the local text, and pushing
+    // both produced the same reply twice -- once from the stream, once from
+    // the final decision.
+    const streamedLocal = live === false ? bubbles.get("local")?.text : null;
+    if (streamedLocal) {
+      chat.messages.push({ role: "assistant", content: streamedLocal, tier: "local", live: true, timestamp: at });
+    }
+    chat.messages.push({ role: "assistant", content: answer, tier, live, timestamp: at, metrics });
+  }
+  chat.updatedAt = at;
   saveChats();
   renderMessages(chat);
   renderChatList();
   playExpression(els.messages.querySelector(".message.assistant:last-child .robot-avatar"), "happy");
+  // The profiler describes the *turn*, so a split is still "Local + Cloud"
+  // there even though the transcript now shows it as two messages.
   renderProfiler(metrics, tier);
 }
 
@@ -697,6 +1315,11 @@ els.exprButtons.addEventListener("click", (e) => {
   if (btn) playExpression(activePreviewAvatar(), btn.dataset.expr);
 });
 
+els.modelSelect?.addEventListener("change", onModelChange);
+els.attachBtn?.addEventListener("click", () => els.attachInput?.click());
+els.attachInput?.addEventListener("change", (e) => setAttachment(e.target.files?.[0]));
+els.attachmentRemove?.addEventListener("click", clearAttachment);
+
 els.profilerPill.addEventListener("click", (e) => {
   e.stopPropagation();
   toggleProfilerCard();
@@ -712,3 +1335,4 @@ renderChatList();
 showEmptyState();
 updateSendState();
 checkBackend();
+loadModels();

@@ -52,6 +52,54 @@ class RouteDecision:
     #: masked. Always populated. Defaulted so the field could be added without
     #: breaking any existing construction of this dataclass.
     pii_entities_detected: int = 0
+    #: Exactly what crossed the boundary, for display. None when nothing did.
+    #:
+    #:     {"query": "<masked>", "context": "<masked, compressed>",
+    #:      "substitutions": [{"type": "EMAIL", "value": "...", "placeholder": "[PII_EMAIL_1]"}]}
+    #:
+    #: `notes` already carries a one-line version of this, but a UI should not
+    #: have to scrape prose to show the user what left their machine. The raw
+    #: `value` is included deliberately: it is the user's own text, already on
+    #: their screen, and showing `jane.doe@example.com -> [PII_EMAIL_1]` side by
+    #: side is the entire point -- a masked string alone proves nothing without
+    #: what it replaced.
+    crossed_to_cloud: dict | None = None
+
+
+@dataclass
+class RouteProgress:
+    """A partial result, handed out *before* `route()` returns.
+
+    Exists because the two halves of a split have very different latencies --
+    the local model answers in ~4s and the cloud leg has been measured at 15s+
+    -- so waiting for the merge before showing anything wastes an answer that
+    was ready the whole time. `route(..., on_progress=...)` emits one of these
+    at the moment the local half is settled and the cloud call is about to
+    start.
+
+    Deliberately *not* a `RouteDecision`. A decision is final and complete; this
+    is explicitly neither, and giving it its own type means a caller cannot
+    accidentally treat an in-flight partial as the finished record -- the
+    `est_cost_usd`/`est_latency_ms` fields a decision carries are not knowable
+    yet, so they are simply absent rather than present-and-wrong.
+    """
+
+    #: `"local_answer"` -- the local model produced a usable partial and named a
+    #: gap; the deep brain is about to be asked about that gap only.
+    #: `"escalating"` -- nothing usable came back locally (or the fast brain was
+    #: skipped), so the whole query is going to the deep brain and there is no
+    #: partial to show.
+    phase: Literal["local_answer", "escalating"]
+    #: Rehydrated, ready to display. None on `"escalating"`.
+    local_answer: str | None
+    #: What the deep brain is being asked. None on `"escalating"`, where it is
+    #: the whole query rather than a named gap.
+    gap: str | None
+    difficulty_score: float
+    #: What the local half cost, in wall-clock. The cloud half is still running.
+    local_latency_ms: float
+    #: The audit trail *so far*. The final `RouteDecision.notes` is a superset.
+    notes: list[str]
 
 
 @dataclass

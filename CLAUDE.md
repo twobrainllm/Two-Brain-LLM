@@ -98,6 +98,19 @@ Three consequences worth knowing before you plan work here:
 
 `TWO_BRAIN_STRUCTURED=0` reverts both AI-PC brains to Shape B.
 
+**Conversation history lives on the client, not in the router.** `api.py`
+shares one `TwoBrainRouter` across every request and tab, so per-chat state
+there would cross-contaminate; `ui/app.js` assembles recent turns and sends
+them as `context`. The local brain gets them raw, the cloud gets them masked.
+Anything reading `pii_entities_detected`/`_masked` should know both now cover
+query **and** context — they used to count the query only, which reported
+"0 detected" for a request that masked an address out of the history.
+
+**`node ui/selftest.mjs`** covers the UI logic that is no longer glue (history
+assembly, NDJSON stream parsing, progressive-render states, privacy wording).
+Zero dependencies, no package.json -- deliberately; `pytest` still owns the
+router.
+
 **To watch the data path, run the API server and read the trace**
 (`src/two_brain_router/trace.py`, on by default there, `--trace` on the CLI).
 It prints each brain call's input and output with an `[ON-DEVICE -- raw text]`

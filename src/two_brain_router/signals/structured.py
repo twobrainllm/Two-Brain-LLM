@@ -51,35 +51,78 @@ from two_brain_router.signals.confidence import parse_self_reported
 #: defends against that anyway (`_NULLISH`), but asking correctly is cheaper
 #: than parsing around it.
 #:
-#: The explicit ban on caveats is measured, not defensive boilerplate. Without
-#: it, a real run put this in `unknown` for the PII demo query: *"This response
-#: assumes the user's authority to address the security matter and does not
-#: involve retrieving or handling personal identification numbers directly."*
-#: That is a disclaimer about an answer the model **did** give, not a part it
-#: failed to give -- and treating it as a gap sent a query the local model had
-#: fully answered to the cloud, which on a PII query is precisely the round trip
-#: this project exists to avoid. See
-#: `data/npu_model/phi-3.5-mini-instruct/_real_structured_inference_log.md`.
+#: Three failure modes have earned a line in this prompt so far, in order
+#: found -- each is a real run, not a hypothetical, and each fix was checked
+#: against the *other* two before landing, because they pull in different
+#: directions and an early attempt at #2 broke #1's counterpart:
+#:
+#: 1. **Caveats are not gaps.** Without the ban, a real run put this in
+#:    `unknown` for the PII demo query: *"This response assumes the user's
+#:    authority to address the security matter and does not involve retrieving
+#:    or handling personal identification numbers directly."* A disclaimer
+#:    about an answer the model **did** give, not a part it failed to give --
+#:    and treating it as a gap sent a fully-answered PII query to the cloud,
+#:    precisely the round trip this project exists to avoid.
+#: 2. **Self-invented follow-ups are not gaps either.** For "explain about
+#:    stable diffusion" a real run answered a general definition, then put
+#:    this in `unknown`: *"How does stable diffusion specifically apply to
+#:    environmental science or economic models?"* -- neither field was
+#:    mentioned anywhere in the query. The model *widened the question*
+#:    rather than reporting a hole in its own answer, and that escalated a
+#:    request it considered fully answered.
+#: 3. **A fact the model doesn't know must be named, not faked.** The first
+#:    fix for #2 was worded as "only a literal part of the question, nothing
+#:    invented" -- and on the very next real run, that collapsed a genuine
+#:    gap into a false positive: for the population half of the France
+#:    question above, the model no longer named a gap *or* answered it. It
+#:    emitted `{"solution": "Paris, France's population on 3 March 2019",
+#:    "confidence": 100, "unknown": ""}` -- echoing the question fragment
+#:    back as if it were the number, at full claimed confidence. That is
+#:    worse than #2: a silently wrong "complete" local answer instead of an
+#:    honest escalation. The instruction below says explicitly not to do
+#:    this -- guessing or restating is banned, and not-knowing has exactly
+#:    one correct expression, naming it in `unknown`.
+#:
+#: #2 and #3 are opposite-direction failures of the same instruction and both
+#: have to hold at once: don't invent a gap that isn't there (#2), don't erase
+#: a gap that is (#3). Any future wording change must be checked against a
+#: query with a real gap (the France/population query below) *and* a query
+#: with none (the stable-diffusion one) before it ships -- one without the
+#: other is how #3 happened.
+#:
+#: See `data/npu_model/phi-3.5-mini-instruct/_real_structured_inference_log.md`
+#: for the measurements behind all three.
 STRUCTURED_SUFFIX = (
     "\n\nReply with ONLY a single-line JSON object and nothing else -- no code "
     "fence, no commentary before or after:\n"
     '{"solution": "<answer the parts you are sure about>", '
     '"confidence": <integer 0-100>, '
-    '"unknown": "<a specific sub-question you could NOT answer, or an empty '
-    'string if you answered all of it>"}\n'
-    "Put something in \"unknown\" only if part of the question is still "
-    "unanswered. Caveats, assumptions, disclaimers and notes about the answer "
-    "you did give do not belong there -- use an empty string for those."
+    '"unknown": "<a part of THIS question you could not actually answer, in '
+    'your own words -- or an empty string if you answered everything>"}\n'
+    "If you do not actually know a fact the user asked for, put it in "
+    "\"unknown\" -- do not guess, and do not repeat the question back as if it "
+    "were the answer. Never put a caveat or assumption about your own answer "
+    "in \"unknown\". Never put a new topic or follow-up question there that "
+    "the user did not ask, even a reasonable one -- if it was not in the "
+    "question, it is not a gap.\n"
+    'Example: "What is the capital of France, and its population on 3 March '
+    '2019?" -- if you do not know that exact figure, unknown = "the population '
+    'on 3 March 2019", not empty and not a guess. "Explain about stable '
+    'diffusion" -- once answered, unknown = "" even though you could also '
+    "cover its use in economics, because that was never asked."
 )
 
 #: System-message half of the same instruction, for brains that send one.
 STRUCTURED_SYSTEM_PROMPT = (
-    "You are a careful, concise on-device assistant. Answer as much of the "
-    "question as you genuinely can. If part of it needs knowledge or reasoning "
-    "you are not confident about, still answer the rest, and name that missing "
-    "part in the 'unknown' field so a larger model can finish it. 'unknown' is "
-    "only for a part of the question you left unanswered -- never for caveats "
-    "or assumptions about the answer you did give. "
+    "You are a careful, concise on-device assistant. Answer exactly what the "
+    "user asked. If you genuinely do not know or cannot determine a specific "
+    "fact the user asked for, say so honestly by naming it in 'unknown' -- do "
+    "not guess, and do not restate the question as if it were an answer. "
+    "'unknown' is ONLY for a part of the user's own question that you could "
+    "not answer -- never for a caveat about the answer you did give, and "
+    "never for a new topic, application, or follow-up the user did not ask "
+    "about, no matter how relevant it seems. If every part of the question is "
+    "genuinely answered, 'unknown' is an empty string. "
     "Reply with one single-line JSON object and nothing else. Never use blank "
     "lines."
 )
@@ -293,3 +336,156 @@ def parse_structured(text: str) -> StructuredAnswer:
         model_masked_output=_coerce_text(_first_key(obj, _MASKED_KEYS)),
         source="json",
     )
+
+
+class SolutionStreamer:
+    r"""Emits only the `solution` field's text as a structured reply arrives.
+
+    The problem this exists for: a Shape C brain generates
+    `{"solution": "Paris is...", "confidence": 95, "unknown": ""}` token by
+    token. Forwarding those tokens straight to a UI shows the user the
+    scaffolding -- a brace, a quoted key, a colon -- before any answer appears,
+    and the `confidence`/`unknown` fields after it. Those are routing metadata;
+    they are not the answer and must never be rendered as one.
+
+    So this walks the raw buffer and hands back only the decoded contents of
+    `solution`, as they become available. Feed it whatever chunks arrive, in
+    order; each call returns the *new* text since the last call, or `""`.
+
+    Three things make this fiddlier than "wait for valid JSON":
+
+    - **Chunk boundaries fall anywhere.** `"solu` / `tion": "Par` / `is"` is a
+      normal split, so nothing can be matched against a single chunk. The whole
+      buffer is rescanned each feed instead; replies are a few hundred
+      characters, so the quadratic cost is irrelevant next to one NPU token.
+    - **JSON escapes must be decoded, and may be truncated.** A buffer ending
+      mid-escape (`...\u00e9` cut after `\u00`) has to withhold that fragment
+      rather than emit a broken character, and pick it up on the next feed.
+    - **The model may not emit JSON at all.** Small models sometimes answer in
+      plain prose (`parse_structured`'s lower rungs exist for exactly that). If
+      the buffer clearly is not a JSON object, everything is streamed verbatim
+      -- degrading to "show the user the words" rather than showing nothing.
+    """
+
+    #: Enough characters to tell prose from `{"solution": ...`. A model that
+    #: has not opened a brace by here is not going to.
+    _JSON_SNIFF_CHARS = 24
+
+    def __init__(self) -> None:
+        self._raw: list[str] = []
+        self._emitted = 0
+        self._plain_text: bool | None = None
+
+    @property
+    def raw(self) -> str:
+        """Everything fed so far, for the caller to parse properly at the end."""
+        return "".join(self._raw)
+
+    def feed(self, chunk: str) -> str:
+        """Add `chunk`; return whatever new answer text that made available."""
+        if not chunk:
+            return ""
+        self._raw.append(chunk)
+        buffer = self.raw
+
+        if self._plain_text is None:
+            stripped = buffer.lstrip()
+            if stripped.startswith("{") or stripped.startswith("```"):
+                self._plain_text = False
+            elif len(stripped) >= self._JSON_SNIFF_CHARS:
+                # Committed: no object is coming, so stream the prose as-is.
+                self._plain_text = True
+            else:
+                return ""  # too early to tell -- hold rather than guess wrong
+
+        available = buffer if self._plain_text else _partial_solution(buffer)
+        if available is None or len(available) <= self._emitted:
+            return ""
+        new = available[self._emitted :]
+        self._emitted = len(available)
+        return new
+
+    def finish(self) -> str:
+        """Any remaining text, once the stream is known to be complete.
+
+        Covers the case where the sniff never resolved -- a reply shorter than
+        `_JSON_SNIFF_CHARS` that turned out to be prose, which would otherwise
+        be withheld forever.
+        """
+        buffer = self.raw
+        if self._plain_text is None:
+            self._plain_text = not buffer.lstrip().startswith(("{", "```"))
+        available = buffer if self._plain_text else _partial_solution(buffer)
+        if available is None or len(available) <= self._emitted:
+            return ""
+        new = available[self._emitted :]
+        self._emitted = len(available)
+        return new
+
+
+def _partial_solution(buffer: str) -> str | None:
+    """Decode as much of the `solution` string as `buffer` contains.
+
+    Returns None while the key has not been seen yet -- distinct from `""`,
+    which means "the key is open and so far it is empty".
+    """
+    for key in _SOLUTION_KEYS:
+        start = _value_start(buffer, key)
+        if start is not None:
+            return _decode_json_string_prefix(buffer, start)
+    return None
+
+
+def _value_start(buffer: str, key: str) -> int | None:
+    """Index just past the opening quote of `"<key>" : "`, or None."""
+    needle = f'"{key}"'
+    at = buffer.find(needle)
+    if at == -1:
+        return None
+    i = at + len(needle)
+    while i < len(buffer) and buffer[i] in " \t\r\n":
+        i += 1
+    if i >= len(buffer) or buffer[i] != ":":
+        return None
+    i += 1
+    while i < len(buffer) and buffer[i] in " \t\r\n":
+        i += 1
+    if i >= len(buffer) or buffer[i] != '"':
+        return None
+    return i + 1
+
+
+def _decode_json_string_prefix(buffer: str, start: int) -> str:
+    r"""Decode a JSON string body from `start` until its close quote or the end.
+
+    A trailing incomplete escape is dropped rather than guessed at: the next
+    feed will carry the rest of it, and emitting half of a `\uXXXX` would put
+    a broken character on screen that can never be taken back.
+    """
+    out: list[str] = []
+    i = start
+    n = len(buffer)
+    simple = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+    while i < n:
+        ch = buffer[i]
+        if ch == '"':
+            break  # closing quote -- the value is complete
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= n:
+            break  # dangling backslash; wait for more
+        esc = buffer[i + 1]
+        if esc == "u":
+            if i + 6 > n:
+                break  # truncated \uXXXX
+            try:
+                out.append(chr(int(buffer[i + 2 : i + 6], 16)))
+            except ValueError:
+                out.append(buffer[i : i + 6])
+            i += 6
+            continue
+        out.append(simple.get(esc, esc))
+        i += 2
+    return "".join(out)

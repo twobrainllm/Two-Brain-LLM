@@ -49,14 +49,17 @@ the AI PC's own real brain), that is asked directly instead. Still
 """
 from __future__ import annotations
 
+import dataclasses
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from two_brain_router.privacy import MaskResult, PIIGuard, assert_masked_token_invariant
 from two_brain_router.routing.brains import (
     Brain,
+    _to_brain_response,
     BrainResponse,
     CirrascaleDeepBrain,
     CloudDeepBrain,
@@ -65,7 +68,7 @@ from two_brain_router.routing.brains import (
     NpuFastBrain,
     PhoneFastBrain,
 )
-from two_brain_router.routing.policy import RouteDecision, RoutePolicy
+from two_brain_router.routing.policy import RouteDecision, RoutePolicy, RouteProgress
 from two_brain_router.signals import DifficultyEstimator, TierSignals
 from two_brain_router.signals.confidence import confidence_to_difficulty
 from two_brain_router.trace import Tracer, trace_enabled
@@ -109,6 +112,60 @@ _NO_DIFFICULTY_SIGNAL_YET = 0.0
 _BUDGET_ALREADY_CHECKED = 0.0
 
 
+def _unique_entities(hits: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """De-duplicate `(type, value)` detections by value, keeping first order.
+
+    Detection counts *occurrences*; the vault keys on *values*, so one address
+    written twice masks to one placeholder. Reporting raw occurrences against a
+    vault-derived masked count would make a request that mentions the same
+    email in both the query and the history read as "2 detected, 1 masked" --
+    which looks like a leak and isn't one.
+    """
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for entity_type, value in hits:
+        if value not in seen:
+            seen.add(value)
+            unique.append((entity_type, value))
+    return unique
+
+
+def _deltas_for(decision: RouteDecision):
+    """Emit a finished decision as tier-attributed deltas.
+
+    Used by `route_stream`'s non-streaming fallbacks. A split still yields
+    **two** deltas, one per brain, rather than one tagged `"hybrid"` -- the UI
+    opens a bubble per tier it hears from, so a single `"hybrid"` delta
+    collapses two brains' answers into one anonymous bubble and loses exactly
+    the attribution the split exists to show. The rendering path is then
+    identical whether or not the configured brains happen to stream.
+    """
+    if decision.tier_answered == "hybrid":
+        if decision.local_answer:
+            yield ("delta", {"text": decision.local_answer, "tier": "local"})
+        if decision.gap:
+            yield ("tier", {"tier": "cloud", "gap": decision.gap})
+        if decision.cloud_answer:
+            yield ("delta", {"text": decision.cloud_answer, "tier": "cloud"})
+        return
+    yield ("delta", {"text": decision.answer, "tier": decision.tier_answered})
+
+
+def _crossing_payload(masked_query: str, context: str, vault: dict[str, str]) -> dict:
+    """What crossed the boundary, shaped for display.
+
+    `vault` maps placeholder -> original value, so this inverts it into the
+    direction a person reads: the thing they typed, and what it became. Typed
+    from the placeholder rather than re-detected, so the record can only ever
+    describe substitutions that actually happened.
+    """
+    subs = []
+    for placeholder, value in vault.items():
+        kind = placeholder.strip("[]").removeprefix("PII_").rsplit("_", 1)[0]
+        subs.append({"type": kind, "value": value, "placeholder": placeholder})
+    return {"query": masked_query, "context": context, "substitutions": subs}
+
+
 def _trusted_with_raw_pii(brain: object) -> bool:
     """Whether `brain` may be handed the query as the user typed it.
 
@@ -137,7 +194,7 @@ class _LocalView:
     they are in; they just rehydrate with whatever vault they were given.
     """
 
-    text: str
+    text: str = ""
     vault: dict[str, str] = field(default_factory=dict)
 
 
@@ -165,7 +222,30 @@ class _Request:
     pii_detected: int
     #: What the *fast* brain sees. Not used for anything that leaves.
     view: _LocalView
+    #: The same treatment for `context` (conversation history, usually) --
+    #: raw for a trusted brain, masked for one that isn't. Separate from `view`
+    #: because the two are masked independently but with the *same* guard, so
+    #: their vaults share placeholder numbering and can be merged safely.
+    context_view: _LocalView = field(default_factory=_LocalView)
     image: Path | None = None
+    #: Called with a `RouteProgress` when the local half is settled and the
+    #: cloud call is about to start, so a UI can show that half immediately
+    #: instead of waiting out a 15s+ cloud leg. Optional; `route()` behaves
+    #: identically without it.
+    on_progress: Callable[[RouteProgress], None] | None = None
+
+    @property
+    def local_vault(self) -> dict[str, str]:
+        """Everything the fast brain's answer might need rehydrating from.
+
+        A brain given masked query *and* masked context can echo a placeholder
+        from either, so rehydration has to consider both. Safe to merge: one
+        `PIIGuard` masked both, and it maps a repeated value to the same
+        placeholder, so the two dicts cannot disagree.
+        """
+        if not self.context_view.vault:
+            return self.view.vault
+        return {**self.view.vault, **self.context_view.vault}
 
     def mask_for_boundary(self, text: str) -> MaskResult:
         """Mask `text` and assert the invariant, immediately before it leaves.
@@ -271,8 +351,43 @@ class TwoBrainRouter:
         self.cloud = TierSignals.load("cloud_large", "cloud_ai100")
         self.difficulty = DifficultyEstimator()
         self.fast_brain = _build_fast_brain(tier, self.local)
+        #: Which catalogue entry `fast_brain` is, when it came from one.
+        #: None for an env-var-built brain -- `use_model` sets it, and the
+        #: no-op-if-unchanged check reads it.
+        self.model_id: str | None = None
         self.escalation_brain = _build_escalation_brain(tier, self.fast_brain)
         self.deep_brain = _build_deep_brain(self.cloud)
+
+    def use_model(self, model_id: str) -> None:
+        """Swap the fast brain to the given catalogue model.
+
+        **Closes the current brain before opening the new one, always.** Not an
+        optimisation -- a requirement: this hardware refuses a second live Genie
+        dialog session (`GENIE_STATUS_ERROR... err 1002`, see
+        `tests/test_npu_brain.py`'s fixture), and two `llama-server` children
+        would each hold GBs of VRAM. So a switch is genuinely serial, and costs
+        a cold load: ~12s for the NPU, ~17s for the 8B GPU model.
+
+        On failure the router is left with **no** fast brain rather than a
+        half-swapped one, and the exception propagates -- a caller that asked
+        for a model it cannot have should hear about it, not silently keep
+        answering from the previous one and wonder why the numbers look
+        familiar.
+        """
+        from two_brain_router.routing.models import BY_ID, build_brain
+
+        if model_id == self.model_id:
+            return
+        model = BY_ID.get(model_id)
+        if model is None:
+            raise ValueError(f"unknown model {model_id!r}")
+
+        old, self.fast_brain, self.model_id = self.fast_brain, None, None
+        close = getattr(old, "close", None)
+        if callable(close):
+            close()
+        self.fast_brain = build_brain(model, self.tier, self.local)
+        self.model_id = model_id
 
     def close(self) -> None:
         """Release any real resources a brain holds (e.g. `NpuFastBrain`'s
@@ -311,9 +426,47 @@ class TwoBrainRouter:
             )
         return _LocalView(text=masked.masked_text, vault=masked.vault)
 
+    def _local_context_view(self, guard: PIIGuard, brain: object, context: str) -> _LocalView:
+        """`_local_view` for the context (conversation history), minus the note.
+
+        Same trust rule as the query -- raw for an on-device brain, masked for
+        one across a boundary -- and masked with the *same* guard, so a value
+        appearing in both the history and the query gets one placeholder and the
+        vaults merge cleanly (`_Request.local_vault`).
+
+        No audit note of its own: `_local_view` already recorded which side of
+        the boundary this brain sits on, and repeating it per-field would bury
+        the routing decision in bookkeeping.
+        """
+        if not context:
+            return _LocalView()
+        if _trusted_with_raw_pii(brain):
+            return _LocalView(text=context)
+        masked = guard.mask(context)
+        assert_masked_token_invariant(context, masked)
+        return _LocalView(text=masked.masked_text, vault=masked.vault)
+
     @staticmethod
     def _n(query: str, guard: PIIGuard) -> int:
         return len(guard.detect(query))
+
+    @staticmethod
+    def _emit_progress(request: _Request, progress: RouteProgress) -> None:
+        """Hand a partial result to the caller, if one asked for partials.
+
+        Exceptions from the callback are swallowed on purpose. This is a
+        *notification*, and the commonest way it fails is a streaming client
+        disconnecting mid-request -- which must not change the routing outcome,
+        corrupt the audit trail, or turn a working answer into a 500. The
+        request finishes normally and the final `RouteDecision` is still
+        correct; nobody is just listening any more.
+        """
+        if request.on_progress is None:
+            return
+        try:
+            request.on_progress(progress)
+        except Exception:  # noqa: BLE001 -- a dead listener is not a routing failure
+            pass
 
     def _ask(
         self,
@@ -341,24 +494,195 @@ class TwoBrainRouter:
         self.tracer.result(brain, response, vault=None if crossing else vault)
         return response
 
-    def route(self, query: str, context: str = "", image: Path | None = None) -> RouteDecision:
+    def route(
+        self,
+        query: str,
+        context: str = "",
+        image: Path | None = None,
+        on_progress: Callable[[RouteProgress], None] | None = None,
+    ) -> RouteDecision:
         """Route one query. The real work is `_route`; this traces the outcome.
 
         Split so that *every* return path is traced, including ones added
         later -- `_route` has four `return RouteDecision(...)` sites and a fifth
         would otherwise be silently untraced.
+
+        `on_progress`, when given, is called once with a `RouteProgress` at the
+        moment the local half is settled and the deep brain is about to be
+        asked. Purely additive: the returned `RouteDecision` is identical
+        either way, and callers that don't pass it see no change at all.
         """
-        decision = self._route(query, context, image)
+        decision = self._route(query, context, image, on_progress)
         self.tracer.decision(decision)
         return decision
 
-    def _route(self, query: str, context: str = "", image: Path | None = None) -> RouteDecision:
+    def route_stream(self, query: str, context: str = "", image: Path | None = None):
+        """Route one query, yielding text as each brain generates it.
+
+        Yields `(kind, payload)` pairs:
+
+            ("meta",  {...})            once, before any generation
+            ("delta", {"text", "tier"}) repeatedly, tier-attributed
+            ("done",  {...})            once, the full RouteDecision as a dict
+
+        **Only the `solution` field is streamed, never the JSON around it.**
+        A Shape C brain emits `{"solution": "...", "confidence": 95, "unknown":
+        "..."}` token by token; forwarding that raw would show the user a brace,
+        a quoted key and a colon before any answer, then routing metadata after
+        it. `SolutionStreamer` walks the buffer and releases only the decoded
+        contents of `solution`, while the raw text is kept intact for the real
+        parse at the end. (The `(hollowbyte)-feat/chat_app` branch declined to
+        stream the local half at all for exactly this reason.)
+
+        **Every delta is tier-attributed**, so a caller renders two bubbles from
+        the data rather than inferring attribution from ordering.
+
+        The privacy ordering is unchanged and still comes first: detection, the
+        local view, and -- for an escalated image -- describing it on-device and
+        masking that description, all happen before the first delta. Only
+        *generation* is incremental. What crosses is still masked from the raw
+        query at the point of crossing, and the deep brain is still asked the
+        gap rather than the whole query.
+
+        Falls back to `route()` and emits its answer as a single delta when the
+        tier's brain cannot stream (`streams_tokens`) or takes a shape this does
+        not implement -- Shape B, which discards its local answer when it routes
+        away, so streaming it would mean showing text about to be retracted.
+        """
+        from two_brain_router.signals.structured import SolutionStreamer
+
+        fast = self.fast_brain
+        can_stream = (
+            getattr(fast, "streams_tokens", False)
+            and getattr(fast, "reports_gaps", False)
+            and image is None
+        )
+        if not can_stream:
+            # One delta, then done: the caller's rendering path stays identical
+            # whether or not the configured brains happen to support streaming.
+            decision = self.route(query, context, image)
+            yield ("meta", {"tier": decision.tier_answered, "streaming": False})
+            if decision.crossed_to_cloud:
+                yield ("crossing", decision.crossed_to_cloud)
+            yield from _deltas_for(decision)
+            yield ("done", dataclasses.asdict(decision))
+            return
+
+        notes: list[str] = []
+        guard = PIIGuard()
+        detected = _unique_entities(
+            guard.detect(query) + (guard.detect(context) if context else [])
+        )
+        self.tracer.request(self.tier, query, context, image, detected)
+        if detected:
+            notes.append(
+                f"detected {len(detected)} PII "
+                f"entit{'y' if len(detected) == 1 else 'ies'} in the query"
+            )
+        request = _Request(
+            guard=guard,
+            query=query,
+            context=context,
+            notes=notes,
+            pii_detected=len(detected),
+            view=self._local_view(guard, fast, query, notes),
+            context_view=self._local_context_view(guard, fast, context),
+        )
+        if context:
+            notes.append(f"carrying {len(context)} chars of conversation context")
+
+        local_latency_est = self.policy.estimate_local_latency_ms(self.local.profile, query)
+        if local_latency_est > self.policy.local_partial_budget_ms:
+            # Same ceiling as `_route_on_structured_answer`; nothing local is
+            # worth starting past it, so there is nothing to stream.
+            decision = self.route(query, context, image)
+            yield ("meta", {"tier": decision.tier_answered, "streaming": False})
+            if decision.crossed_to_cloud:
+                yield ("crossing", decision.crossed_to_cloud)
+            yield from _deltas_for(decision)
+            yield ("done", dataclasses.asdict(decision))
+            return
+
+        yield ("meta", {"tier": "local", "streaming": True, "pii_detected": len(detected)})
+
+        streamer = SolutionStreamer()
+        self.tracer.call("fast brain", fast, request.view.text, request.context_view.text,
+                         crossing=False, vault=request.local_vault)
+        start = time.perf_counter()
+        for piece in fast.answer_stream(request.view.text, request.context_view.text):
+            visible = streamer.feed(piece)
+            if visible:
+                # Rehydrated per-delta: for an untrusted brain the text is in
+                # masked space, and a placeholder must never reach the screen.
+                yield ("delta", {
+                    "text": request.guard.rehydrate(visible, request.local_vault),
+                    "tier": "local",
+                })
+        tail = streamer.finish()
+        if tail:
+            yield ("delta", {
+                "text": request.guard.rehydrate(tail, request.local_vault),
+                "tier": "local",
+            })
+        local_latency_ms = (time.perf_counter() - start) * 1000
+
+        local = _to_brain_response(streamer.raw.strip(), local_latency_ms, structured=True)
+        self.tracer.result(fast, local, vault=request.local_vault)
+        difficulty = self._difficulty_from(local, notes)
+        gap = local.unknown.strip()
+        if gap:
+            notes.append(f"fast brain named what it could not answer: {gap!r}")
+
+        if not self.policy.needs_gap_fill(difficulty, gap) or not gap or not local.text.strip():
+            # Stayed local, or has no gap to hand on. Either way nothing more is
+            # generated -- and when there is no usable split, `route()` would
+            # have escalated the *whole* query, which cannot reuse the text
+            # already streamed. Fall back so the audit trail stays truthful.
+            if self.policy.needs_gap_fill(difficulty, gap):
+                decision = self.route(query, context, image)
+                yield ("meta", {"tier": decision.tier_answered, "restarted": True})
+                if decision.crossed_to_cloud:
+                    yield ("crossing", decision.crossed_to_cloud)
+                yield from _deltas_for(decision)
+                yield ("done", dataclasses.asdict(decision))
+                return
+            notes.append(self.policy.local_note(difficulty, local.latency_ms))
+            decision = self._answer_locally(request, difficulty, response=local)
+            self.tracer.decision(decision)
+            yield ("done", dataclasses.asdict(decision))
+            return
+
+        # A split: the cloud answers the gap, and its tokens open a second
+        # bubble. `_answer_hybrid` does the masking, the boundary assert and the
+        # cloud call; streaming its half is the only difference here.
+        yield ("tier", {"tier": "cloud", "gap": gap})
+        # `yield from` on a generator that `return`s: the deltas flow to the
+        # caller and the finished decision comes back here (PEP 380), so the
+        # streaming half needs no out-parameter or mutable holder.
+        decision = yield from self._answer_hybrid_streaming(request, difficulty, local, gap)
+        self.tracer.decision(decision)
+        yield ("done", dataclasses.asdict(decision))
+
+    def _route(
+        self,
+        query: str,
+        context: str = "",
+        image: Path | None = None,
+        on_progress: Callable[[RouteProgress], None] | None = None,
+    ) -> RouteDecision:
         notes: list[str] = []
         guard = PIIGuard()
 
-        # 1. Detect, do not mask. What the query contained is recorded from the
-        #    start; whether any of it gets masked depends on where it goes.
-        detected = guard.detect(query)
+        # 1. Detect, do not mask. What the request contained is recorded from
+        #    the start; whether any of it gets masked depends on where it goes.
+        #
+        #    Context is scanned too, not just the query. Conversation history is
+        #    real user text and can carry PII the current query does not -- and
+        #    it crosses the boundary on an escalation exactly like the query
+        #    does. Counting only the query reported "0 detected" for a request
+        #    that then masked an email out of the history, which understates the
+        #    thing this sample exists to show.
+        detected = _unique_entities(guard.detect(query) + (guard.detect(context) if context else []))
         self.tracer.request(self.tier, query, context, image, detected)
         n_detected = len(detected)
         if n_detected:
@@ -383,8 +707,12 @@ class TwoBrainRouter:
             notes=notes,
             pii_detected=n_detected,
             view=self._local_view(guard, self.fast_brain, query, notes),
+            context_view=self._local_context_view(guard, self.fast_brain, context),
             image=image,
+            on_progress=on_progress,
         )
+        if context:
+            notes.append(f"carrying {len(context)} chars of conversation context")
 
         # 2. Decide.
         local_latency_est = self.policy.estimate_local_latency_ms(self.local.profile, query)
@@ -449,7 +777,10 @@ class TwoBrainRouter:
             request.notes.append(self.policy.escalation_note(difficulty, local_latency_est))
             return self._route_away_from_fast_brain(request, difficulty)
 
-        local = self._ask(self.fast_brain, "fast brain", request.view.text, vault=request.view.vault)
+        local = self._ask(
+            self.fast_brain, "fast brain", request.view.text,
+            request.context_view.text, vault=request.local_vault,
+        )
         difficulty = self._difficulty_from(local, request.notes)
 
         if self.policy.should_escalate(difficulty, _BUDGET_ALREADY_CHECKED):
@@ -523,7 +854,10 @@ class TwoBrainRouter:
                 f"in a split, its answer is kept rather than discarded"
             )
 
-        local = self._ask(self.fast_brain, "fast brain", request.view.text, vault=request.view.vault)
+        local = self._ask(
+            self.fast_brain, "fast brain", request.view.text,
+            request.context_view.text, vault=request.local_vault,
+        )
         difficulty = self._difficulty_from(local, request.notes)
 
         gap = local.unknown.strip()
@@ -542,6 +876,25 @@ class TwoBrainRouter:
         if not self.policy.needs_gap_fill(difficulty, gap):
             request.notes.append(self.policy.local_note(difficulty, local.latency_ms))
             return self._answer_locally(request, difficulty, response=local)
+
+        if not gap:
+            # Escalating on low confidence alone, with no gap named. There is
+            # nothing gap-shaped to ask about, so this is an ordinary
+            # escalation: the whole query goes and the local answer is
+            # discarded, rather than shown beside a full cloud answer that
+            # covers the same ground.
+            #
+            # Load-bearing, not tidiness. `_answer_hybrid` sends the gap as the
+            # deep brain's *query*, so reaching it with an empty gap asks the
+            # cloud an empty question. Observed on real hardware: the NPU
+            # returned `confidence 0.00` with `unknown` empty for a query it
+            # simply declined, which lands exactly here. The pre-fix code hid
+            # this because it sent the whole query as the ask regardless.
+            request.notes.append(
+                "not confident, and no specific gap named -- escalating the "
+                "whole query rather than splitting on nothing"
+            )
+            return self._route_away_from_fast_brain(request, difficulty, discarded=local)
 
         if not local.text.strip():
             request.notes.append(
@@ -615,8 +968,16 @@ class TwoBrainRouter:
             "own model instead of falling back to a heuristic or escalating "
             "to the cloud"
         )
+        # Its own views, not the fast brain's: the AI PC is trusted with the raw
+        # query even though the phone that just failed on it was not.
         view = self._local_view(request.guard, self.escalation_brain, request.query, request.notes)
-        response = self._ask(self.escalation_brain, "escalation brain", view.text, vault=view.vault)
+        context_view = self._local_context_view(
+            request.guard, self.escalation_brain, request.context
+        )
+        vault = {**view.vault, **context_view.vault}
+        response = self._ask(
+            self.escalation_brain, "escalation brain", view.text, context_view.text, vault=vault
+        )
 
         est_latency_ms = response.latency_ms
         if discarded is not None:
@@ -632,9 +993,12 @@ class TwoBrainRouter:
             est_latency_ms=est_latency_ms,
             est_cost_usd=response.cost_usd,
             pii_entities_detected=request.pii_detected,
-            pii_entities_masked=len(view.vault),
-            answer=request.guard.rehydrate(response.text, view.vault),
+            pii_entities_masked=len(vault),
+            answer=request.guard.rehydrate(response.text, vault),
             notes=request.notes,
+            # No `crossed_to_cloud`: the escalation brain runs on this machine,
+            # so nothing crossed the boundary this field describes. Leaving it
+            # None is the claim, not an omission.
         )
 
     def _answer_locally(
@@ -649,11 +1013,13 @@ class TwoBrainRouter:
                 # The image never left the device, so the local VLM sees it directly.
                 response = self._ask(
                     self.fast_brain, "fast brain", request.view.text,
-                    image=request.image, vault=request.view.vault,
+                    request.context_view.text, image=request.image,
+                    vault=request.local_vault,
                 )
             else:
                 response = self._ask(
-                    self.fast_brain, "fast brain", request.view.text, vault=request.view.vault
+                    self.fast_brain, "fast brain", request.view.text,
+                    request.context_view.text, vault=request.local_vault,
                 )
         # Rehydration is a no-op for a trusted brain (empty vault): its answer
         # is already in raw space because its input was.
@@ -663,9 +1029,111 @@ class TwoBrainRouter:
             est_latency_ms=response.latency_ms,
             est_cost_usd=response.cost_usd,
             pii_entities_detected=request.pii_detected,
-            pii_entities_masked=len(request.view.vault),
-            answer=request.guard.rehydrate(response.text, request.view.vault),
+            pii_entities_masked=len(request.local_vault),
+            answer=request.guard.rehydrate(response.text, request.local_vault),
             notes=request.notes,
+        )
+
+    def _prepare_gap_escalation(
+        self, request: _Request, local: BrainResponse, gap: str
+    ) -> tuple[MaskResult, str, dict[str, str]]:
+        """Mask everything a split sends, and build the deep brain's context.
+
+        Returns `(masked_gap, compressed_context, vault)`.
+
+        Extracted so the blocking and streaming split paths cannot drift: this
+        is where every string that crosses the boundary gets masked and the
+        invariant asserted, and having that logic in one place is worth more
+        than the indirection costs. Two copies of privacy-critical code is how
+        one of them ends up a fix behind.
+        """
+        masked_query = request.mask_for_boundary(request.query)
+        masked_gap = request.mask_for_boundary(gap)
+
+        vault = dict(masked_query.vault)
+        vault.update(masked_gap.vault)
+
+        parts: list[str] = []
+        if request.context:
+            masked_context = request.mask_for_boundary(request.context)
+            vault.update(masked_context.vault)
+            parts.append(masked_context.masked_text)
+        parts.append(
+            f"For background, the user originally asked: {masked_query.masked_text}"
+        )
+        if self.policy.send_partial_to_cloud:
+            masked_partial = request.mask_for_boundary(local.text)
+            vault.update(masked_partial.vault)
+            parts.append(
+                "A smaller on-device model has already answered part of it: "
+                f"{masked_partial.masked_text}\nDo not repeat that part."
+            )
+
+        compressed, was_compressed = self.policy.compress_context("\n\n".join(parts))
+        if was_compressed:
+            request.notes.append(f"compressed the escalated gap context to {len(compressed)} chars")
+        if masked_query.vault:
+            request.notes.append(f"sent off-device (masked): {masked_query.masked_text!r}")
+        request.notes.append(
+            "splitting the query: keeping the on-device answer and asking the "
+            "deep brain only about the gap"
+            + ("" if self.policy.send_partial_to_cloud else " (partial answer withheld)")
+        )
+        return masked_gap, compressed, vault
+
+    def _answer_hybrid_streaming(
+        self, request: _Request, difficulty: float, local: BrainResponse, gap: str
+    ):
+        """`_answer_hybrid`, but the cloud half is yielded as it generates.
+
+        A generator that yields `("delta", {...})` and **returns** the finished
+        `RouteDecision` (PEP 380), so `route_stream` gets both out of one
+        `yield from` without an out-parameter.
+
+        Identical masking to the blocking path -- literally the same
+        `_prepare_gap_escalation` call -- so the guarantee cannot differ between
+        the two. The only difference is that the deep brain is asked to stream.
+        """
+        masked_gap, compressed, vault = self._prepare_gap_escalation(request, local, gap)
+        local_answer = request.guard.rehydrate(local.text, request.local_vault)
+
+        # Announced *before* the call, not after: the point of showing what
+        # crossed is to show it while the user is waiting on the answer it
+        # bought, not as a footnote once the answer has arrived.
+        yield ("crossing", _crossing_payload(masked_gap.masked_text, compressed, vault))
+        self.tracer.call(
+            "deep brain", self.deep_brain, masked_gap.masked_text, compressed,
+            crossing=True, vault=vault,
+        )
+        start = time.perf_counter()
+        pieces: list[str] = []
+        for piece in self.deep_brain.answer_stream(masked_gap.masked_text, compressed):
+            pieces.append(piece)
+            # Rehydrated per-delta: the cloud answers in masked space, and a
+            # `[PII_EMAIL_1]` must never reach the screen. Safe piecewise
+            # because a placeholder is one token-ish run of text; the final
+            # `cloud_answer` below is rehydrated whole regardless, so a
+            # placeholder split across two deltas is corrected there.
+            yield ("delta", {"text": request.guard.rehydrate(piece, vault), "tier": "cloud"})
+        cloud_latency_ms = (time.perf_counter() - start) * 1000
+
+        response = BrainResponse(text="".join(pieces).strip(), latency_ms=cloud_latency_ms)
+        self.tracer.result(self.deep_brain, response)
+        self.tracer.rehydrated(vault)
+        cloud_answer = request.guard.rehydrate(response.text, vault)
+        return RouteDecision(
+            tier_answered="hybrid",
+            difficulty_score=difficulty,
+            est_latency_ms=local.latency_ms + cloud_latency_ms,
+            est_cost_usd=local.cost_usd + response.cost_usd,
+            pii_entities_detected=request.pii_detected,
+            pii_entities_masked=len(vault),
+            answer=f"{local_answer}\n\n{cloud_answer}",
+            notes=request.notes,
+            local_answer=local_answer,
+            cloud_answer=cloud_answer,
+            gap=request.guard.rehydrate(masked_gap.masked_text, vault),
+            crossed_to_cloud=_crossing_payload(masked_gap.masked_text, compressed, vault),
         )
 
     def _answer_hybrid(
@@ -682,55 +1150,64 @@ class TwoBrainRouter:
         wrong would leak PII that the original query masking would never have
         caught, because these strings did not exist when the query was read.
 
-        Ordering inside the context is load-bearing too:
-        `RoutePolicy.compress_context` keeps the *tail*, so the gap instruction
-        goes last and survives truncation. The partial answer is the part that
-        gets trimmed when there is too much, which is the right thing to lose --
-        it is an optimisation for answer quality, while the gap is the entire
-        reason this call is being made.
+        **The gap is the question asked, not a note attached to one.** The deep
+        brain's `query` argument is the masked *gap*; the original query, the
+        history and the partial answer are background in `context`. Getting this
+        backwards is not a stylistic difference -- it was a real, observed
+        failure. Sending the whole query as the ask and mentioning the gap in
+        the context got this, on a real Cirrascale call:
+
+            query : "My email is [PII_EMAIL_1] ... Draft a short reply about the
+                     backup breach, and give me the exact ISBN ..."
+            reply : "I cannot provide you with a reply that includes your
+                     personal information."
+
+        The deep brain answered the *whole* placeholder-laden request and
+        refused it on safety grounds, when the only thing actually needed from
+        it was "the exact ISBN of the 1813 first edition" -- entirely
+        innocuous. Asking the narrow question narrowly is also the behaviour
+        the split was specified to have: only what needs addressing goes in the
+        second call.
+
+        Ordering inside the context is still load-bearing, just inverted: the
+        gap no longer needs to survive truncation (it is the query now and
+        cannot be truncated at all), so `compress_context` keeping the *tail*
+        means the partial answer goes last -- the most useful background for
+        not repeating work -- and the conversation history is trimmed first.
         """
-        masked_query = request.mask_for_boundary(request.query)
-        masked_gap = request.mask_for_boundary(gap)
+        masked_gap, compressed, vault = self._prepare_gap_escalation(request, local, gap)
 
-        vault = dict(masked_query.vault)
-        vault.update(masked_gap.vault)
-
-        parts: list[str] = []
-        if request.context:
-            masked_context = request.mask_for_boundary(request.context)
-            vault.update(masked_context.vault)
-            parts.append(masked_context.masked_text)
-        if self.policy.send_partial_to_cloud:
-            masked_partial = request.mask_for_boundary(local.text)
-            vault.update(masked_partial.vault)
-            parts.append(
-                "A smaller on-device model has already answered part of this "
-                f"question: {masked_partial.masked_text}"
-            )
-        parts.append(f"Answer only the remaining part it could not: {masked_gap.masked_text}")
-
-        compressed, was_compressed = self.policy.compress_context("\n\n".join(parts))
-        if was_compressed:
-            request.notes.append(f"compressed the escalated gap context to {len(compressed)} chars")
-        if masked_query.vault:
-            request.notes.append(f"sent off-device (masked): {masked_query.masked_text!r}")
-        request.notes.append(
-            "splitting the query: keeping the on-device answer and asking the "
-            "deep brain only about the gap"
-            + ("" if self.policy.send_partial_to_cloud else " (partial answer withheld)")
+        # The local half is finished and rehydrated *before* the cloud call, not
+        # after, so it can be handed out now rather than in ~15s. Rehydrating
+        # here is safe and not merely convenient: this text came from a brain
+        # given `request.view`, so `request.view.vault` is the only vault that
+        # can apply to it, and that vault is complete already -- it does not
+        # depend on anything the deep brain will return.
+        local_answer = request.guard.rehydrate(local.text, request.local_vault)
+        self._emit_progress(
+            request,
+            RouteProgress(
+                phase="local_answer",
+                local_answer=local_answer,
+                gap=gap,
+                difficulty_score=difficulty,
+                local_latency_ms=local.latency_ms,
+                notes=list(request.notes),  # copy: `notes` keeps growing below
+            ),
         )
 
+        # The gap is the question. See the docstring for the real refusal this
+        # ordering fixes.
         response = self._ask(
-            self.deep_brain, "deep brain", masked_query.masked_text, compressed,
+            self.deep_brain, "deep brain", masked_gap.masked_text, compressed,
             crossing=True, vault=vault,
         )
         self.tracer.rehydrated(vault)
 
-        # Rehydrate only now, on-device, after the answer is back. The local
-        # half needs no rehydration at all when the brain was trusted -- it was
-        # never masked -- which the empty vault makes a no-op rather than a
-        # special case.
-        local_answer = request.guard.rehydrate(local.text, request.view.vault)
+        # Rehydrate the cloud half only now, on-device, after the answer is
+        # back. The local half needed no rehydration at all when the brain was
+        # trusted -- it was never masked -- which the empty vault makes a no-op
+        # rather than a special case.
         cloud_answer = request.guard.rehydrate(response.text, vault)
         return RouteDecision(
             tier_answered="hybrid",
@@ -740,12 +1217,13 @@ class TwoBrainRouter:
             est_latency_ms=local.latency_ms + response.latency_ms,
             est_cost_usd=local.cost_usd + response.cost_usd,
             pii_entities_detected=request.pii_detected,
-            pii_entities_masked=len(masked_query.vault),
+            pii_entities_masked=len(vault),
             answer=f"{local_answer}\n\n{cloud_answer}",
             notes=request.notes,
             local_answer=local_answer,
             cloud_answer=cloud_answer,
             gap=request.guard.rehydrate(masked_gap.masked_text, vault),
+            crossed_to_cloud=_crossing_payload(masked_gap.masked_text, compressed, vault),
         )
 
     def _escalate(
@@ -797,6 +1275,24 @@ class TwoBrainRouter:
         if masked_query.vault:
             request.notes.append(f"sent off-device (masked): {masked_query.masked_text!r}")
 
+        # No partial to hand out on this path -- that is the whole difference
+        # from `_answer_hybrid`. Emitted anyway so a UI can say *why* it is
+        # about to wait: "escalating, nothing usable locally" is a much better
+        # thing to show for 15s than an undifferentiated spinner. `local_answer`
+        # and `gap` are None rather than empty strings, so "no partial exists"
+        # is distinguishable from "the partial was blank".
+        self._emit_progress(
+            request,
+            RouteProgress(
+                phase="escalating",
+                local_answer=None,
+                gap=None,
+                difficulty_score=difficulty,
+                local_latency_ms=discarded.latency_ms if discarded is not None else 0.0,
+                notes=list(request.notes),
+            ),
+        )
+
         response = self._ask(
             self.deep_brain, "deep brain", masked_query.masked_text, compressed,
             crossing=True, vault=vault,
@@ -821,7 +1317,8 @@ class TwoBrainRouter:
             est_latency_ms=est_latency_ms,
             est_cost_usd=response.cost_usd,
             pii_entities_detected=request.pii_detected,
-            pii_entities_masked=len(masked_query.vault),
+            pii_entities_masked=len(vault),
             answer=request.guard.rehydrate(response.text, vault),
             notes=request.notes,
+            crossed_to_cloud=_crossing_payload(masked_query.masked_text, compressed, vault),
         )
