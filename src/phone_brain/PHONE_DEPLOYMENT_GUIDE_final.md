@@ -193,13 +193,53 @@ disk):
 | `llama-server` | `C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\llama-server` | Android arm64 OpenAI-compatible server binary — `ELF ... interpreter /system/bin/linker64` |
 | `llama-cli` | `C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\llama-cli` | Android arm64 CLI binary — same interpreter |
 | `libOpenCL.so` | `C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\libOpenCL.so` | ICD loader stub the phone's real Adreno driver resolves against at runtime |
+| `Llama-3.2-3B-Instruct-Q4_0.gguf` | `C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\Llama-3.2-3B-Instruct-Q4_0.gguf` | The model weights (1.92GB, from `unsloth/Llama-3.2-3B-Instruct-GGUF` on Hugging Face) |
 
 From WSL (e.g. to `adb push` them — `adb` itself runs from the Windows
 side, see below), the same files are at
 `/mnt/c/Users/qc_de/Two-Brain-LLM/.llama-cpp-opencl-android/`.
 
-Only rebuild from the recipe below if these files are gone or you need a
-different target (different API level, different quant kernel set, etc).
+**None of these four files are in git, and that's intentional, not an
+oversight** — the GGUF alone is 1.92GB, well past anything that belongs in
+a git history, and the compiled binaries follow the same "receipts not
+binaries" convention already established for `.llama-cpp-opencl/` (the
+AI-PC tier's equivalent). What *is* in git is this recipe: the exact
+Hugging Face repo/filename above, and the cross-compile steps below, so
+either can be reproduced from scratch on a machine that doesn't have them.
+If you're tunneled into this same box, you don't need to reproduce
+anything — the files are just sitting there.
+
+Only rebuild/re-download if these files are gone or you need a different
+target (different API level, different quant, etc).
+
+### How the pieces fit together
+
+Three different kinds of thing, easy to conflate:
+
+1. **`llama-server` is the inference *engine*** — a program, not a model.
+   By itself it does nothing; it needs a model file to load.
+2. **The GGUF is the *model* — pure data**, the actual 3.2 billion
+   weights, quantized to 4 bits each (that's what "Q4_0" means). It has no
+   code in it. You hand its path to `llama-server` via `-m <path>` at
+   startup, and that's the only place the two connect.
+3. **`libOpenCL.so` is a *bridge*, not compute itself.** It's a thin
+   loader stub — when `llama-server` wants to run matrix math on the GPU,
+   it calls into this `.so`, which forwards those calls to the *real*
+   OpenCL driver that Qualcomm ships inside the phone's own Android system
+   image (something like `/vendor/lib64/libOpenCL.so` — already on the
+   phone, part of the GPU vendor driver, not something we're pushing).
+   Without this loader stub in `LD_LIBRARY_PATH`/`OCL_ICD_FILENAMES`,
+   `llama-server` would still run, just fall back to CPU-only.
+
+So the full chain for one query: your request hits `llama-server` (started
+with `-m Llama-3.2-3B-Instruct-Q4_0.gguf -ngl 99`) → it reads the GGUF's
+weights into memory → for each layer, since `-ngl 99` says "offload all
+layers to GPU", it calls out through `libOpenCL.so` → that hands the actual
+matrix multiplication to the Adreno 830's real driver on-device → the
+result comes back through the same chain → `llama-server` streams the
+generated tokens back over HTTP. The binary and the `.so` only need
+building/pushing once; the GGUF is what actually determines which model
+you're running.
 
 ### The cross-compile problem, and how it was solved
 
@@ -260,11 +300,11 @@ adb push "C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\llama-server" /
 adb push "C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\libOpenCL.so"  /data/local/tmp/
 adb shell chmod +x /data/local/tmp/llama-server
 
-# Pull a Q4_0 GGUF of Llama-3.2-3B-Instruct onto the dev machine first --
-# Q4_0 specifically: Qualcomm's OpenCL backend (GGML_OPENCL_USE_ADRENO_KERNELS)
-# is tuned for Q4_0, and stock GGUF repos (e.g. Qwen's own) often only ship
-# Q4_K_M/Q8_0 -- an unsloth-style Q4_0 reupload may be needed.
-adb push Llama-3.2-3B-Instruct-Q4_0.gguf /data/local/tmp/
+# Already downloaded on this machine (unsloth/Llama-3.2-3B-Instruct-GGUF,
+# 1.92GB, Q4_0 specifically -- Qualcomm's OpenCL backend
+# (GGML_OPENCL_USE_ADRENO_KERNELS) is tuned for Q4_0, and stock GGUF repos
+# like Qwen's own often only ship Q4_K_M/Q8_0):
+adb push "C:\Users\qc_de\Two-Brain-LLM\.llama-cpp-opencl-android\Llama-3.2-3B-Instruct-Q4_0.gguf" /data/local/tmp/
 
 adb reverse tcp:8080 tcp:8080
 adb shell "cd /data/local/tmp && \
@@ -279,7 +319,8 @@ offloads all layers to the Adreno GPU via OpenCL. Smoke-test from the dev
 machine against `http://localhost:8000` the same way as the NPU path's
 Part 7, once `adb reverse` is set up.
 
-**Not yet done:** actually running this on the physical S25 Ultra (no
-device was connected when the binaries were built), and getting a Q4_0
-GGUF onto the phone. Both are the immediate next steps once hardware is
-available.
+**Not yet done:** actually running this on the physical S25 Ultra — no
+device was connected via `adb` when the binaries were built or the GGUF was
+downloaded. Everything needed (binaries + model) is staged and ready on
+this machine; the only remaining step is plugging in the phone and running
+the commands above.
