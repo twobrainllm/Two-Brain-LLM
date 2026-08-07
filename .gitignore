@@ -59,3 +59,9 @@ secrets.txt
 .llama-cpp-opencl/
 data/vlm_gpu_model/**/raw/
 data/vlm_gpu_model/**/*.gguf
+
+# llama-server's own log, captured at -v by run-server.ps1 (TWO_BRAIN_GPU_LOG).
+# It is how a real GPU load is told apart from a silent CPU fallback, so it is
+# worth keeping locally -- but it is a per-run artifact, rewritten on every
+# model switch, and tens of MB at that verbosity.
+llama-server.log
