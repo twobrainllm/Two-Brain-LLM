@@ -61,6 +61,19 @@ authorization prompt on the phone (it resets sometimes).
 ./export_phone_brain.sh genie_bundle_l_phone
 ```
 
+On Windows, use `export_phone_brain.ps1` instead — same export, plus
+preflight checks (Python/venv, `qai_hub_models` importable, AI Hub config,
+Hugging Face token) that fail fast with a specific fix rather than partway
+through the real compile job:
+
+```powershell
+.\export_phone_brain.ps1 -OutputDir genie_bundle_l_phone
+```
+
+If PowerShell refuses to run it, either unblock it for the session
+(`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`) or invoke it
+directly (`powershell -ExecutionPolicy Bypass -File .\export_phone_brain.ps1`).
+
 This submits a real compile job to Qualcomm's cloud — expect real
 wall-clock minutes, not instant. Output: a `genie_bundle_l_phone/`
 directory containing the QNN context binaries. This step does **not**
@@ -159,7 +172,7 @@ to fix it purely by rewording the prompt.
 - **Port already in use** — `adb reverse --remove tcp:8000` then redo Part 6.
 - **Hugging Face access still pending** — check email for the gated-repo approval; it isn't instant.
 - **Compile job stuck or slow** — check the AI Hub Workbench dashboard for job status rather than assuming it's hung.
-- **Server crashes or OOMs on the 3B model** — check `adb shell dumpsys meminfo`; consider lowering `CONTEXT_LEN` in `export_phone_brain.sh` and re-exporting.
+- **Server crashes or OOMs on the 3B model** — check `adb shell dumpsys meminfo`; consider lowering the context length and re-exporting: the `CONTEXT_LEN` env var on `export_phone_brain.sh`, or `-ContextLength` (falls back to the same `CONTEXT_LEN` env var if unset) on `export_phone_brain.ps1`.
 
 ## Known unknowns, stated plainly
 

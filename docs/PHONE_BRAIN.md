@@ -48,12 +48,18 @@ looks like for `phone_brain` to follow.
 
 ## The four pieces
 
-### 1. Export — `export_phone_brain.sh`
+### 1. Export — `export_phone_brain.sh` (`export_phone_brain.ps1` on Windows)
 
 One command: `./export_phone_brain.sh genie_bundle_l_phone`. Compiles
 Llama-3.2-3B-Instruct into QNN context binaries for
 `qualcomm-snapdragon-8-elite` at context length 2048 (overridable via
 `CONTEXT_LEN`, with a note to trim it under device memory pressure).
+
+`export_phone_brain.ps1` is the same export for a native-Windows dev
+machine, with one real addition rather than a plain port: preflight checks
+(Python/venv on PATH, `qai_hub_models` importable, AI Hub config present,
+Hugging Face token present) that fail fast with a specific fix, before the
+real cloud compile job starts, instead of partway through it.
 
 Prereqs are spelled out and are all real gates: an AI Hub account + API token,
 and HuggingFace access to `meta-llama/Llama-3.2-3B-Instruct` (gated weights).
@@ -242,6 +248,7 @@ src/two_brain_router/
 
 src/phone_brain/      # unchanged, still per-device tooling by nature
   export_phone_brain.sh
+  export_phone_brain.ps1  # same export, native Windows, + preflight checks
   mock_phone_brain_server.py
   bench_phone_brain.py            # renamed from test_phone_brain.py (see #5)
   verify_confidence_estimator.sh

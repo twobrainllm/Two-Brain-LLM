@@ -68,6 +68,14 @@ python -m qai_hub_models.models.llama_v3_2_3b_instruct.export --help
 ./export_phone_brain.sh genie_bundle_l_phone
 ```
 
+On Windows, `export_phone_brain.ps1` is the same export with added preflight
+checks (Python/venv, `qai_hub_models` importable, AI Hub config, HF token) run
+before the export starts, rather than failing partway through:
+
+```powershell
+.\export_phone_brain.ps1 -OutputDir genie_bundle_l_phone
+```
+
 This compiles Llama-3.2-3B-Instruct into QNN context binaries targeting
 `qualcomm-snapdragon-8-elite`, matching the S25's SoC.
 
