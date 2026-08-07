@@ -1,5 +1,10 @@
 # Deploying the Mobile-tier fast brain on the Adreno GPU (Android, S25 Ultra)
 
+**Repo checkout on the dev machine: `C:\Users\qc_de\Two-Brain-LLM`**
+(WSL path: `/mnt/c/Users/qc_de/Two-Brain-LLM`). Everything referenced below
+— this doc, the deployment guide, and the built artifacts — lives under
+that one directory. If you're tunneled into this machine, `cd` there first.
+
 Session date: 2026-08-07. Full build history and every dead end, so this
 doesn't get re-derived. Written as a handoff doc — if you're picking this up
 without the live chat, this plus `docs/PHONE_BRAIN.md` and

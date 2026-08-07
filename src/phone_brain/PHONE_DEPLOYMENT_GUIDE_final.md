@@ -4,6 +4,11 @@
 — not the mock. If you're building O and just need something to develop
 against today, you don't need this yet: see `DEPLOYMENT_GUIDE.md` instead.
 
+**Repo checkout on the dev machine: `C:\Users\qc_de\Two-Brain-LLM`**
+(WSL path: `/mnt/c/Users/qc_de/Two-Brain-LLM`) — this file and every path
+referenced below live under that directory. If accessing via tunnel, `cd`
+there first.
+
 ## What happens where
 
 | Step | Runs on | Needs the phone? |
