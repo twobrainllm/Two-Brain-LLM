@@ -34,11 +34,10 @@ Fill in — these are placeholders.
 
 | Name | Email | Area |
 |---|---|---|
-| _TBD_ | `tbd@example.com` | Orchestrator / routing |
-| _TBD_ | `tbd@example.com` | Mobile fast brain (`src/phone_brain/`) |
-| _TBD_ | `tbd@example.com` | AI PC fast brain (NPU / GPU) |
-| _TBD_ | `tbd@example.com` | Chat UI |
-| _TBD_ | `tbd@example.com` | Evaluation |
+| Jaisurya | `jaisuryasundar2001@gmail.com` |
+| Thrisha | `tbd@example.com` |
+| Nikhita Neelakanta | `nikhita.neelakanta@gmail.com` |
+| Visnu | `tbd@example.com` | 
 
 ---
 
