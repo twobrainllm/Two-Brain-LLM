@@ -106,6 +106,14 @@ def test_serve_binds_loopback_by_default(monkeypatch):
     from two_brain_router import api as api_module
 
     calls = []
-    monkeypatch.setattr(api_module, "serve", lambda tier, host, port: calls.append((tier, host, port)))
+    monkeypatch.setattr(
+        api_module, "serve", lambda tier, host, port, **kw: calls.append((tier, host, port, kw))
+    )
     api_module.main([])
-    assert calls == [("pc", "127.0.0.1", DEFAULT_PORT)]
+    # Trace defaults on for the server: a human watching this terminal is who
+    # it is for. `--no-trace` is the opt-out, checked below.
+    assert calls == [("pc", "127.0.0.1", DEFAULT_PORT, {"trace": True})]
+
+    calls.clear()
+    api_module.main(["--no-trace"])
+    assert calls == [("pc", "127.0.0.1", DEFAULT_PORT, {"trace": False})]

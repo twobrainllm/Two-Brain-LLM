@@ -13,13 +13,23 @@ from two_brain_router.signals.loader import (
     TierSignals,
     load_tool_response,
 )
+from two_brain_router.signals.structured import (
+    STRUCTURED_SUFFIX,
+    STRUCTURED_SYSTEM_PROMPT,
+    StructuredAnswer,
+    parse_structured,
+)
 
 __all__ = [
     "DifficultyEstimator",
     "HARD_QUERY_MARKERS",
     "SELF_REPORT_SUFFIX",
+    "STRUCTURED_SUFFIX",
+    "STRUCTURED_SYSTEM_PROMPT",
+    "StructuredAnswer",
     "confidence_to_difficulty",
     "parse_self_reported",
+    "parse_structured",
     "TierSignals",
     "load_tool_response",
     "DATA_DIR",

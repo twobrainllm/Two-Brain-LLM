@@ -1,36 +1,56 @@
-"""The Two-Brain router: mask, decide, answer, rehydrate.
+"""The Two-Brain router: detect, answer, mask at the boundary, rehydrate.
 
 The ordering here is the privacy guarantee, and it is deliberate:
 
-    1. mask the query                     <- before any routing decision is made
-    2. assert the masked-token invariant  <- fatal if raw PII survived
-    3. score difficulty / estimate latency
-    4. answer locally, or mask+compress context and escalate
-    5. rehydrate the answer               <- only after it is back on-device
+    1. detect PII in the query               <- for the audit trail, not a mask
+    2. answer on-device, with the raw query  <- the local model is inside the boundary
+    3. if anything must leave: mask it, and assert the masked-token invariant
+    4. only then call the deep brain
+    5. rehydrate the answer                  <- on-device, after it is back
 
-Only masked text ever reaches `CloudDeepBrain`. The vault never leaves this
-process.
+**Masking happens at the boundary, not at the front door.** An earlier version
+of this file masked the query before *anything* touched it, including the local
+model. That was the wrong place. The AI PC's fast brain executes on this
+machine -- `NpuFastBrain` in this very process through `ctypes`,
+`GpuLocalBrain` in a `llama-server` child bound to loopback -- so nothing it is
+given is transmitted anywhere, and masking it bought no privacy while
+measurably costing answer quality: a model asked to draft a reply to
+`[PII_EMAIL_1]` writes a worse reply than one that can see the address.
 
-Step 3 has two shapes, depending on what the tier's fast brain can tell us --
+So the boundary is where the mask goes, and `Brain.trusted_with_raw_pii` is
+what marks which side of it a brain sits on. Everything outside -- both cloud
+brains, and `PhoneFastBrain`, which runs on a physically separate device even
+though `adb reverse` makes the hop look like loopback -- still receives masked
+text and nothing else. That flag defaults to False wherever it is read, so a
+brain that forgets to declare it gets masked input rather than a leak.
+
+What this costs: the routing decision is now made on raw text. That is
+acceptable precisely because the thing making it is on-device -- the difficulty
+heuristic is a pure local function, and the confidence/gap signals come from the
+local model itself, which was already trusted with the query by the time it
+produced them.
+
+Step 2 has three shapes, depending on what the tier's fast brain can tell us --
 see `docs/ORCHESTRATOR.md`. When the brain self-rates
 (`Brain.reports_confidence`), its confidence *is* the difficulty signal and
 arrives attached to the answer, so the brain has to be asked before the
-decision instead of after it. Masking still happens first either way: step 1
-is ahead of step 3 in both shapes, which is the invariant that matters.
+decision instead of after it. When it also reports *gaps*
+(`Brain.reports_gaps`), the decision stops being "which brain answers this" and
+becomes "how is this query split between them": the local model's partial
+answer is kept and shown, and only the part it named as beyond it is masked and
+sent on.
 
-Step 4's "escalate" destination is no longer always the cloud. When a tier's
-fast brain isn't confident and a second, better *local* opinion is
-configured (`self.escalation_brain` -- currently: mobile's `PhoneFastBrain`
-escalating to the AI PC's own `NpuFastBrain`), that's asked directly instead
-of falling back to a keyword/length heuristic or paying cloud cost/egress for
-a query a local model could plausibly still answer. Still `tier_answered =
-"local"`: nothing about this crosses the boundary `CloudDeepBrain` represents.
-`self.deep_brain` remains the fallback whenever no escalation brain is
-configured -- unset by default, same opt-in posture as every real brain here.
+Step 3's destination is not always the cloud. When a tier's fast brain isn't
+confident and a second, better *local* opinion is configured
+(`self.escalation_brain` -- currently: mobile's `PhoneFastBrain` escalating to
+the AI PC's own real brain), that is asked directly instead. Still
+`tier_answered = "local"`: nothing about it crosses the boundary
+`CloudDeepBrain` represents, so nothing about it needs masking either.
 """
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -48,6 +68,7 @@ from two_brain_router.routing.brains import (
 from two_brain_router.routing.policy import RouteDecision, RoutePolicy
 from two_brain_router.signals import DifficultyEstimator, TierSignals
 from two_brain_router.signals.confidence import confidence_to_difficulty
+from two_brain_router.trace import Tracer, trace_enabled
 
 Tier = Literal["mobile", "pc"]
 
@@ -82,10 +103,81 @@ _PHONE_ALLOW_REMOTE_ENV_VAR = "TWO_BRAIN_PHONE_ALLOW_REMOTE"
 #: The confidence path has to evaluate those two at *different moments* -- the
 #: budget before spending an inference, the difficulty only after the brain has
 #: answered -- so each call passes a neutral value for the term it is not
-#: asking about. Doing it this way keeps `policy.py` pure and unmodified, which
+#: asking about. Doing it this way keeps `policy.py` pure, which
 #: WALKTHROUGH next-step #4 asked for explicitly.
 _NO_DIFFICULTY_SIGNAL_YET = 0.0
 _BUDGET_ALREADY_CHECKED = 0.0
+
+
+def _trusted_with_raw_pii(brain: object) -> bool:
+    """Whether `brain` may be handed the query as the user typed it.
+
+    `getattr` with a False default rather than a bare attribute read, so the
+    unsafe direction is never the accidental one: a brain that predates this
+    flag, or forgets to declare it, gets masked input. Opting in wrongly would
+    leak; opting out wrongly only costs answer quality.
+    """
+    return getattr(brain, "trusted_with_raw_pii", False)
+
+
+@dataclass
+class _LocalView:
+    """What a local brain is given, and how to read its answer back.
+
+    Two cases, and the vault is what distinguishes them:
+
+    - **Trusted brain** -- `text` is the raw query and `vault` is empty, so the
+      rehydrate on the way out is a no-op. Nothing was masked because nothing
+      needed to be.
+    - **Untrusted brain** (`PhoneFastBrain`) -- `text` is masked and `vault`
+      holds the placeholders, so its answer comes back in masked space and has
+      to be rehydrated before the user sees it.
+
+    Carrying both together means the callers below never have to ask which case
+    they are in; they just rehydrate with whatever vault they were given.
+    """
+
+    text: str
+    vault: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class _Request:
+    """One in-flight `route()` call.
+
+    A single object rather than eight positional parameters threaded through
+    six methods -- which is how a real bug got in once before, when a new
+    optional `image` argument silently bound to a different parameter at a call
+    site that passed positionally.
+
+    `query` is the **raw** text throughout. Anything crossing the boundary is
+    masked from it at the point of crossing, never carried around pre-masked,
+    so there is exactly one kind of string in this object and no chance of
+    sending the wrong one.
+    """
+
+    guard: PIIGuard
+    query: str
+    context: str
+    notes: list[str]
+    #: How many PII entities the query contained, whether or not any were
+    #: masked. Always recorded; masking is a separate event.
+    pii_detected: int
+    #: What the *fast* brain sees. Not used for anything that leaves.
+    view: _LocalView
+    image: Path | None = None
+
+    def mask_for_boundary(self, text: str) -> MaskResult:
+        """Mask `text` and assert the invariant, immediately before it leaves.
+
+        Every path to `deep_brain.answer` goes through this. Keeping it a named
+        method rather than two inline lines is what makes the guarantee
+        greppable: if a mask/assert pair is missing somewhere, the absence of
+        this call is what shows it.
+        """
+        result = self.guard.mask(text)
+        assert_masked_token_invariant(text, result)
+        return result
 
 
 def _build_fast_brain(tier: Tier, signals: TierSignals) -> Brain:
@@ -163,10 +255,18 @@ class TwoBrainRouter:
     the device boundary.
     """
 
-    def __init__(self, tier: Tier, policy: RoutePolicy | None = None) -> None:
+    def __init__(
+        self, tier: Tier, policy: RoutePolicy | None = None, trace: bool | Tracer | None = None
+    ) -> None:
         hw_file, tier_name = _TIER_FILES[tier]
         self.tier = tier
         self.policy = policy or RoutePolicy()
+        # None -> read TWO_BRAIN_TRACE, defaulting off, so importing this class
+        # as a library stays silent and the test suite is unaffected. `cli.py`
+        # and `api.py` pass True: a human watching a terminal is who it's for.
+        self.tracer = trace if isinstance(trace, Tracer) else Tracer(
+            enabled=trace_enabled() if trace is None else bool(trace)
+        )
         self.local = TierSignals.load(tier_name, hw_file)
         self.cloud = TierSignals.load("cloud_large", "cloud_ai100")
         self.difficulty = DifficultyEstimator()
@@ -186,65 +286,144 @@ class TwoBrainRouter:
             if callable(close):
                 close()
 
+    def _local_view(self, guard: PIIGuard, brain: object, query: str, notes: list[str]) -> _LocalView:
+        """Decide what `brain` is allowed to see, and say so in the audit trail.
+
+        The one place `trusted_with_raw_pii` is consulted. Both outcomes are
+        noted explicitly -- "the raw query stayed on-device" is as much a
+        privacy claim as "it was masked", and a reader should not have to infer
+        which happened from the absence of a note.
+        """
+        if _trusted_with_raw_pii(brain):
+            if self._n(query, guard):
+                notes.append(
+                    f"{type(brain).__name__} runs on this device, so it gets the "
+                    f"query unmasked -- nothing is transmitted"
+                )
+            return _LocalView(text=query)
+        masked = guard.mask(query)
+        assert_masked_token_invariant(query, masked)
+        if masked.vault:
+            notes.append(
+                f"masked {len(masked.vault)} PII "
+                f"entit{'y' if len(masked.vault) == 1 else 'ies'} before calling "
+                f"{type(brain).__name__}, which is not on this device"
+            )
+        return _LocalView(text=masked.masked_text, vault=masked.vault)
+
+    @staticmethod
+    def _n(query: str, guard: PIIGuard) -> int:
+        return len(guard.detect(query))
+
+    def _ask(
+        self,
+        brain,
+        role: str,
+        text: str,
+        context: str = "",
+        image: Path | None = None,
+        crossing: bool = False,
+        vault: dict[str, str] | None = None,
+    ) -> BrainResponse:
+        """Call a brain, tracing what went in and what came back.
+
+        Every `answer()` call in this class goes through here, which is the
+        point: a new branch that calls a brain directly would silently drop out
+        of the trace, and the trace is how anyone verifies the privacy claim.
+        `crossing=True` marks the calls that leave the device -- the trace
+        banners off that flag rather than guessing from the brain's type.
+        """
+        self.tracer.call(role, brain, text, context, crossing=crossing, vault=vault)
+        if image is not None:
+            response = brain.answer(text, context, image=image)
+        else:
+            response = brain.answer(text, context)
+        self.tracer.result(brain, response, vault=None if crossing else vault)
+        return response
+
     def route(self, query: str, context: str = "", image: Path | None = None) -> RouteDecision:
+        """Route one query. The real work is `_route`; this traces the outcome.
+
+        Split so that *every* return path is traced, including ones added
+        later -- `_route` has four `return RouteDecision(...)` sites and a fifth
+        would otherwise be silently untraced.
+        """
+        decision = self._route(query, context, image)
+        self.tracer.decision(decision)
+        return decision
+
+    def _route(self, query: str, context: str = "", image: Path | None = None) -> RouteDecision:
         notes: list[str] = []
         guard = PIIGuard()
 
-        # 1-2. Mask before anything else, and refuse to continue if the mask leaked.
-        masked_query_result = guard.mask(query)
-        assert_masked_token_invariant(query, masked_query_result)
-        n_entities = len(masked_query_result.vault)
-        if n_entities:
+        # 1. Detect, do not mask. What the query contained is recorded from the
+        #    start; whether any of it gets masked depends on where it goes.
+        detected = guard.detect(query)
+        self.tracer.request(self.tier, query, context, image, detected)
+        n_detected = len(detected)
+        if n_detected:
             notes.append(
-                f"masked {n_entities} PII "
-                f"entit{'y' if n_entities == 1 else 'ies'} before any routing decision"
+                f"detected {n_detected} PII "
+                f"entit{'y' if n_detected == 1 else 'ies'} in the query"
             )
 
+        if image is not None and not getattr(self.fast_brain, "can_see", False):
+            raise ValueError(
+                "an image was supplied but the fast brain cannot see -- "
+                "enable TWO_BRAIN_GPU_BRAIN=1 and build it with "
+                "GpuLocalBrain.for_vision()"
+            )
         if image is not None:
-            if not getattr(self.fast_brain, "can_see", False):
-                raise ValueError(
-                    "an image was supplied but the fast brain cannot see -- "
-                    "enable TWO_BRAIN_GPU_BRAIN=1 and build it with "
-                    "GpuLocalBrain.for_vision()"
-                )
             notes.append("image stays on-device: the cloud tier has no VLM")
 
-        # 3. Decide.
+        request = _Request(
+            guard=guard,
+            query=query,
+            context=context,
+            notes=notes,
+            pii_detected=n_detected,
+            view=self._local_view(guard, self.fast_brain, query, notes),
+            image=image,
+        )
+
+        # 2. Decide.
         local_latency_est = self.policy.estimate_local_latency_ms(self.local.profile, query)
 
-        if self.fast_brain.reports_confidence:
-            return self._route_on_confidence(
-                guard, masked_query_result, query, context, local_latency_est, notes
-            )
+        # An image-bearing query always takes the heuristic path below, even
+        # when the fast brain self-rates. That is not a limitation of Shape B/C
+        # so much as the fact that neither shape has anywhere to *put* an image:
+        # both call `answer(text)` with no image argument, so routing an image
+        # through them would silently drop it -- a latent bug that only became
+        # reachable when `GpuLocalBrain` (the one vision-capable brain here)
+        # started self-rating. The heuristic path handles images correctly
+        # today, so image behaviour is unchanged. Extending Shape C to images is
+        # the deliberate next step, not an oversight.
+        if image is None:
+            if getattr(self.fast_brain, "reports_gaps", False):
+                return self._route_on_structured_answer(request, local_latency_est)
+            if self.fast_brain.reports_confidence:
+                return self._route_on_confidence(request, local_latency_est)
 
         difficulty = self.difficulty.score(query)
         if self.policy.should_escalate(difficulty, local_latency_est):
             notes.append(self.policy.escalation_note(difficulty, local_latency_est))
-            return self._escalate(guard, masked_query_result, context, difficulty, notes, image=image)
+            return self._escalate(request, difficulty)
 
         notes.append(self.policy.local_note(difficulty, local_latency_est))
-        return self._answer_locally(guard, masked_query_result, difficulty, notes, image=image)
+        return self._answer_locally(request, difficulty)
 
-    def _route_on_confidence(
-        self,
-        guard: PIIGuard,
-        masked_query: MaskResult,
-        query: str,
-        context: str,
-        local_latency_est: float,
-        notes: list[str],
-    ) -> RouteDecision:
+    def _route_on_confidence(self, request: _Request, local_latency_est: float) -> RouteDecision:
         """Ask the fast brain first, then route on the confidence it returns.
 
-        Used when the tier's brain self-rates. The answer and the confidence
-        arrive together (one inference, not two -- see
-        `signals/confidence.py`), which means the brain is asked *before* the
-        local-vs-cloud decision and its answer is discarded if the decision
-        goes elsewhere. That cost is the accepted trade for a real signal
-        instead of a keyword heuristic -- and it is now paid twice on the
-        "not confident" path when an escalation brain is configured (see
-        `_route_away_from_fast_brain`): two real local inferences on one
-        query, deliberately not optimized for latency.
+        Used when the tier's brain self-rates but cannot name gaps -- today
+        that is `PhoneFastBrain` alone. The answer and the confidence arrive
+        together (one inference, not two -- see `signals/confidence.py`), which
+        means the brain is asked *before* the local-vs-cloud decision and its
+        answer is discarded if the decision goes elsewhere. That cost is the
+        accepted trade for a real signal instead of a keyword heuristic -- and
+        it is paid twice on the "not confident" path when an escalation brain
+        is configured (see `_route_away_from_fast_brain`): two real local
+        inferences on one query, deliberately not optimized for latency.
 
         Two details that are easy to get wrong, both load-bearing:
 
@@ -254,65 +433,150 @@ class TwoBrainRouter:
           harmful: escalating at that point adds the next brain's latency on
           top of the local time already spent, so it can only make the total
           worse.
-        - **Masking still happens first.** This runs after step 1-2 in
-          `route()`, so every brain downstream -- the mobile tier's fast
-          brain over HTTP, and now potentially the AI PC's escalation brain
-          too -- only ever sees masked text.
+        - **This brain is off-device, so it was given masked text.**
+          `request.view` was built with `trusted_with_raw_pii = False` for
+          `PhoneFastBrain`, so its answer comes back in masked space and
+          `_answer_locally` rehydrates it.
         """
         if self.policy.should_escalate(_NO_DIFFICULTY_SIGNAL_YET, local_latency_est):
             difficulty = 1.0  # no signal was even attempted -- not a heuristic score
-            notes.append(
+            request.notes.append(
                 f"skipped the fast brain: its profiled latency estimate "
                 f"({local_latency_est:.0f}ms) already exceeds the "
                 f"{self.policy.local_latency_budget_ms:.0f}ms budget, so a local "
                 f"answer would have been discarded anyway"
             )
-            notes.append(self.policy.escalation_note(difficulty, local_latency_est))
-            return self._route_away_from_fast_brain(guard, masked_query, context, difficulty, notes)
+            request.notes.append(self.policy.escalation_note(difficulty, local_latency_est))
+            return self._route_away_from_fast_brain(request, difficulty)
 
-        local = self.fast_brain.answer(masked_query.masked_text)
-        if local.error:
-            notes.append(f"fast brain reported a problem: {local.error}")
-
-        if local.confidence is None:
-            # No keyword/length heuristic fallback here on purpose -- a
-            # brain that didn't report a number gets treated as maximally
-            # uncertain (difficulty 1.0), not scored by a different signal
-            # entirely. See docs/ORCHESTRATOR.md.
-            difficulty = 1.0
-            notes.append("fast brain returned no usable confidence signal")
-        else:
-            difficulty = confidence_to_difficulty(local.confidence)
-            notes.append(
-                f"fast brain self-reported confidence={local.confidence:.2f} "
-                f"-> difficulty={difficulty:.2f}"
-            )
+        local = self._ask(self.fast_brain, "fast brain", request.view.text, vault=request.view.vault)
+        difficulty = self._difficulty_from(local, request.notes)
 
         if self.policy.should_escalate(difficulty, _BUDGET_ALREADY_CHECKED):
             # Not `policy.escalation_note`: that one describes both terms of the
             # OR, and quoting a latency-vs-budget comparison here would be
             # misleading -- the budget was settled before the call and cannot be
             # what fired.
-            notes.append(
+            request.notes.append(
                 f"escalating: difficulty={difficulty:.2f} >= threshold "
                 f"{self.policy.escalate_threshold} "
                 f"(the local answer took {local.latency_ms:.0f}ms and was not used)"
             )
-            return self._route_away_from_fast_brain(
-                guard, masked_query, context, difficulty, notes, discarded=local
+            return self._route_away_from_fast_brain(request, difficulty, discarded=local)
+
+        request.notes.append(self.policy.local_note(difficulty, local.latency_ms))
+        return self._answer_locally(request, difficulty, response=local)
+
+    def _route_on_structured_answer(self, request: _Request, local_latency_est: float) -> RouteDecision:
+        """Shape C: ask the local brain to solve what it can and name what it
+        can't, then mask and send only what it named.
+
+        The difference from `_route_on_confidence` is what happens on a "not
+        confident" verdict. There, the local answer is *discarded* and some
+        other brain redoes the whole query. Here it is kept and shown, and the
+        deep brain is asked a narrower question -- the one the local model
+        wrote out itself.
+
+        Both brains that take this path are on-device, so the model that
+        produced the `solution` and the `unknown` saw the raw query. That makes
+        `_answer_hybrid`'s masking of those two strings the load-bearing step in
+        the whole feature: they are the only things here that cross, and they
+        are raw until it masks them.
+
+        Three outcomes:
+
+        - **local** -- confident, and no gap named. Nothing is masked because
+          nothing leaves.
+        - **hybrid** -- there is something to hand on *and* a usable partial
+          answer to keep.
+        - **cloud** -- there is something to hand on but no usable partial (the
+          brain errored, or returned an empty solution). Splitting requires two
+          halves; with one, this is an ordinary escalation and is reported as
+          one.
+        """
+        # Shape B's budget pre-check is deliberately *not* reused here, and the
+        # reason is the premise it rests on: "a local answer would have been
+        # discarded anyway". In Shape C it would not be -- a usable local answer
+        # is always kept and shown. Reusing the 3000ms budget measurably broke
+        # this feature on real hardware: two of the four demo queries skipped
+        # the fast brain entirely, including the PII one, which the local model
+        # then turned out to answer fully on-device. So the ceiling here is
+        # `local_partial_budget_ms`, a runaway guard rather than a preference.
+        if local_latency_est > self.policy.local_partial_budget_ms:
+            difficulty = 1.0  # no signal was even attempted -- not a heuristic score
+            request.notes.append(
+                f"skipped the fast brain: its profiled latency estimate "
+                f"({local_latency_est:.0f}ms) exceeds even the "
+                f"{self.policy.local_partial_budget_ms:.0f}ms ceiling for keeping a "
+                f"partial answer"
+            )
+            request.notes.append(self.policy.escalation_note(difficulty, local_latency_est))
+            return self._route_away_from_fast_brain(request, difficulty)
+
+        if local_latency_est > self.policy.local_latency_budget_ms:
+            # Worth saying out loud rather than passing silently: this query is
+            # over the budget that Shape B would have escalated on, and is being
+            # answered locally anyway because the answer will be kept.
+            request.notes.append(
+                f"over the {self.policy.local_latency_budget_ms:.0f}ms fast-path budget "
+                f"(estimate {local_latency_est:.0f}ms) but asking the fast brain anyway -- "
+                f"in a split, its answer is kept rather than discarded"
             )
 
-        notes.append(self.policy.local_note(difficulty, local.latency_ms))
-        return self._answer_locally(guard, masked_query, difficulty, notes, response=local)
+        local = self._ask(self.fast_brain, "fast brain", request.view.text, vault=request.view.vault)
+        difficulty = self._difficulty_from(local, request.notes)
+
+        gap = local.unknown.strip()
+        if gap:
+            request.notes.append(f"fast brain named what it could not answer: {gap!r}")
+        if local.model_masked_output:
+            # Recorded, never acted on. See signals/structured.py -- masking is
+            # this router's job and happens at the boundary, so a model that was
+            # handed the raw text is the last thing that should be deciding what
+            # a masked version of it looks like.
+            request.notes.append(
+                "ignored the model's own masked_output field: masking happens at "
+                "the cloud boundary, not by delegation to the model"
+            )
+
+        if not self.policy.needs_gap_fill(difficulty, gap):
+            request.notes.append(self.policy.local_note(difficulty, local.latency_ms))
+            return self._answer_locally(request, difficulty, response=local)
+
+        if not local.text.strip():
+            request.notes.append(
+                "no usable partial answer to keep -- escalating the whole query "
+                "rather than reporting a split that only has one half"
+            )
+            return self._route_away_from_fast_brain(request, difficulty, discarded=local)
+
+        return self._answer_hybrid(request, difficulty, local, gap)
+
+    @staticmethod
+    def _difficulty_from(local: BrainResponse, notes: list[str]) -> float:
+        """Turn a self-rating brain's response into a difficulty, with notes.
+
+        Shared by Shapes B and C so the two cannot drift on the one rule that
+        matters most here: **an unparseable confidence is `1.0`, not a fall-back
+        to a different signal.** A brain that formats badly is not the same
+        claim as "the surface features say this is hard"; conflating them would
+        score the same query two different ways depending on an unrelated
+        formatting accident. See docs/ORCHESTRATOR.md.
+        """
+        if local.error:
+            notes.append(f"fast brain reported a problem: {local.error}")
+        if local.confidence is None:
+            notes.append("fast brain returned no usable confidence signal")
+            return 1.0
+        difficulty = confidence_to_difficulty(local.confidence)
+        notes.append(
+            f"fast brain self-reported confidence={local.confidence:.2f} "
+            f"-> difficulty={difficulty:.2f}"
+        )
+        return difficulty
 
     def _route_away_from_fast_brain(
-        self,
-        guard: PIIGuard,
-        masked_query: MaskResult,
-        context: str,
-        difficulty: float,
-        notes: list[str],
-        discarded: BrainResponse | None = None,
+        self, request: _Request, difficulty: float, discarded: BrainResponse | None = None
     ) -> RouteDecision:
         """Where a "not confident" verdict actually goes.
 
@@ -324,40 +588,40 @@ class TwoBrainRouter:
         `routing/policy.py` needed no edits for this.
         """
         if self.escalation_brain is not None:
-            return self._answer_via_escalation_brain(guard, masked_query, difficulty, notes, discarded)
-        return self._escalate(guard, masked_query, context, difficulty, notes, discarded=discarded)
+            return self._answer_via_escalation_brain(request, difficulty, discarded)
+        return self._escalate(request, difficulty, discarded=discarded)
 
     def _answer_via_escalation_brain(
-        self,
-        guard: PIIGuard,
-        masked_query: MaskResult,
-        difficulty: float,
-        notes: list[str],
-        discarded: BrainResponse | None,
+        self, request: _Request, difficulty: float, discarded: BrainResponse | None
     ) -> RouteDecision:
         """A second opinion from `self.escalation_brain` (the AI PC's real
         model) instead of the cloud.
 
-        Still `tier_answered="local"`: `NpuFastBrain` runs in-process on
-        this machine (docs/npu-deployment.md), so nothing here crosses the
-        boundary `CloudDeepBrain` represents -- the privacy invariant this
-        project is built around is specifically about *that* boundary, and
-        this path never reaches it. `discarded` is `None` when the fast
-        brain was never even called (the budget pre-check fired); otherwise
-        it is billed into the reported latency, same accounting `_escalate`
-        already does for a discarded local answer.
+        Still `tier_answered="local"`: the escalation brain runs on this
+        machine (docs/npu-deployment.md), so nothing here crosses the boundary
+        `CloudDeepBrain` represents -- the privacy invariant this project is
+        built around is specifically about *that* boundary, and this path never
+        reaches it. Which also means this brain gets its own `_local_view`
+        rather than inheriting the phone's: the AI PC is trusted with the raw
+        query even though the phone that just failed on it was not.
+
+        `discarded` is `None` when the fast brain was never even called (the
+        budget pre-check fired); otherwise it is billed into the reported
+        latency, same accounting `_escalate` already does for a discarded local
+        answer.
         """
-        notes.append(
+        request.notes.append(
             "not confident enough -- getting a second opinion from the AI PC's "
-            "NpuFastBrain instead of falling back to a heuristic or escalating "
+            "own model instead of falling back to a heuristic or escalating "
             "to the cloud"
         )
-        response = self.escalation_brain.answer(masked_query.masked_text)
+        view = self._local_view(request.guard, self.escalation_brain, request.query, request.notes)
+        response = self._ask(self.escalation_brain, "escalation brain", view.text, vault=view.vault)
 
         est_latency_ms = response.latency_ms
         if discarded is not None:
             est_latency_ms += discarded.latency_ms
-            notes.append(
+            request.notes.append(
                 f"AI PC answered in {response.latency_ms:.0f}ms; reported latency "
                 f"also includes the phone's discarded {discarded.latency_ms:.0f}ms"
             )
@@ -367,102 +631,177 @@ class TwoBrainRouter:
             difficulty_score=difficulty,
             est_latency_ms=est_latency_ms,
             est_cost_usd=response.cost_usd,
-            pii_entities_masked=len(masked_query.vault),
-            answer=guard.rehydrate(response.text, masked_query.vault),
-            notes=notes,
+            pii_entities_detected=request.pii_detected,
+            pii_entities_masked=len(view.vault),
+            answer=request.guard.rehydrate(response.text, view.vault),
+            notes=request.notes,
         )
 
     def _answer_locally(
-        self,
-        guard: PIIGuard,
-        masked_query: MaskResult,
-        difficulty: float,
-        notes: list[str],
-        response: BrainResponse | None = None,
-        image: Path | None = None,
+        self, request: _Request, difficulty: float, response: BrainResponse | None = None
     ) -> RouteDecision:
-        # `response` is already populated on the confidence path -- reusing it
-        # is what keeps that path to a single inference call. `image` is only
-        # ever passed on the non-confidence path (see route()): no self-rating
-        # brain can see (PhoneFastBrain/NpuFastBrain aren't vision-capable;
-        # GpuLocalBrain, the only one that is, has reports_confidence=False),
-        # so the two parameters never need to combine in practice.
+        # `response` is already populated on the confidence/structured paths --
+        # reusing it is what keeps those to a single inference call. An image is
+        # only ever present on the heuristic path (see route()), where no
+        # response has been produced yet.
         if response is None:
-            if image is not None:
+            if request.image is not None:
                 # The image never left the device, so the local VLM sees it directly.
-                response = self.fast_brain.answer(masked_query.masked_text, image=image)
+                response = self._ask(
+                    self.fast_brain, "fast brain", request.view.text,
+                    image=request.image, vault=request.view.vault,
+                )
             else:
-                response = self.fast_brain.answer(masked_query.masked_text)
+                response = self._ask(
+                    self.fast_brain, "fast brain", request.view.text, vault=request.view.vault
+                )
+        # Rehydration is a no-op for a trusted brain (empty vault): its answer
+        # is already in raw space because its input was.
         return RouteDecision(
             tier_answered="local",
             difficulty_score=difficulty,
             est_latency_ms=response.latency_ms,
             est_cost_usd=response.cost_usd,
+            pii_entities_detected=request.pii_detected,
+            pii_entities_masked=len(request.view.vault),
+            answer=request.guard.rehydrate(response.text, request.view.vault),
+            notes=request.notes,
+        )
+
+    def _answer_hybrid(
+        self, request: _Request, difficulty: float, local: BrainResponse, gap: str
+    ) -> RouteDecision:
+        """Keep the local partial answer, and send the deep brain only the gap.
+
+        The masking here is the part worth reading closely, and it is the whole
+        privacy story of Shape C. `gap` and `local.text` were produced by a
+        model that was handed the **raw** query, so they can contain the user's
+        real email address verbatim -- not a placeholder. They are the only
+        strings on this path that cross the boundary besides the query itself,
+        and they are raw right up until `mask_for_boundary` here. Getting this
+        wrong would leak PII that the original query masking would never have
+        caught, because these strings did not exist when the query was read.
+
+        Ordering inside the context is load-bearing too:
+        `RoutePolicy.compress_context` keeps the *tail*, so the gap instruction
+        goes last and survives truncation. The partial answer is the part that
+        gets trimmed when there is too much, which is the right thing to lose --
+        it is an optimisation for answer quality, while the gap is the entire
+        reason this call is being made.
+        """
+        masked_query = request.mask_for_boundary(request.query)
+        masked_gap = request.mask_for_boundary(gap)
+
+        vault = dict(masked_query.vault)
+        vault.update(masked_gap.vault)
+
+        parts: list[str] = []
+        if request.context:
+            masked_context = request.mask_for_boundary(request.context)
+            vault.update(masked_context.vault)
+            parts.append(masked_context.masked_text)
+        if self.policy.send_partial_to_cloud:
+            masked_partial = request.mask_for_boundary(local.text)
+            vault.update(masked_partial.vault)
+            parts.append(
+                "A smaller on-device model has already answered part of this "
+                f"question: {masked_partial.masked_text}"
+            )
+        parts.append(f"Answer only the remaining part it could not: {masked_gap.masked_text}")
+
+        compressed, was_compressed = self.policy.compress_context("\n\n".join(parts))
+        if was_compressed:
+            request.notes.append(f"compressed the escalated gap context to {len(compressed)} chars")
+        if masked_query.vault:
+            request.notes.append(f"sent off-device (masked): {masked_query.masked_text!r}")
+        request.notes.append(
+            "splitting the query: keeping the on-device answer and asking the "
+            "deep brain only about the gap"
+            + ("" if self.policy.send_partial_to_cloud else " (partial answer withheld)")
+        )
+
+        response = self._ask(
+            self.deep_brain, "deep brain", masked_query.masked_text, compressed,
+            crossing=True, vault=vault,
+        )
+        self.tracer.rehydrated(vault)
+
+        # Rehydrate only now, on-device, after the answer is back. The local
+        # half needs no rehydration at all when the brain was trusted -- it was
+        # never masked -- which the empty vault makes a no-op rather than a
+        # special case.
+        local_answer = request.guard.rehydrate(local.text, request.view.vault)
+        cloud_answer = request.guard.rehydrate(response.text, vault)
+        return RouteDecision(
+            tier_answered="hybrid",
+            difficulty_score=difficulty,
+            # Both calls really happened and the user waited for both, so both
+            # are billed -- same accounting as a discarded local answer.
+            est_latency_ms=local.latency_ms + response.latency_ms,
+            est_cost_usd=local.cost_usd + response.cost_usd,
+            pii_entities_detected=request.pii_detected,
             pii_entities_masked=len(masked_query.vault),
-            answer=guard.rehydrate(response.text, masked_query.vault),
-            notes=notes,
+            answer=f"{local_answer}\n\n{cloud_answer}",
+            notes=request.notes,
+            local_answer=local_answer,
+            cloud_answer=cloud_answer,
+            gap=request.guard.rehydrate(masked_gap.masked_text, vault),
         )
 
     def _escalate(
-        self,
-        guard: PIIGuard,
-        masked_query: MaskResult,
-        context: str,
-        difficulty: float,
-        notes: list[str],
-        discarded: BrainResponse | None = None,
-        image: Path | None = None,
+        self, request: _Request, difficulty: float, discarded: BrainResponse | None = None
     ) -> RouteDecision:
+        # 3. The boundary. Everything below is masked from the raw query at the
+        # point of crossing, rather than having been masked on the way in.
+        masked_query = request.mask_for_boundary(request.query)
+        vault = dict(masked_query.vault)
+        context = request.context
+
         # 3b. An image cannot cross the boundary -- the deep brain is a text-only
         # LLM with no vision support at all. So the local VLM converts it to
         # words here, on-device, and only those words are eligible to leave.
         # The description is steered by the query: a physics diagram needs the
         # mechanical arrangement, "what is this?" needs identification.
-        description_vault: dict[str, str] = {}
-        if image is not None:
-            described = self.fast_brain.describe_image(image, masked_query.masked_text)
+        if request.image is not None:
+            described = self.fast_brain.describe_image(request.image, request.view.text)
             # The description is newly generated text that has never been
             # masked. It can easily contain PII the query did not -- a name on
             # a document, an address on a sign, a face described in words -- so
             # it is masked exactly like any other text before it can escalate,
             # and the invariant is asserted on it too.
-            masked_description = guard.mask(described.text)
-            assert_masked_token_invariant(described.text, masked_description)
-            # Without this, description_vault stays {} and its entities are
-            # never rehydrated below -- a real bug found while merging this:
-            # the placeholder would reach the user as a literal [PII_*_N]
-            # token instead of resolving. Not a privacy leak (the opposite
-            # direction would be), but a real correctness bug.
-            description_vault = masked_description.vault
-            context = f"{context}\n\n{masked_description.masked_text}".strip() if context else masked_description.masked_text
-            notes.append(
+            masked_description = request.mask_for_boundary(described.text)
+            vault.update(masked_description.vault)
+            context = (
+                f"{context}\n\n{masked_description.masked_text}".strip()
+                if context
+                else masked_description.masked_text
+            )
+            request.notes.append(
                 f"image described on-device into {len(masked_description.masked_text)} chars; "
                 f"masked {len(masked_description.vault)} PII entit"
                 f"{'y' if len(masked_description.vault) == 1 else 'ies'} in the description"
             )
+            # Already masked above; re-masking placeholders is a no-op, and
+            # skipping it here keeps a single masked string rather than two.
+            masked_context = MaskResult(masked_text=context, vault={})
+        else:
+            masked_context = (
+                request.mask_for_boundary(context) if context else MaskResult(masked_text="", vault={})
+            )
+            vault.update(masked_context.vault)
 
         # 4. Context crosses the boundary too, so it is masked and compressed.
-        # The description above is already masked; masking it again is a no-op
-        # on placeholders and keeps a single path for everything that leaves.
-        masked_context = guard.mask(context) if context else MaskResult(masked_text="", vault={})
         compressed, was_compressed = self.policy.compress_context(masked_context.masked_text)
         if was_compressed:
-            notes.append(f"compressed escalated context to {len(compressed)} chars")
-
-        vault = dict(masked_query.vault)
-        if context:
-            vault.update(masked_context.vault)
-        # The description was masked *before* being folded into context, so
-        # re-masking context cannot rediscover its entities -- placeholders are
-        # not email- or phone-shaped. Its vault has to be merged explicitly or
-        # the answer comes back with a bare [PII_*] token the user never sees
-        # resolved. Safe to merge because placeholders are unique per guard.
-        if description_vault:
-            vault.update(description_vault)
+            request.notes.append(f"compressed escalated context to {len(compressed)} chars")
         if masked_query.vault:
-            notes.append(f"sent off-device (masked): {masked_query.masked_text!r}")
+            request.notes.append(f"sent off-device (masked): {masked_query.masked_text!r}")
 
-        response = self.deep_brain.answer(masked_query.masked_text, compressed)
+        response = self._ask(
+            self.deep_brain, "deep brain", masked_query.masked_text, compressed,
+            crossing=True, vault=vault,
+        )
+        self.tracer.rehydrated(vault)
 
         # A speculative local answer that lost is still time the user waited
         # for, so the reported latency includes it. Hiding it would make the
@@ -470,7 +809,7 @@ class TwoBrainRouter:
         est_latency_ms = response.latency_ms
         if discarded is not None:
             est_latency_ms += discarded.latency_ms
-            notes.append(
+            request.notes.append(
                 f"discarded the local answer after {discarded.latency_ms:.0f}ms; "
                 f"reported latency includes it"
             )
@@ -481,7 +820,8 @@ class TwoBrainRouter:
             difficulty_score=difficulty,
             est_latency_ms=est_latency_ms,
             est_cost_usd=response.cost_usd,
+            pii_entities_detected=request.pii_detected,
             pii_entities_masked=len(masked_query.vault),
-            answer=guard.rehydrate(response.text, vault),
-            notes=notes,
+            answer=request.guard.rehydrate(response.text, vault),
+            notes=request.notes,
         )

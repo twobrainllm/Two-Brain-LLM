@@ -151,13 +151,15 @@ $env:TWO_BRAIN_PHONE_BRAIN=1
 See [`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md) for the full env-var table
 and how the two routing paths differ.
 
-Sample output (query 3 shows the privacy guarantee end-to-end -- masked
-text is what actually leaves the device, the final answer is rehydrated):
+Sample output (query 3 shows the privacy guarantee end-to-end -- PII is
+detected up front but only masked at the moment it crosses, and the final
+answer is rehydrated on-device):
 
 ```
 > My email is jane.doe@example.com and my phone is 555-123-4567 -- can you draft a reply telling the sender their SSN 123-45-6789 was found in an old backup and needs to be rotated?
   routed to: cloud | difficulty=0.40 | est_latency_ms=1479 | est_cost_usd=0.00004
-  - masked 3 PII entities before any routing decision
+  - detected 3 PII entities in the query
+  - LocalFastBrain runs on this device, so it gets the query unmasked -- nothing is transmitted
   - escalating: difficulty=0.40 (threshold 0.55) or local_latency_est=4855ms > budget 3000ms
   - sent off-device (masked): 'My email is [PII_EMAIL_1] and my phone is [PII_PHONE_1] -- can you draft a reply telling the sender their SSN [PII_SSN_1] was found in an old backup and needs to be rotated?'
   answer: [cloud:ai100 mock deep-brain response to: 'My email is jane.doe@example.com and my phone is 555-123-4567 -- can you draft a reply telling the sender their SSN 123-45-6789 was found in an old backup and needs to be rotated?' | context_used='']

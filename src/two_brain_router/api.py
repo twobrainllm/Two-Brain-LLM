@@ -149,12 +149,24 @@ class _Handler(BaseHTTPRequestHandler):
         print(f"[two-brain-api] {self.address_string()} - {fmt % args}")
 
 
-def serve(tier: Tier, host: str, port: int) -> None:
-    router = TwoBrainRouter(tier=tier)
+def serve(tier: Tier, host: str, port: int, trace: bool = True) -> None:
+    router = TwoBrainRouter(tier=tier, trace=trace)
     handler = type("_BoundHandler", (_Handler,), {"router": router, "route_lock": threading.Lock()})
     httpd = ThreadingHTTPServer((host, port), handler)
     print(f"two-brain-router API -> http://{host}:{port} (tier={tier})")
     print(f"  POST http://{host}:{port}/route   {{\"query\": \"...\", \"context\": \"\"}}")
+    if trace:
+        # Said plainly and once, at startup. The trace exists so you can *see*
+        # that PII stayed on-device, which means it necessarily prints that PII
+        # -- and a terminal is a place data ends up. Better to name that than to
+        # let someone discover it while screen-sharing.
+        print(
+            "  trace: ON -- every call in/out is printed below, including raw PII\n"
+            "         (--no-trace to silence it, TWO_BRAIN_TRACE_REDACT=1 to show\n"
+            "          placeholders instead of real values)"
+        )
+    # `route()` is serialized by `route_lock`, so trace blocks never interleave
+    # even though this is a threading server.
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -169,8 +181,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tier", choices=["pc", "mobile"], default="pc")
     parser.add_argument("--host", default="127.0.0.1", help="default is loopback-only; see module docstring")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--no-trace",
+        action="store_true",
+        help="don't print each call's input/output (the trace includes raw PII)",
+    )
     args = parser.parse_args(argv)
-    serve(args.tier, args.host, args.port)
+    serve(args.tier, args.host, args.port, trace=not args.no_trace)
     return 0
 
 

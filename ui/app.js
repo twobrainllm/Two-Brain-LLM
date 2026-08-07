@@ -160,6 +160,17 @@ function activePreviewAvatar() {
   return els.emptyStateAvatar;
 }
 
+/** Badge text per `tier_answered`. `"hybrid"` is a real third outcome, not a
+ * flavour of "cloud": the on-device model answered part of the query and only
+ * the part it flagged as beyond it was sent on. Saying "Cloud brain" there
+ * would understate what stayed local, and "Local brain" would hide that
+ * anything left at all. */
+const TIER_BADGE_LABEL = {
+  local: "Local brain",
+  cloud: "Cloud brain",
+  hybrid: "Local brain + cloud (split)",
+};
+
 const state = {
   chats: loadChats(),
   activeChatId: null,
@@ -352,7 +363,7 @@ function renderMessageEl(msg) {
     const suffix = msg.live === true ? "" : msg.live === false ? " (offline preview)" : "";
     badge.innerHTML =
       `<span class="tier-dot" data-tier="${tier}"></span>` +
-      (tier === "local" ? "Local brain" : "Cloud brain") +
+      (TIER_BADGE_LABEL[tier] ?? TIER_BADGE_LABEL.local) +
       suffix;
     bubble.appendChild(badge);
   }
@@ -390,13 +401,29 @@ function createChat(firstMessage) {
 }
 
 function tierLabel(tier) {
+  if (tier === "hybrid") return "Local + Cloud";
   return tier === "cloud" ? "Cloud" : "Local";
+}
+
+/** Same thing with the noun attached. Separate from `tierLabel` because
+ * "Local + Cloud brain" reads as one brain with a long name -- on a split there
+ * were two of them, and the card is where that should be plainest. */
+function tierCardLabel(tier) {
+  return tier === "hybrid" ? "Local brain + cloud" : `${tierLabel(tier)} brain`;
 }
 
 function formatPrivacy(metrics) {
   if (!metrics.piiCount) return "No PII detected";
   const parts = metrics.piiEntities.map((e) => `${e.count} ${e.type}`);
-  return `${metrics.piiCount} masked (${parts.join(", ")})`;
+  const found = `${metrics.piiCount} detected (${parts.join(", ")})`;
+  // Detected and masked are different numbers now that masking happens at the
+  // cloud boundary rather than at the front door. Saying only "N masked" would
+  // print "0 masked" for a PII-heavy query answered entirely on-device -- which
+  // reads as "we did nothing" when it actually means "none of it left".
+  const masked = metrics.piiMasked ?? (metrics.wouldEscalate ? metrics.piiCount : 0);
+  return masked === 0
+    ? `${found} — none left the device`
+    : `${found}, ${masked} masked before leaving`;
 }
 
 /** Renders the profiler pill + card from one message's computed metrics (see profiler.js). */
@@ -404,7 +431,7 @@ function renderProfiler(metrics, tier) {
   els.profiler.dataset.hasData = "true";
   els.profilerDot.dataset.tier = tier;
   els.profilerCardDot.dataset.tier = tier;
-  els.profilerCardTier.textContent = `${tierLabel(tier)} brain`;
+  els.profilerCardTier.textContent = tierCardLabel(tier);
 
   const summaryLatencyMs = Math.round(metrics.actualLatencyMs ?? metrics.estLatencyMs);
   els.profilerSummary.textContent = `${tierLabel(tier)} · ${summaryLatencyMs}ms`;
@@ -481,9 +508,16 @@ function metricsFromRouteResponse(body) {
   return {
     difficulty: body.difficulty_score,
     escalateThreshold: body.escalate_threshold,
-    wouldEscalate: body.tier_answered === "cloud",
+    // Anything that isn't purely local crossed the boundary. `"hybrid"` did
+    // reach the cloud -- it just kept the local half too -- so testing for
+    // `=== "cloud"` here would have reported a real escalation as none.
+    wouldEscalate: body.tier_answered !== "local",
     piiEntities: body.pii_entities,
-    piiCount: body.pii_entities_masked,
+    // `piiCount` is what the query *contained*; `piiMasked` is what actually
+    // had to be masked because it crossed. On a locally-answered query the
+    // second is 0 while the first is not, and that gap is the demo.
+    piiCount: body.pii_entities_detected,
+    piiMasked: body.pii_entities_masked,
     estLatencyMs: body.est_latency_ms,
     estCostUsd: body.est_cost_usd,
     notes: body.notes,

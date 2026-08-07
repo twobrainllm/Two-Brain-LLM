@@ -74,8 +74,42 @@ captures. Full build history, real bugs found and fixed, and every receipt:
 (the finished version) and [`docs/npu-deployment.md`](docs/npu-deployment.md)
 (short architecture summary). See also [next step #3](docs/WALKTHROUGH.md#next-steps).
 
-**`NpuFastBrain` now self-rates as well** (Shape B), so the AI PC tier routes on
-the model's own confidence rather than the keyword heuristic. As
+**The AI PC tier is now on Shape C — read
+[`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md) before touching `route()`.**
+Both AI-PC brains (`NpuFastBrain`, `GpuLocalBrain`) ask the local model for a
+single-line JSON object — `{solution, confidence, unknown}` — so it solves what
+it can *and names the part it can't*. A named `unknown` splits the query: the
+local answer is kept and shown, and only the gap goes to the deep brain
+(`tier_answered="hybrid"`). Real-hardware receipts, including the two defects
+this turned up, are in
+`data/npu_model/phi-3.5-mini-instruct/_real_structured_inference_log.md`.
+
+Three consequences worth knowing before you plan work here:
+
+- **A named gap escalates regardless of the confidence number.** That is the
+  point: this tier's confidence is measurably uninformative (0.95–1.00 on
+  everything), while the gap field discriminates cleanly.
+- **`routing/policy.py` is no longer untouched.** It gained
+  `local_partial_budget_ms`, `send_partial_to_cloud` and a pure
+  `needs_gap_fill()`. It is still pure — that was always the real constraint.
+- **Shape C is text-only.** An image-bearing query still takes the heuristic
+  path, because neither Shape B nor C has anywhere to put an image. Image
+  behaviour is unchanged; extending Shape C to images is the next step.
+
+`TWO_BRAIN_STRUCTURED=0` reverts both AI-PC brains to Shape B.
+
+**To watch the data path, run the API server and read the trace**
+(`src/two_brain_router/trace.py`, on by default there, `--trace` on the CLI).
+It prints each brain call's input and output with an `[ON-DEVICE -- raw text]`
+or `[OFF-DEVICE -- masked]` banner, every value-to-placeholder substitution at
+a crossing, and the rehydration on the way back. Every `answer()` call in the
+router goes through `TwoBrainRouter._ask` so nothing can quietly escape the
+trace — keep it that way. It is ASCII-only on purpose: box-drawing characters
+crash a `cp1252` Windows console, taking the server with them.
+
+**`NpuFastBrain` self-rates as well** (Shape B, the format Shape C
+generalised), so the AI PC tier routes on the model's own confidence rather
+than the keyword heuristic. As
 `ORCHESTRATOR.md` predicted, this needed a prompt change plus a re-profile and
 **no** router change — `route()` and `policy.py` were untouched. Three real
 defects turned up while getting there and are fixed and logged in
@@ -126,15 +160,43 @@ The point of this sample is a privacy guarantee. It lives in the *ordering*
 inside `routing/router.py::TwoBrainRouter.route`, and any change to routing
 must preserve all four:
 
-1. **Mask first.** The query is masked *before* any routing decision is made —
-   before difficulty scoring, before latency estimation, and before any brain
-   is called. A decision made on raw text has already read the PII.
+1. **Mask at the boundary, and nowhere earlier.** Every string that leaves this
+   machine is masked immediately before it goes, and never carried around
+   pre-masked. `Brain.trusted_with_raw_pii` marks which side of the boundary a
+   brain sits on: the AI PC's own models (`NpuFastBrain` in-process,
+   `GpuLocalBrain` in a loopback child process) get the query **exactly as the
+   user typed it**, because nothing they are given is transmitted and masking
+   them would cost answer quality while protecting nothing. Everything else —
+   both cloud brains, and `PhoneFastBrain`, which runs on a physically separate
+   device even though `adb reverse` makes the hop look like loopback — receives
+   masked text only.
+
+   > **This inverted in the Shape C work.** It previously read "mask first…
+   > before any brain is called". If you find docs or comments still asserting
+   > that ordering, they are stale — `routing/router.py`'s module docstring is
+   > the current statement. The flag defaults to `False` everywhere it is read
+   > (`getattr(brain, "trusted_with_raw_pii", False)`), so a brain that forgets
+   > to declare it gets masked input rather than a leak.
+
 2. **The invariant check is fatal.** `assert_masked_token_invariant` runs on
-   every request and raises. Never downgrade it to a warning, a log line, or a
-   test-only assertion.
+   everything that crosses and raises. Never downgrade it to a warning, a log
+   line, or a test-only assertion. `_Request.mask_for_boundary` is the single
+   method that pairs the mask with the assert — every path to
+   `deep_brain.answer` goes through it, which is what makes a missing
+   mask/assert greppable.
 3. **Only masked text crosses the boundary.** `CloudDeepBrain.answer` receives
    masked query + masked, compressed context. The vault never leaves the
    process. Escalated *context* gets masked too, not just the query.
+   **This now includes text the local model wrote itself, and that is the
+   sharpest edge in the codebase.** On a Shape C split, the `unknown` gap and
+   (unless `send_partial_to_cloud=False`) the partial answer both cross — and
+   the model that wrote them was handed the **raw** query, so they can quote a
+   real email address verbatim rather than a placeholder. Query-level masking
+   cannot save you here: these strings did not exist when the query was read.
+   Both are masked at the crossing and both get the invariant asserted, exactly
+   like an image description.
+   `tests/test_structured_routing.py::test_the_raw_partial_answer_is_masked_before_it_crosses`
+   is the one to keep passing.
    **`PhoneFastBrain` is on the far side of a boundary as well** — the mobile
    model runs on a physically separate device over HTTP — so the same rule
    applies to it, and it additionally refuses a non-loopback host without an
@@ -145,17 +207,23 @@ must preserve all four:
    brain here.
 4. **Rehydrate last, on-device.** Only after the answer is back.
 
-Note that invariant 1 is *why* the confidence path is safe: a self-rating brain
-is called before the routing decision (see
-[`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md)), but masking is still ahead of
-both, so what it receives is masked either way.
+The confidence path is safe for a different reason than it used to be. A
+self-rating brain is called *before* the routing decision (see
+[`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md)), so the decision is now made on
+raw text — which is fine precisely because the thing making it is on-device:
+the difficulty heuristic is a pure local function, and the confidence/gap
+signals come from the local model, which was already trusted with the query by
+the time it produced them. Nothing about the decision is transmitted; only what
+invariant 1 masks is.
 
 `tests/test_routing.py::test_escalated_pii_never_reaches_cloud_unmasked` is the
-regression test for all of this, and
+regression test for all of this;
 `tests/test_orchestrator.py::test_pii_never_reaches_the_phone_or_the_cloud_unmasked`
 is its counterpart for the phone boundary — it asserts against the bytes that
-actually went out over the socket, not a mocked call. If you change the router,
-both must still pass unmodified — if either needs editing to pass, the
+actually went out over the socket, not a mocked call; and
+`tests/test_structured_routing.py::test_pii_the_local_model_invented_in_the_gap_is_masked_before_it_crosses`
+covers the split path's new surface. If you change the router,
+all three must still pass unmodified — if either needs editing to pass, the
 guarantee changed and that is a review-worthy decision, not a test fix.
 
 ---
@@ -169,8 +237,15 @@ a piece that is currently mocked:
 | Seam | Replace when | Contract to keep |
 |---|---|---|
 | `privacy/guard.py` | `quad.privacy` (gap G8) becomes available here | `mask` / `rehydrate` / invariant |
-| `signals/difficulty.py` | a fast brain can emit a real signal — **done for both local tiers**, see `signals/confidence.py` | `score(query) -> float` in `[0, 1]` |
+| `signals/difficulty.py` | a fast brain can emit a real signal — **done for both local tiers**, see `signals/confidence.py` and `signals/structured.py` | `score(query) -> float` in `[0, 1]` |
 | `routing/brains.py` | a tier gets a real artifact — **done for both local tiers** | the `Brain` protocol → `BrainResponse` |
+
+`signals/structured.py` is the newest of these and follows the same rule as
+`confidence.py` and `policy.py`: **pure**, text in and parsed values out, no I/O
+and no reference to a brain. `brains.py` calls into it; nothing there calls
+back. Its `parse_structured` never raises — a badly-formatted model reply
+degrades down a three-rung ladder (JSON → bare `CONFIDENCE:` → no signal at
+all) rather than becoming an exception the router has to special-case.
 
 When swapping a mock for the real thing, **change only that module** — if the
 swap forces edits in `router.py`, the seam was drawn in the wrong place.

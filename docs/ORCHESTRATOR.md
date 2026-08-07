@@ -15,14 +15,131 @@ to L (fast brain), O (orchestrator), and C (deep brain); the mapping is:
 
 ---
 
-## The two decision shapes
+## The three decision shapes
 
-The privacy ordering never changes: **mask → assert → decide → answer →
-rehydrate.** What changes per tier is *where the difficulty signal comes
-from*, and that determines whether the fast brain is called before or after
-the decision.
+The privacy ordering is: **detect → answer on-device → mask at the boundary →
+assert → send → rehydrate.** What changes per tier is *where the difficulty
+signal comes from*, and that determines whether the fast brain is called before
+or after the decision — and, in Shape C, whether the decision is "which brain"
+at all.
 
-A brain declares which shape it needs via `Brain.reports_confidence`.
+> **The ordering changed.** It used to be *mask → assert → decide → answer →
+> rehydrate*: the query was masked before anything touched it, including the
+> local model. That was the wrong place for it. The AI PC's fast brain executes
+> on this machine, so masking its input bought no privacy and measurably cost
+> answer quality — a model asked to draft a reply to `[PII_EMAIL_1]` writes a
+> worse reply than one that can see the address. See **The trust boundary**
+> below.
+
+A brain declares which shape it needs with two flags:
+
+| | `reports_confidence` | `reports_gaps` | Brains |
+|---|---|---|---|
+| **Shape A** | `False` | `False` | `LocalFastBrain`, `CloudDeepBrain` (the stubs) |
+| **Shape B** | `True` | `False` | `PhoneFastBrain` |
+| **Shape C** | `True` | `True` | `NpuFastBrain`, `GpuLocalBrain` (both AI-PC, both default-on) |
+
+`reports_gaps` implies `reports_confidence` and never the reverse — a brain
+that can say *which part* it couldn't do can necessarily say *how sure* it is.
+
+---
+
+## The trust boundary
+
+A third flag, `Brain.trusted_with_raw_pii`, decides something more important
+than any of the above: **what the `query` argument to `answer()` actually
+contains.**
+
+| Brain | Trusted | Why |
+|---|---|---|
+| `NpuFastBrain` | **Yes** | in-process, `ctypes` → `Genie.dll`, this machine's NPU |
+| `GpuLocalBrain` | **Yes** | a `llama-server` child process this class started, bound to `127.0.0.1` |
+| `LocalFastBrain` (stub) | **Yes** | in-process; a stub that got different input from the real thing would make the default path a bad rehearsal |
+| `PhoneFastBrain` | **No** | a physically separate device. `adb reverse` makes the hop *look* like loopback, which is exactly why this is declared and not inferred from the URL |
+| `CloudDeepBrain` / `CirrascaleDeepBrain` | **No** | the boundary itself |
+
+Trusted brains get the query **exactly as the user typed it**. Everything else
+gets masked text, and every string that leaves is masked immediately before it
+does — via `_Request.mask_for_boundary`, which pairs the mask with the fatal
+invariant assert. Every path to `deep_brain.answer` goes through that one
+method, so a missing mask/assert is greppable rather than a matter of reading
+carefully.
+
+The flag is read as `getattr(brain, "trusted_with_raw_pii", False)`. **A brain
+that forgets to declare it gets masked input**, because forgetting to opt *in*
+costs answer quality while forgetting to opt *out* would leak.
+
+### Watching it happen: the trace
+
+`RouteDecision.notes` says *what the router decided and why*. The trace
+(`src/two_brain_router/trace.py`) prints **the payloads** — the exact strings
+handed to each brain and returned by each one. That distinction matters here:
+"did the raw address reach the cloud?" is not answerable from a note reading
+"masked 3 entities", only from seeing the bytes.
+
+It is **on by default when you run `python -m two_brain_router.api`**
+(`--no-trace` to silence it) and opt-in for the CLI (`--trace`; off under
+`--json`, and off by default so the README's pinned transcript stays exact).
+Real output, abridged:
+
+```
+- CALL  fast brain | NpuFastBrain   [ON-DEVICE -- raw text]
+  query      : My email is jane.doe@example.com -- ...tell me the exact ISBN of the 1813 first edition...
+- RETURN  NpuFastBrain  5871ms
+  text       : Your SSN 123-45-6789 was found in a backup, and the exact ISBN ... is [ISBN here].
+  confidence : 0.90
+  unknown    : The exact ISBN of the 1813 first edition of Pride and Prejudice
+- BOUNDARY  -> CloudDeepBrain   [OFF-DEVICE -- masked]
+    masked  'jane.doe@example.com' -> [PII_EMAIL_1]
+    masked  '123-45-6789' -> [PII_SSN_1]
+  context    : A smaller on-device model has already answered part of this question:
+               Your SSN [PII_SSN_1] was found in a backup, ...
+- REHYDRATE  2 placeholder(s) restored on-device
+- DECISION  hybrid  difficulty=0.10  7350ms  $0.00004
+  PII        : 2 detected -- 2 masked before leaving
+```
+
+The `[ON-DEVICE]` / `[OFF-DEVICE]` banners are driven by the `crossing` flag at
+the call site, not guessed from the brain's type. Note the same sentence
+appearing twice: the local model wrote `Your SSN 123-45-6789`, and what crossed
+says `Your SSN [PII_SSN_1]`. That is Shape C's masking of the partial answer,
+visible.
+
+Two implementation notes worth keeping:
+
+- **Every `answer()` call in the router goes through `_ask`**, which is what
+  emits the trace. A new branch that calls a brain directly would silently drop
+  out of it — and the trace is how anyone verifies the privacy claim.
+- **ASCII only.** Box-drawing characters crashed the server outright on a
+  Windows console (`cp1252` cannot encode them, and `print` raises). A trace
+  that kills the process it is tracing is worse than a plain-looking one.
+
+**The trace prints raw PII**, necessarily — you cannot verify that PII stayed
+on-device without seeing it was there. It goes to stdout, never to a file, and
+`api.py` says so at startup rather than letting someone find out mid-screenshare.
+
+### Detected ≠ masked
+
+`RouteDecision` carries both counts, and it has to. A PII-heavy query answered
+entirely on-device now reports `pii_entities_masked = 0` — which is the *good*
+outcome, not a missing measurement, but reads as "no PII here" on its own.
+`pii_entities_detected` is what the query contained regardless, and the gap
+between the two numbers is the demo: *2 detected — none left the device.*
+
+### What this costs
+
+The routing decision is now made on raw text. That is acceptable precisely
+because the thing making it is on-device: the difficulty heuristic is a pure
+local function, and the confidence/gap signals come from the local model, which
+was already trusted with the query by the time it produced them. Nothing about
+the decision is transmitted.
+
+The real cost lands in Shape C, and it is worth being blunt about: because the
+local model sees raw PII, **its `solution` and `unknown` can contain raw PII
+too** — a real address, not a placeholder. Those strings cross the boundary on
+a split. Masking them there is not defence-in-depth; it is the only thing
+standing between the user and a leak, because query-level masking never saw
+them.
 
 ### Shape A — brain does not self-rate (`reports_confidence = False`)
 
@@ -110,6 +227,104 @@ Three details in Shape B are load-bearing:
 
 Both land on the same "not confident" path as a low-but-parsed number. What
 differs is only the note text, so the audit trail still says *why*.
+
+### Shape C — brain names its gaps (`reports_gaps = True`)
+
+Used by both AI-PC brains. **This is the flow the AI PC actually runs today.**
+
+Shapes A and B both answer the same question — *which brain handles this?* —
+and throw one brain's work away. Shape C stops asking that. The local model is
+asked to solve what it can *and to write down the part it can't*, in one call,
+as JSON:
+
+```json
+{"solution": "Paris, 2.1 million", "confidence": 95,
+ "unknown": "The specific population on 3 March 2019"}
+```
+
+The `solution` is kept and shown. The `unknown` is what the deep brain is
+asked about — a second, **narrower** call, not a redo:
+
+```
+mask ─▶ assert ─▶ ceiling pre-check ─▶ fast brain (solution + confidence + gap)
+                                                 │
+                                    needs_gap_fill(difficulty, gap)?
+                                        │                    │
+                                       no                   yes
+                                        │                    │
+                                   tier=local        usable solution?
+                                   ─▶ rehydrate        │          │
+                                                      yes         no
+                                                       │          │
+                                              mask the gap    tier=cloud
+                                              + the partial   (ordinary
+                                                       │      escalation)
+                                              deep brain(gap)
+                                                       │
+                                              tier=hybrid, merge
+                                                 ─▶ rehydrate
+```
+
+Four things here are load-bearing:
+
+1. **A named gap escalates on its own, whatever the confidence says.**
+   `RoutePolicy.needs_gap_fill` ORs "gap is non-empty" with the usual
+   threshold. This is the whole point. Measured on real hardware: *"capital of
+   France, and its population on 3 March 2019"* self-rates **0.95** →
+   difficulty 0.05, far below the 0.55 threshold. Under Shape B it stays local
+   and answers "Paris", silently dropping half the question. The model knew the
+   other half was missing all along; there was nowhere to say so.
+2. **The gap and the partial are masked before they cross — the sharpest edge
+   here.** Both are *newly generated* text the guard has never seen, written by
+   a model that was handed the **raw** query, so they can quote a real address
+   verbatim. Query-level masking cannot help: these strings did not exist when
+   the query was read. Both go through `mask_for_boundary`, and their vaults
+   are merged for rehydration.
+   `tests/test_structured_routing.py::test_the_raw_partial_answer_is_masked_before_it_crosses`
+   and `…::test_pii_the_local_model_invented_in_the_gap_is_masked_before_it_crosses`
+   are the regression tests.
+3. **A split needs two halves.** No usable `solution` (empty, or the brain
+   errored) means this is an ordinary escalation and is reported as
+   `tier_answered="cloud"`, not as a split with one side missing.
+4. **The latency ceiling is a different number here** — see below.
+
+#### Why Shape C has its own latency ceiling
+
+Shape B skips the fast brain when the profiled estimate exceeds
+`local_latency_budget_ms` (3000 ms), on the stated grounds that *"a local answer
+would have been discarded anyway"*.
+
+**That premise is false in Shape C**, where a usable local answer is always
+kept. Reusing the budget measurably broke the feature: on the first real
+hardware run, two of the four demo queries never reached the fast brain,
+including the PII query — which the local model then turned out to answer
+*fully* on-device. Escalating it sent masked PII to the cloud for nothing.
+
+So Shape C uses `RoutePolicy.local_partial_budget_ms` (15000 ms), a runaway
+guard rather than a preference, sized at ~2.3x the slowest measured structured
+call. A query between the two numbers is answered locally anyway, with a note
+in the audit trail saying so. `local_latency_budget_ms` is unchanged for
+Shapes A and B.
+
+#### `tier_answered="hybrid"`
+
+A third value, not a flavour of `"cloud"`. For *"did anything cross the
+boundary?"* treat it exactly like `"cloud"` — it did. What it adds is that
+something also **didn't**, and `RouteDecision` carries the split:
+`local_answer`, `cloud_answer`, `gap` (all rehydrated), with `answer` as the
+merged text.
+
+#### What Shape C does not do yet
+
+**Images.** `route(query, context, image)` still takes the Shape A heuristic
+path whenever an image is present, even on a Shape C brain. Neither Shape B nor
+C has anywhere to *put* an image — both call `answer(masked_text)` with no image
+argument — so routing one through would silently drop it and answer the text
+alone. Image behaviour is therefore exactly as it was. Extending Shape C to
+images is the deliberate next step.
+
+**The phone.** `PhoneFastBrain` is untouched and stays Shape B, so the mobile
+tier behaves exactly as before.
 
 ---
 
@@ -227,11 +442,14 @@ piece (which brain answers this tier) — see "Where code goes" in
 
 ## Per-tier signal
 
-| Tier | Fast brain | "Not confident" goes to | Transport | Self-rates? | Difficulty signal |
+| Tier | Fast brain | Shape | "Not confident" goes to | Transport | Difficulty signal |
 |---|---|---|---|---|---|
-| AI PC (`pc_3b`) | `NpuFastBrain` — Phi-3.5-mini-instruct on Hexagon NPU | Cloud (no escalation brain on this tier) | in-process `ctypes`/Genie | **Yes** | model's own self-report |
-| Mobile (`mobile_1b`) | `PhoneFastBrain` — Llama-3.2-3B on a Galaxy S25 | **The AI PC's `NpuFastBrain`** (if `TWO_BRAIN_NPU_BRAIN=1`), else cloud | HTTP to loopback (`adb reverse`) | **Yes** | model's own self-report |
-| Cloud | `CloudDeepBrain` (stub) | — | — | No | n/a — escalation target |
+| AI PC (`pc_3b`) | `NpuFastBrain` — Phi-3.5-mini-instruct on Hexagon NPU | **C** | Cloud, and only for the named gap (no escalation brain on this tier) | in-process `ctypes`/Genie | self-report **+ named gap** |
+| AI PC (`pc_3b`) | `GpuLocalBrain` — GGUF on the Adreno GPU, wins if both are set | **C** | as above | `llama-server` on loopback | self-report **+ named gap** |
+| Mobile (`mobile_1b`) | `PhoneFastBrain` — Llama-3.2-3B on a Galaxy S25 | **B** | **The AI PC's brain** (if `TWO_BRAIN_GPU_BRAIN`/`NPU_BRAIN=1`), else cloud | HTTP to loopback (`adb reverse`) | model's own self-report |
+| Cloud | `CloudDeepBrain` (stub) / `CirrascaleDeepBrain` (real) | — | — | — | n/a — escalation target |
+
+### Confidence is weak on this tier; the gap field is not
 
 `NpuFastBrain` self-rates as of the Shape B change. As predicted, that took a
 prompt change plus a re-profile and **no** router change — `route()`,
@@ -258,6 +476,35 @@ Two honest caveats, both measured rather than assumed (receipts:
 The threshold was deliberately **not** retuned to compensate. Moving it to fit
 seven samples of a weak signal would hide the finding rather than fix it.
 
+**Shape C is what actually addressed it** — not by improving the number, but by
+asking for something else alongside it. Across ten real structured calls
+(receipts: `data/npu_model/phi-3.5-mini-instruct/_real_structured_inference_log.md`)
+the confidence stayed in its usual uninformative 0.95–1.00 band while the
+`unknown` field cleanly separated the queries with a real missing piece from the
+ones without:
+
+| Query | confidence | `unknown` | Routed |
+|---|---|---|---|
+| "What time zone is Tokyo in?" | 1.00 | *(empty)* | local |
+| "capital of France, and its population on 3 March 2019?" | 0.95 | "The specific population on 3 March 2019" | **hybrid** |
+| "Pride and Prejudice, and the exact ISBN of the 1813 first edition" | 0.95 | "The exact ISBN of the 1813 first edition…" | **hybrid** |
+| the PII demo query | 1.00 | *(empty)* | local |
+
+Format compliance was **10/10** — a well-formed single-line JSON object every
+time, nothing falling through to `parse_structured`'s lower rungs. That was the
+main risk going in, since Genie's C API exposes no grammar hook the way
+`llama-server`'s `response_format` does. It did not materialise on this
+artifact; the degradation ladder exists in case it does on another.
+
+One real defect was found and fixed in the process, and it is worth knowing
+about because it is a prompt-shaped bug rather than a code-shaped one: the model
+initially used `unknown` for a **disclaimer** about an answer it had given
+("This response assumes the user's authority…"), which `needs_gap_fill` cannot
+distinguish from a real gap — so a fully-answered PII query got split and its
+masked PII went to the cloud for nothing. Fixed by banning caveats in
+`STRUCTURED_SUFFIX` explicitly. Whether that ban also suppresses *real* gaps is
+**unmeasured**; it is the first thing to check if splits start looking too rare.
+
 Getting the prompt to behave was itself measured, not guessed. Left alone the
 model emits the answer, the `CONFIDENCE:` line, and then paragraphs of
 unrequested rationale until the token cap — tripling latency and leaving
@@ -272,9 +519,20 @@ sometimes returned a number and **no answer at all**, so it was rejected.
 ## Running it
 
 ```powershell
-# AI PC tier, real NPU brain (needs .venv-npu + the Genie artifact)
+# AI PC tier, real NPU brain, Shape C (needs .venv-npu + the Genie artifact)
 $env:TWO_BRAIN_NPU_BRAIN=1
+$env:PYTHONPATH="src"
 .venv-npu\Scripts\python.exe -m two_brain_router --tier pc
+
+# ...the same thing behind the chat UI. Two terminals:
+#   1) the router API   -- first request pays a ~12s Genie cold load
+$env:TWO_BRAIN_NPU_BRAIN=1; $env:PYTHONPATH="src"
+.venv-npu\Scripts\python.exe -m two_brain_router.api --tier pc
+#   2) the static UI, from ui/
+..\..\..\.venv\Scripts\python.exe -m http.server 5500   # then open http://127.0.0.1:5500
+
+# Same tier, back on Shape B's bare CONFIDENCE: format, for A/B:
+$env:TWO_BRAIN_STRUCTURED=0
 
 # Mobile tier, real phone brain -- against the mock, no phone needed:
 python src\phone_brain\mock_phone_brain_server.py --port 8000
@@ -302,6 +560,10 @@ Against the real device, the only change is that the server is the phone
 | `TWO_BRAIN_PHONE_MODEL` | `llama-3.2-3b-instruct` | model id sent in the request |
 | `TWO_BRAIN_PHONE_ALLOW_REMOTE` | unset | `1` permits a non-loopback L (see below) |
 | `TWO_BRAIN_CLOUD_BRAIN` | unset | `1` enables the real Cirrascale cloud brain (needs `INFERENCE_CLOUD_ENDPOINT`/`INFERENCE_CLOUD_API_KEY`) |
+| `TWO_BRAIN_TRACE` | off as a library, **on** for `api.py`; `--trace` for the CLI | Print every call's input and output, and what was masked at each crossing. See below. |
+| `TWO_BRAIN_TRACE_REDACT` | unset | `1` shows placeholders instead of real values in the `[ON-DEVICE]` sections too — for demoing this in front of an audience |
+| `TWO_BRAIN_TRACE_MAX` | `1200` | Per-field character budget before a value is elided |
+| `TWO_BRAIN_STRUCTURED` | `1` (on) | `0` puts the AI-PC brains back on Shape B's bare `CONFIDENCE:` format. Only affects brains that are already enabled, so the stdlib-only default path is untouched either way. The isolation tool when this tier misbehaves: it separates "the model is bad at JSON" from "the model is bad at this question" without giving up the real hardware. |
 
 Both brains are **off by default**, so the base package stays stdlib-only and
 the test suite never depends on hardware or a served endpoint being up.
@@ -356,6 +618,29 @@ heuristic fallback was removed — see below.
 `Brain` gained `reports_confidence`; `route()` grew the Shape B branch, then
 grew the escalation-brain branch inside it. `TwoBrainRouter` gained
 `escalation_brain` and a `close()` that releases both real brains.
+
+**Changed again, for Shape C:** `BrainResponse` gained `unknown` and
+`model_masked_output`; `Brain` gained `reports_gaps`; `RouteDecision` gained
+`"hybrid"` plus `local_answer`/`cloud_answer`/`gap`; `RoutePolicy` gained
+`needs_gap_fill()`, `local_partial_budget_ms` and `send_partial_to_cloud`.
+`signals/structured.py` is new, and `routing/brains.py` grew a structured mode
+on both AI-PC brains. `routing/policy.py` is **no longer untouched** — the two
+fields and one pure predicate above are the first additions to it since the
+original build. It is still pure (no I/O, no brain calls), which was the actual
+constraint; "never edit this file" was never the rule.
+
+**Changed a third time, and this one is an inversion rather than an addition:**
+masking moved from the front door to the boundary. `Brain` gained
+`trusted_with_raw_pii`; `route()` no longer masks before deciding;
+`RouteDecision` gained `pii_entities_detected` alongside `pii_entities_masked`;
+`router.py` gained `_Request`/`_LocalView` and `mask_for_boundary`, the single
+method every crossing goes through. The README's pinned transcript moved with
+it — its first note is now "detected 3 PII entities in the query" instead of
+"masked 3 PII entities before any routing decision".
+
+**Not changed, deliberately:** `PhoneFastBrain` and the whole mobile tier
+(still Shape B, still masked — it is off-device); `signals/confidence.py`;
+image routing.
 
 **Removed, not just changed:** the surface-feature heuristic fallback for an
 unparseable confidence (`signals/difficulty.py`'s `DifficultyEstimator`) is
