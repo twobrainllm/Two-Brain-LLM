@@ -16,7 +16,25 @@ const STORAGE_KEY = "twoBrainChats";
 const GROUP_ORDER = ["Today", "Yesterday", "Previous 7 Days", "Previous 30 Days", "Older"];
 
 //: `src/two_brain_router/api.py`'s default bind address/port.
-const API_BASE_URL = "http://127.0.0.1:8765";
+/**
+ * `src/two_brain_router/api.py`'s port, on whatever host is serving this page.
+ *
+ * Derived rather than hardcoded so the UI works from a phone: opened over the
+ * LAN, `127.0.0.1` would mean *the phone itself*, which is not running the
+ * router. Falls back to loopback for `file://`, where there is no host to
+ * borrow. Override with `?api=http://host:port` when the API is somewhere
+ * else entirely.
+ *
+ * Reaching this from another device also needs api.py started with
+ * `--host 0.0.0.0`; loopback-only is its deliberate default.
+ */
+const API_BASE_URL = (() => {
+  const override = new URLSearchParams(window.location.search).get("api");
+  if (override) return override.replace(/\/$/, "");
+  const { protocol, hostname } = window.location;
+  if (protocol === "file:" || !hostname) return "http://127.0.0.1:8765";
+  return `${protocol}//${hostname}:8765`;
+})();
 
 // data/hardware_detect/{ai_pc,mobile}.json -- real quad-client detect /
 // adb shell captures, matching profiler.js's own DEVICE_CONTEXT convention.
