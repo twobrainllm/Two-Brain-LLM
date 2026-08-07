@@ -15,8 +15,8 @@ exactly what did.
 
 The routing and masking logic is **real, working Python**. What is mocked is
 model artifacts and hardware probes for the tiers whose toolchain is broken —
-each one labeled, with the failed real attempt logged beside it. See
-[Real vs. mocked](#real-vs-mocked-tier-by-tier).
+each one labeled, with the failed real attempt logged beside it in `data/`.
+[`docs/GAPS.md`](docs/GAPS.md) has the full account.
 
 **Archetype:** Privacy-Aware Edge↔Cloud Inference Routing — decide per-request
 *where* a workload runs (phone / PC / Cloud AI 100) and *what* is safe to send
@@ -134,13 +134,14 @@ foreground printing the trace.
 
 # Window 2 — static file server for the UI
 cd ui
-python -m http.server 8080
+python -m http.server 8081
 ```
 
-Then open **`http://localhost:8080`**.
+Then open **`http://localhost:8081`**.
 
-> Serve the UI on 8080, **not** 8000 — port 8000 is the phone brain's, and the
-> two collide the moment you try the mobile tier.
+> **Port 8081, not 8000 or 8080.** Both of those belong to the phone: the mock
+> brain listens on 8000, and `adb forward` claims 8080 on this host for the
+> real device. Either collides the moment you try the mobile tier.
 
 To route against a real local model, set the env var **in window 1 before
 starting the server**:
@@ -180,9 +181,10 @@ so nothing needs configuring on the phone.
 .venv\Scripts\python.exe -m two_brain_router --query "..." --trace  # with the full data-path trace
 ```
 
-### The mobile tier
+### Without a phone
 
-No phone needed — the mock server speaks the same contract:
+The mock server speaks the same contract, so the mobile tier runs on nothing
+but this machine:
 
 ```powershell
 .venv\Scripts\python.exe src\phone_brain\mock_phone_brain_server.py --port 8000
@@ -190,24 +192,164 @@ $env:TWO_BRAIN_PHONE_BRAIN=1
 .venv\Scripts\python.exe -m two_brain_router --tier mobile
 ```
 
-With a real Galaxy S25 attached, `tools/phone/live_test.py` walks the whole
-path one step at a time and tells you exactly which one failed:
-
-```powershell
-.venv\Scripts\python.exe tools\phone\live_test.py          # needs adb + the phone
-.venv\Scripts\python.exe tools\phone\live_test.py --mock   # harness self-check, no hardware
-```
-
-> Use **`adb forward`**, not `adb reverse` — the server is on the phone and the
-> caller is your PC, so the port has to open on the host. Every doc in this repo
-> said `reverse` until it was run against real hardware; the mock server hides
-> the difference because it listens on the dev machine's own loopback either
-> way. See `src/phone_brain/L_INTERFACE_CONTRACT.md`.
-
 > Use **`127.0.0.1`, not `localhost`** anywhere you point at a local brain. On
 > this machine `localhost` resolves to `::1` first, the servers bind IPv4 only,
 > and the failed attempt costs **~2s per call** — enough to blow the routing
 > budget on its own.
+
+---
+
+## Running the Mobile Tier on Real Hardware
+
+The mobile tier runs *Llama-3.2-3B-Instruct* directly on a Samsung Galaxy S25
+Ultra. The router communicates with the on-device model through a USB
+connection using `adb forward`, allowing queries to be processed locally on the
+phone.
+
+> **`adb forward`, not `adb reverse`.** `forward` opens the port on the *host*
+> and tunnels it to the device, which is what is needed when the server runs on
+> the phone and the caller is your machine. Every doc in this repo said
+> `reverse` until it was run against real hardware — the mock server hides the
+> difference, because it listens on the dev machine's own loopback either way.
+> See `src/phone_brain/L_INTERFACE_CONTRACT.md`.
+
+### Prerequisites
+
+Before deployment, ensure:
+
+- USB debugging is enabled and authorized on the phone.
+- `adb` is installed and available on the system PATH.
+- A gitignored `secrets.txt` file exists in the repository root containing:
+  - `INFERENCE_CLOUD_ENDPOINT`
+  - `INFERENCE_CLOUD_API_KEY`
+
+### One-Time Setup: Deploy Model Assets
+
+The mobile deployment requires the following files:
+
+- `llama-server`
+- `libOpenCL.so`
+- `libc++_shared.so`
+- `Llama-3.2-3B-Instruct-Q4_0.gguf`
+
+Build and deployment details are documented in
+`src/phone_brain/PHONE_DEPLOYMENT_GUIDE.md`.
+
+Push the required files to the device:
+
+```bash
+adb push llama-server libOpenCL.so libc++_shared.so \
+         Llama-3.2-3B-Instruct-Q4_0.gguf /data/local/tmp/
+
+adb shell chmod +x /data/local/tmp/llama-server
+adb shell cp /data/local/tmp/libOpenCL.so /data/local/tmp/libOpenCL.so.1
+```
+
+### Terminal 1: Start the On-Device Model Server
+
+Create a USB tunnel and launch the model server:
+
+```bash
+adb forward tcp:8080 tcp:8080
+
+adb shell "cd /data/local/tmp && nohup env LD_LIBRARY_PATH=/data/local/tmp \
+  ./llama-server -m Llama-3.2-3B-Instruct-Q4_0.gguf \
+  -ngl 99 -c 4096 --port 8080 \
+  > server.log 2>&1 &"
+```
+
+Wait approximately 15 seconds for the model to load, then verify the endpoint:
+
+```bash
+curl -s -m 30 http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"x","messages":[{"role":"user","content":"hi"}],"max_tokens":8}'
+```
+
+### Terminal 2: Start the Router
+
+```bash
+set -a && source secrets.txt && set +a
+
+TWO_BRAIN_CLOUD_BRAIN=1 \
+TWO_BRAIN_PHONE_BRAIN=1 \
+TWO_BRAIN_PHONE_URL=http://127.0.0.1:8080 \
+PYTHONPATH=src \
+python3 -m two_brain_router.api --tier mobile
+```
+
+### Terminal 3: Start the HTTPS UI
+
+```bash
+python3 ui/serve_https.py
+```
+
+The server generates a self-signed certificate on first launch and prints the
+URL to access from the phone.
+
+### Terminal 4: Verify the Deployment
+
+Test the routing endpoint:
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/route \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"What time zone is Tokyo in?"}'
+```
+
+A successful local response should return:
+
+```json
+"tier_answered": "local"
+```
+
+To access the UI from the phone, obtain the host machine's IP address:
+
+```bash
+ipconfig getifaddr en0
+```
+
+Then open `https://<host-ip>:8643` and accept the certificate warning on first
+use.
+
+### End-to-End Validation
+
+The following utility validates the complete deployment chain:
+
+```bash
+PYTHONPATH=src python3 tools/phone/live_test.py --port 8080
+```
+
+For development without physical hardware:
+
+```bash
+PYTHONPATH=src python3 tools/phone/live_test.py --mock
+```
+
+This verifies device connectivity, model availability, router integration, and
+end-to-end request handling.
+
+### On Windows (PowerShell)
+
+The commands above are bash. Three have no direct equivalent:
+
+```powershell
+# instead of: set -a && source secrets.txt && set +a
+Get-Content secrets.txt | ForEach-Object {
+  if ($_ -match '^\s*([A-Z_]+)\s*=\s*(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2]) }
+}
+
+# instead of inline VAR=x prefixes -- PowerShell has none
+$env:TWO_BRAIN_CLOUD_BRAIN=1; $env:TWO_BRAIN_PHONE_BRAIN=1
+$env:TWO_BRAIN_PHONE_URL="http://127.0.0.1:8080"
+.\.venv\Scripts\python.exe -m two_brain_router.api --tier mobile
+
+# instead of: ipconfig getifaddr en0   (that flag is macOS-only)
+(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -ne 'WellKnown' }).IPAddress
+```
+
+`PYTHONPATH=src` is unnecessary once `run.ps1` has installed the package with
+`-e .`.
 
 ---
 
@@ -266,79 +408,6 @@ Other things worth knowing:
   *description* the local model wrote, masked like any other text.
 - **An image-bearing query takes the heuristic path (Shape A)**, not the split.
   Shape C's JSON contract has nowhere to put an image yet.
-
----
-
-## Real vs. mocked, tier by tier
-
-| Tool | Mobile (3B) | AI PC (3B) | Cloud AI 100 (large) |
-|---|---|---|---|
-| `hardware_detect` | **real** — direct `adb shell` probe of a Galaxy S25 Ultra | **real** — `quad-client detect --json`, Snapdragon X Elite X1E80100, Hexagon v73 @ 45 TOPS | **mocked** — no cloud platform value exists in the tool schema at all |
-| `convert_model` | mocked | mocked (QUAD's own tool — still blocked) | mocked |
-| `profile_workload` | mocked | **real** — see note below | mocked |
-| `orchestrate_workload` | mocked | **real** — see note below | n/a (the cloud tier isn't an on-device op-placement problem) |
-
-`convert_model`/`profile_workload`/`orchestrate_workload` are mocked for mobile
-and cloud. The hosted server's `qairt-converter` cannot even import (missing
-`libpython3.10.so.1.0`) — a real, reproducible server-side defect. Bypassing
-the server and running the SDK's own Windows-native converter *locally* got
-much further (four real environment bugs fixed, real ops actually transformed)
-before hitting a second, independent native-code defect: non-deterministic
-uninitialized-memory reads in `ReshapeOp::calculateShape`, proven by three
-identical runs producing three different garbage totals. Two execution paths,
-two genuine compiler-level defects — see `docs/GAPS.md` #3/#3b and
-`data/convert_model/_real_attempts_log.md` (attempts 1–5).
-
-**AI PC `profile_workload`/`orchestrate_workload` — real, but not from QUAD's
-own tool call.** `convert_model` is still genuinely blocked, so the table entry
-stays "mocked" for it. But `data/profile_workload/pc_3b.json` and
-`data/orchestrate_workload/pc_3b.json` are real captures (`_mock: false`) from
-a *different* toolchain that routes around QUAD's compiler entirely:
-Qualcomm's pre-built Genie/QNN artifact for Phi-3.5-mini-instruct, run for real
-on this machine's Hexagon NPU. See
-[`superpowers/deploy-local-brain-npu.md`](superpowers/deploy-local-brain-npu.md)
-and `data/npu_model/phi-3.5-mini-instruct/` for the receipts — real per-token
-latency (~74.2 ms/token, ~13.5 tok/s across 8 queries), real `QnnGraph_execute`
-HTP-execution evidence, and a real QNN profiler capture.
-
-**Mobile `hardware_detect`:** `adb` was missing entirely (installed Android SDK
-platform-tools mid-session after winget's own package failed a hash check). The
-attached Galaxy S25 Ultra needed USB debugging enabled and the on-device
-authorization prompt accepted. Once authorized, `quad-client detect --platform
-android --json` reached the device but returned placeholder values (`chipset:
-"unknown"`, `storage_gb: 475.6` — this PC's own disk size, not the phone's), a
-real bug in the client's android probe path. Worked around with direct
-`adb shell getprop` / `/proc/meminfo` queries, so
-`data/hardware_detect/mobile.json` is real end to end (Snapdragon 8 Elite for
-Galaxy / SM8750, 8 cores, ~10.9 GB RAM, Android 16) — `docs/GAPS.md` #5.
-
-### The `data/` receipts rule
-
-**Nothing in `data/` is a guess without a receipt.** Every mocked file has a
-`_real_*_log.md` beside it recording the actual tool calls attempted, their
-arguments, and the verbatim error strings that forced the mock. Real captures
-are marked `_mock: false`. A labeled stub with a logged reason is correct here;
-an invented latency figure is not.
-
----
-
-## Gaps
-
-Full writeup in [`docs/GAPS.md`](docs/GAPS.md). Summary:
-
-1. **`hardware_detect` self-detects the server's own container**, not the
-   client device, when called directly over MCP (`quad-client detect` works
-   around this with a local static probe).
-2. **G8** — the real `quad.privacy` PII guardrail isn't present in this
-   checkout. `src/two_brain_router/privacy/` mocks its detect/mask/rehydrate
-   contract so the router logic is real and testable.
-3. **`convert_model`'s compiler is broken on two independent execution
-   paths** — see above. Five real attempts, logged. Not fixable from this
-   client; don't spend a session retrying variations.
-4. **Cloud AI 100 has no plumbing anywhere in QUAD-Client-main** — no
-   platform/SDK/device value maps to it in any tool schema.
-5. **`quad_mcp_client`'s android hardware-detection path** returns placeholder
-   values even when adb is authorized and reachable.
 
 ---
 
