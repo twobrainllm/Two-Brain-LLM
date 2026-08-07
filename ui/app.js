@@ -15,34 +15,37 @@
 const STORAGE_KEY = "twoBrainChats";
 const GROUP_ORDER = ["Today", "Yesterday", "Previous 7 Days", "Previous 30 Days", "Older"];
 
-//: `src/two_brain_router/api.py`'s default bind address/port.
-/**
- * `src/two_brain_router/api.py`'s port, on whatever host is serving this page.
+/** How much prior conversation is sent back with each query.
  *
- * Derived rather than hardcoded so the UI works from a phone: opened over the
- * LAN, `127.0.0.1` would mean *the phone itself*, which is not running the
- * router. Falls back to loopback for `file://`, where there is no host to
- * borrow. Override with `?api=http://host:port` when the API is somewhere
- * else entirely.
+ * The router is deliberately stateless -- `api.py` shares ONE `TwoBrainRouter`
+ * across every request and every browser tab (the NPU's Genie session is far
+ * too expensive to rebuild per request), so history kept there would leak
+ * between unrelated chats. The client owns it instead, and this is where the
+ * bound lives.
  *
- * Reaching this from another device also needs api.py started with
- * `--host 0.0.0.0`; loopback-only is its deliberate default.
+ * Bounded on three axes because an unbounded history is expensive in three
+ * ways: the on-device model's prompt grows (it already takes 4-12s per query
+ * and its compiled context length is finite), and on an escalation the history
+ * is masked and sent to the cloud -- so every extra turn is both latency and
+ * privacy surface. `compress_context` truncates to 800 chars server-side
+ * anyway; keeping the client's budget near that avoids shipping text that is
+ * only going to be thrown away.
  */
-const API_BASE_URL = (() => {
-  const override = new URLSearchParams(window.location.search).get("api");
-  if (override) return override.replace(/\/$/, "");
+const HISTORY_MAX_MESSAGES = 6; // ~3 turns
+const HISTORY_MAX_CHARS_PER_MESSAGE = 300;
+const HISTORY_MAX_CHARS_TOTAL = 1200;
 
-  const { protocol, hostname } = window.location;
-  if (protocol === "file:" || !hostname) return "http://127.0.0.1:8765";
-
-  // Served over HTTPS means ui/serve_https.py, which proxies /route and
-  // /health on its own origin. Use that origin: an HTTPS page is forbidden
-  // from fetching an http:// URL (mixed content), so reaching out to
-  // :8765 directly would be blocked by the browser regardless of ports.
-  if (protocol === "https:") return "";
-
-  return `${protocol}//${hostname}:8765`;
-})();
+/** Where `two_brain_router.api` is listening.
+ *
+ * Overridable with `?api=http://host:port` so a second router can be pointed
+ * at without editing this file -- two servers on different ports (comparing
+ * `--tier pc` against `--tier mobile`, or a new build against a running one),
+ * or a LAN demo where the API is on another machine. The default is the
+ * loopback address `api.py` binds by default, so the common case needs no
+ * query string at all.
+ */
+const API_BASE_URL =
+  new URLSearchParams(location.search).get("api") || "http://127.0.0.1:8765";
 
 // data/hardware_detect/{ai_pc,mobile}.json -- real quad-client detect /
 // adb shell captures, matching profiler.js's own DEVICE_CONTEXT convention.
@@ -59,30 +62,8 @@ const els = {
   emptyStateAvatar: document.getElementById("empty-state-avatar"),
   messages: document.getElementById("messages"),
   composer: document.getElementById("composer"),
-  composerInner: document.querySelector(".composer-inner"),
   composerInput: document.getElementById("composer-input"),
-  composerAttachments: document.getElementById("composer-attachments"),
-  dictation: document.getElementById("dictation"),
-  dictationWave: document.getElementById("dictation-wave"),
-  dictationTime: document.getElementById("dictation-time"),
-  dictationTranscript: document.getElementById("dictation-transcript"),
-  dictationCancel: document.getElementById("dictation-cancel"),
-  dictationConfirm: document.getElementById("dictation-confirm"),
-  videomode: document.getElementById("videomode"),
-  videomodePreview: document.getElementById("videomode-preview"),
-  videomodeClose: document.getElementById("videomode-close"),
-  videomodeFlip: document.getElementById("videomode-flip"),
-  videomodeShutter: document.getElementById("videomode-shutter"),
-  videomodeStatus: document.getElementById("videomode-status"),
   sendBtn: document.getElementById("send-btn"),
-  fileInput: document.getElementById("file-input"),
-  imageInput: document.getElementById("image-input"),
-  videoInput: document.getElementById("video-input"),
-  attachFileBtn: document.getElementById("attach-file-btn"),
-  attachImageBtn: document.getElementById("attach-image-btn"),
-  attachVideoBtn: document.getElementById("attach-video-btn"),
-  videoModeBtn: document.getElementById("video-mode-btn"),
-  voiceModeBtn: document.getElementById("voice-mode-btn"),
   brainToggle: document.getElementById("brain-toggle"),
   exprButtons: document.getElementById("expr-buttons"),
   robotTemplate: document.getElementById("robot-svg-template"),
@@ -100,8 +81,27 @@ const els = {
   profilerCostValue: document.getElementById("profiler-cost-value"),
   profilerNotes: document.getElementById("profiler-notes"),
   profilerFooter: document.getElementById("profiler-footer"),
-  backendStatus: document.getElementById("backend-status"),
+  emptyStateHint: document.getElementById("empty-state-hint"),
+  brainToggleLabel: document.getElementById("brain-toggle-label"),
+  attachBtn: document.getElementById("attach-btn"),
+  attachInput: document.getElementById("attach-input"),
+  attachmentPreview: document.getElementById("attachment-preview"),
+  attachmentThumb: document.getElementById("attachment-thumb"),
+  attachmentName: document.getElementById("attachment-name"),
+  attachmentRemove: document.getElementById("attachment-remove"),
+  brainToggleWrap: document.getElementById("brain-toggle-wrap"),
+  expressionPreviewWrap: document.getElementById("expression-preview-wrap"),
+  modelPicker: document.getElementById("model-picker"),
+  modelSelect: document.getElementById("model-select"),
+  modelDetail: document.getElementById("model-detail"),
 };
+
+/** Ceiling on an attached image, matching `api.py`'s `MAX_IMAGE_CHARS`.
+ *
+ * Checked here as well as server-side so an oversized file is refused before
+ * it is base64'd and pushed over the wire, rather than after. Base64 inflates
+ * by ~4/3, hence the ratio. */
+const MAX_IMAGE_BYTES = 3_300_000;
 
 const LOOK_DIRECTIONS = ["left", "right", "up", "down"];
 const LOOK_VARIANTS = ["look", "shrink-look", "expand-look"];
@@ -171,7 +171,13 @@ async function playThinkingLooksUntilSettled(avatarEl, pending, rhythmMs) {
   );
   let i = 0;
   do {
-    playExpression(avatarEl, order[i % order.length], rhythmMs);
+    // `avatarEl` may be a getter rather than an element: on a split, the local
+    // bubble finalises mid-flight and a *new* pending row opens for the cloud,
+    // so the avatar that should be animating changes while this loop runs.
+    // Resolving each beat lets the animation follow it instead of drumming its
+    // fingers on a bubble that has already been answered.
+    const el = typeof avatarEl === "function" ? avatarEl() : avatarEl;
+    playExpression(el, order[i % order.length], rhythmMs);
     i++;
     await sleep(rhythmMs);
   } while (!settled);
@@ -208,11 +214,18 @@ function activePreviewAvatar() {
   return els.emptyStateAvatar;
 }
 
-/** Badge text per `tier_answered`. `"hybrid"` is a real third outcome, not a
- * flavour of "cloud": the on-device model answered part of the query and only
- * the part it flagged as beyond it was sent on. Saying "Cloud brain" there
- * would understate what stayed local, and "Local brain" would hide that
- * anything left at all. */
+/** Badge text per message tier.
+ *
+ * A split turn is rendered as **two messages** -- the local answer, then the
+ * cloud's completion beneath it -- so `local` and `cloud` are what new messages
+ * ever carry. Two bubbles beat one merged bubble here because the whole point
+ * of this architecture is that two different models answered two different
+ * parts, and a single blob with a combined label hides exactly that.
+ *
+ * `hybrid` survives for two reasons: chats saved before the split-render change
+ * still hold merged messages, and the profiler still describes the *turn* as a
+ * whole (where "Local + Cloud" is the accurate summary).
+ */
 const TIER_BADGE_LABEL = {
   local: "Local brain",
   cloud: "Cloud brain",
@@ -228,9 +241,9 @@ const state = {
   currentTier: "local",
   searchQuery: "",
   backendLive: null, // null = not checked yet, true/false after checkBackend()
-  attachments: [],
-  videoMode: false,
-  listening: false,
+  attachment: null,  // {name, dataUrl} while one is staged for the next send
+  models: [],        // from GET /models -- only what is installed
+  modelId: null,     // the selected local model, sent with every query
 };
 
 function loadChats() {
@@ -278,11 +291,7 @@ function chatMatchesSearch(chat, query) {
   if (!query) return true;
   const q = query.toLowerCase();
   if (chat.title.toLowerCase().includes(q)) return true;
-  return chat.messages.some(
-    (m) =>
-      m.content.toLowerCase().includes(q) ||
-      m.attachments?.some((a) => a.name.toLowerCase().includes(q))
-  );
+  return chat.messages.some((m) => m.content.toLowerCase().includes(q));
 }
 
 function renderChatList() {
@@ -423,22 +432,192 @@ function renderMessageEl(msg) {
     bubble.appendChild(badge);
   }
 
-  if (msg.attachments?.length) {
-    const attachRow = document.createElement("div");
-    for (const att of msg.attachments) {
-      attachRow.appendChild(attachmentChipEl(att, { removable: false }));
-    }
-    bubble.appendChild(attachRow);
+  // The boundary-crossing disclosure is part of the message, not just the live
+  // row: this function rebuilds the whole transcript at the end of every turn
+  // (and on load), so anything only painted onto the in-flight row vanishes the
+  // moment the answer lands. It was doing exactly that before this.
+  if (msg.role === "assistant" && msg.crossing) {
+    renderCrossing(bubble, msg.crossing);
   }
 
-  if (msg.content) {
-    const text = document.createElement("div");
-    text.innerHTML = escapeHtml(msg.content).replace(/\n/g, "<br>");
-    bubble.appendChild(text);
+  // A user message can carry an image. Shown inline so the transcript records
+  // what was actually asked -- and it never left this machine: `api.py` decodes
+  // it to a temp file the local VLM reads, and only a masked *textual*
+  // description is ever eligible to cross the boundary.
+  if (msg.role === "user" && msg.image) {
+    const img = document.createElement("img");
+    img.className = "message-image";
+    img.src = msg.image;
+    img.alt = "Attached image";
+    bubble.appendChild(img);
   }
+
+  const text = document.createElement("div");
+  // Assistant replies arrive as Markdown -- headings, **bold**, numbered lists,
+  // fenced code -- and were rendering literally, so cloud answers arrived full
+  // of asterisks and hashes. `renderMarkdown` (markdown.js) escapes the model's
+  // output *first* and only then applies a fixed pattern set, so untrusted
+  // output still cannot inject HTML.
+  //
+  // User messages stay plain on purpose: the user typed them, and silently
+  // reformatting someone's own words is worse than showing them verbatim.
+  if (msg.role === "assistant" && typeof renderMarkdown === "function") {
+    text.className = "markdown";
+    text.innerHTML = renderMarkdown(msg.content ?? "");
+  } else {
+    text.innerHTML = escapeHtml(msg.content ?? "").replace(/\n/g, "<br>");
+  }
+  bubble.appendChild(text);
 
   row.appendChild(bubble);
   return row;
+}
+
+/**
+ * Retags a live row as belonging to a different brain -- badge text, badge dot
+ * and avatar colour together.
+ *
+ * Needed because a row's tier is not always known when it is created: a turn
+ * opens as a blue "local" pending row, and only the `escalating` progress event
+ * reveals that the local model produced nothing and the cloud is answering
+ * instead. Repainting beats guessing, and beats leaving it blue while the cloud
+ * works.
+ */
+/**
+ * Renders the "what crossed the boundary" disclosure into a bubble.
+ *
+ * Shows the masked text that was actually sent, plus each substitution as
+ * `typed -> placeholder`. The raw values are the user's own words, already on
+ * their screen -- and showing them beside the placeholders is the whole point:
+ * a masked string on its own proves nothing without what it replaced.
+ *
+ * Inserted above whatever else the bubble holds so it stays visible as the
+ * answer streams in beneath it.
+ */
+function renderCrossing(container, payload) {
+  // Takes the `.bubble` element itself rather than the live-bubble state
+  // object, because `renderMessageEl` builds a bubble *before* attaching it to
+  // its row -- a row-based lookup finds nothing there and silently renders
+  // none of this.
+  if (!container || !payload) return;
+  if (container.querySelector && container.querySelector(".crossing")) return;
+  const subs = payload.substitutions || [];
+  const rows = subs
+    .map((s) =>
+      `<div class="crossing-sub"><code>${escapeHtml(s.value)}</code>` +
+      `<span class="crossing-arrow">-></span>` +
+      `<code class="crossing-mask">${escapeHtml(s.placeholder)}</code></div>`
+    )
+    .join("");
+
+  const el = document.createElement("details");
+  el.className = "crossing";
+  // The chevron is the only thing telling anyone this opens: the native
+  // <details> marker is hidden in CSS (it renders inconsistently across
+  // browsers and clashes with the lock), so without this the row is silently
+  // clickable -- which is the same as not being clickable at all. It rotates
+  // 180 degrees on open, so the icon also reports the current state.
+  el.innerHTML =
+    `<summary><span class="crossing-lock">&#128274;</span>` +
+    `<span class="crossing-summary-text">` +
+    (subs.length
+      ? `${subs.length} item${subs.length === 1 ? "" : "s"} masked before leaving this device`
+      : `Sent to the cloud (no PII found)`) +
+    `</span>` +
+    `<svg class="crossing-chevron" viewBox="0 0 20 20" width="12" height="12" fill="none" aria-hidden="true">` +
+    `<path d="M5 8l5 5 5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
+    `</summary>` +
+    (rows ? `<div class="crossing-subs">${rows}</div>` : "") +
+    `<div class="crossing-label">Sent off-device:</div>` +
+    `<pre class="crossing-text">${escapeHtml(payload.query || "")}</pre>` +
+    (payload.context
+      ? `<div class="crossing-label">With context:</div>` +
+        `<pre class="crossing-text">${escapeHtml(payload.context)}</pre>`
+      : "");
+
+  const badge = container.querySelector ? container.querySelector(".tier-badge") : null;
+  if (badge && badge.nextSibling) container.insertBefore(el, badge.nextSibling);
+  else container.appendChild(el);
+}
+
+function setRowTier(row, tier) {
+  const avatar = row.querySelector(".robot-avatar");
+  if (avatar) avatar.dataset.tier = tier;
+  const badge = row.querySelector(".tier-badge");
+  if (badge) {
+    badge.innerHTML =
+      `<span class="tier-dot" data-tier="${tier}"></span>` +
+      (TIER_BADGE_LABEL[tier] ?? TIER_BADGE_LABEL.local);
+  }
+}
+
+/** Replaces everything in a row's bubble except its tier badge. */
+function replaceBubbleBody(row, nodes) {
+  const bubble = row.querySelector(".bubble");
+  if (!bubble) return null;
+  [...bubble.children].forEach((el) => {
+    if (!el.classList.contains("tier-badge")) el.remove();
+  });
+  for (const node of nodes) bubble.appendChild(node);
+  return bubble;
+}
+
+/**
+ * Turns a pending row into a finished answer from one brain.
+ *
+ * Used for the local half of a split the moment it arrives, so it reads as a
+ * completed message from the local brain rather than as a half-drawn one --
+ * which is the point of showing it early at all.
+ */
+function finalizeAssistantRow(row, { tier, content }) {
+  row.querySelector(".robot-avatar")?.classList.remove("thinking");
+  setRowTier(row, tier);
+  const text = document.createElement("div");
+  // Same Markdown treatment as a persisted message, so the local half looks
+  // identical live and after the turn is saved and re-rendered.
+  if (typeof renderMarkdown === "function") {
+    text.className = "markdown";
+    text.innerHTML = renderMarkdown(content ?? "");
+  } else {
+    text.innerHTML = escapeHtml(content ?? "").replace(/\n/g, "<br>");
+  }
+  replaceBubbleBody(row, [text]);
+}
+
+/**
+ * The inner markup of a "waiting on the cloud" placeholder.
+ *
+ * Shared by `renderCloudPending` (which owns a whole row) and the live
+ * streaming path (which writes into a bubble it is already holding a reference
+ * to, and so cannot use `replaceBubbleBody` without dropping that reference).
+ * One function so the two cannot drift into wording the same wait differently.
+ *
+ * Leads with "Thinking" in both branches, because that word is the part doing
+ * the work: this is shown the instant the router *decides* to cross, which can
+ * be many seconds before the cloud emits its first token. `gap` is the
+ * interesting detail when there is one -- it names exactly what the local model
+ * could not do, and therefore exactly what is crossing the boundary. With no
+ * gap the whole query is going, and this says that rather than implying a split
+ * that isn't happening.
+ */
+function cloudPendingHtml(gap) {
+  return (
+    `<span class="cloud-pending-dots"><i></i><i></i><i></i></span>` +
+    `<span class="cloud-pending-text">` +
+    (gap
+      ? `Thinking… answering the rest: ${escapeHtml(gap)}`
+      : `Thinking… escalating the whole query to the cloud`) +
+    `</span>`
+  );
+}
+
+/** Marks a row as waiting on the cloud, optionally naming the gap being asked. */
+function renderCloudPending(row, gap) {
+  setRowTier(row, "cloud");
+  const pending = document.createElement("div");
+  pending.className = "cloud-pending";
+  pending.innerHTML = cloudPendingHtml(gap);
+  replaceBubbleBody(row, [pending]);
 }
 
 function scrollToBottom() {
@@ -558,11 +737,296 @@ async function sendToRouter(query, context) {
   const res = await fetch(`${API_BASE_URL}/route`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, context }),
+    body: JSON.stringify({ query, context, model: state.modelId || undefined }),
   });
   const body = await res.json();
   if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
   return body;
+}
+
+/* ── Image attachment ───────────────────────────────────────────────────── */
+
+function clearAttachment() {
+  state.attachment = null;
+  if (els.attachInput) els.attachInput.value = "";
+  if (els.attachmentPreview) els.attachmentPreview.hidden = true;
+  els.attachBtn?.classList.remove("has-image");
+  updateSendState();
+}
+
+/**
+ * Reads a chosen file into a data URL and shows a preview.
+ *
+ * The image never leaves this machine: `api.py` decodes it to a temp file, the
+ * local VLM reads it, and — if the query escalates — only a *masked textual
+ * description* crosses the boundary, never the pixels. The cloud tier has no
+ * vision model at all, so there is nowhere for an image to go even if we
+ * wanted to send one. The preview says so, because "where did my photo go" is
+ * the first thing anyone should be able to answer.
+ */
+function setAttachment(file) {
+  if (!file) return;
+  if (file.size > MAX_IMAGE_BYTES) {
+    alert(
+      `That image is ${(file.size / 1e6).toFixed(1)} MB; the limit is ` +
+      `${(MAX_IMAGE_BYTES / 1e6).toFixed(1)} MB.`
+    );
+    clearAttachment();
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    state.attachment = { name: file.name, dataUrl: String(reader.result) };
+    if (els.attachmentThumb) els.attachmentThumb.src = state.attachment.dataUrl;
+    if (els.attachmentName) els.attachmentName.textContent = file.name;
+    if (els.attachmentPreview) els.attachmentPreview.hidden = false;
+    els.attachBtn?.classList.add("has-image");
+    updateSendState();
+  };
+  reader.readAsDataURL(file);
+}
+
+/**
+ * Token-level streaming over Server-Sent Events (`POST /route/sse`).
+ *
+ * `onEvent(kind, payload)` is called per frame:
+ *
+ *   meta  {tier, streaming}      once, before any text
+ *   delta {text, tier}           repeatedly, tier-attributed
+ *   tier  {tier, gap}            a split opening the cloud's bubble
+ *   done  {...RouteDecision}     once
+ *   error {error}                in-band, since the status line is long sent
+ *
+ * `EventSource` cannot be used: it is GET-only, and this request carries a JSON
+ * body with an optional base64 image. So the `fetch` body is read as a stream
+ * and the frames parsed by hand.
+ *
+ * **Only the local model's `solution` field arrives as deltas** — the router
+ * strips the surrounding JSON before it ever reaches the wire, so a bubble is
+ * never seen filling with `{"solution": "`.
+ *
+ * Frames are separated by a blank line and split across chunk boundaries
+ * arbitrarily, so `buffer` holds the incomplete tail between reads.
+ */
+async function sendToRouterSSE(query, context, imageDataUrl, onEvent, signal) {
+  const res = await fetch(`${API_BASE_URL}/route/sse`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query,
+      context,
+      image: imageDataUrl || undefined,
+      // Sent every time, so the server cannot drift out of sync with the
+      // dropdown. An unchanged id is a no-op server-side.
+      model: state.modelId || undefined,
+    }),
+    signal,
+  });
+  if (res.status === 404) {
+    // A server older than this endpoint. Degrade to the non-streaming path
+    // rather than to the offline preview -- the API *is* reachable, and
+    // claiming "no model ran" about a working router is a lie that sends
+    // someone hunting the wrong problem. (This is exactly what happened: a
+    // stale server kept port 8765, the new one failed to bind, and the UI
+    // reported the backend as down.)
+    console.warn("/route/sse not found — falling back to /route/stream");
+    const body = await sendToRouterStreaming(query, context, (progress) => {
+      if (progress.phase === "local_answer") {
+        onEvent("delta", { text: progress.local_answer, tier: "local" });
+        if (progress.gap) onEvent("tier", { tier: "cloud", gap: progress.gap });
+      }
+    });
+    // The pre-SSE endpoints deliver whole halves, not tokens, so emit whatever
+    // the deltas above did not already cover.
+    if (body.tier_answered === "hybrid") {
+      onEvent("delta", { text: body.cloud_answer, tier: "cloud" });
+    } else {
+      onEvent("delta", { text: body.answer, tier: body.tier_answered });
+    }
+    onEvent("done", body);
+    return body;
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `HTTP ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      if (!data) continue;
+      let payload;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        continue; // keep-alive or a partial frame; not fatal
+      }
+      if (event === "error") throw new Error(payload.error || "stream failed");
+      if (event === "done") result = payload;
+      onEvent(event, payload);
+    }
+  }
+  if (!result) throw new Error("stream ended without a result");
+  return result;
+}
+
+/**
+ * Streaming call: POSTs to `/route/stream` and resolves with the final result,
+ * calling `onProgress` with the local half as soon as the server has it.
+ *
+ * Why bother: the local model answers in ~4s and the cloud gap-fill has been
+ * measured at 15s+, so the non-streaming `/route` spends most of its wall-clock
+ * sitting on an answer that was ready the whole time. This shows that answer
+ * immediately and lets the cloud half land when it lands.
+ *
+ * NDJSON, one JSON object per line. Lines can be split across chunk
+ * boundaries, so `buf` holds the incomplete tail between reads -- parsing per
+ * chunk instead would fail intermittently on exactly the long answers this
+ * feature exists for.
+ *
+ * Falls back to non-streaming `/route` on 404, so a UI newer than its server
+ * degrades to "slower" rather than to the offline preview, which would wrongly
+ * claim nothing ran.
+ */
+async function sendToRouterStreaming(query, context, onProgress) {
+  const res = await fetch(`${API_BASE_URL}/route/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, context, model: state.modelId || undefined }),
+  });
+  if (res.status === 404) return sendToRouter(query, context);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let result = null;
+
+  const handleLine = (line) => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    if (msg.type === "progress") onProgress?.(msg);
+    else if (msg.type === "result") result = msg;
+    else if (msg.type === "error") throw new Error(msg.error);
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop(); // keep the (possibly incomplete) tail for the next read
+    for (const line of lines) handleLine(line);
+  }
+  if (buf.trim()) handleLine(buf);
+
+  if (!result) throw new Error("stream ended without a result");
+  return result;
+}
+
+/**
+ * Builds the `context` string sent with a query: the recent turns of *this*
+ * chat, oldest-first, so "explain in more detail" has something to refer to.
+ *
+ * `excludeLast` drops the message just pushed -- the current query is sent
+ * separately as `query`, and repeating it in the context would have the local
+ * model answering it twice.
+ *
+ * Truncation is oldest-first (`slice(-N)`) because recency is what resolves a
+ * pronoun. The per-message cap keeps one long answer from crowding out the
+ * turns around it, which is the case that actually breaks reference
+ * resolution -- a single 4000-char reply would otherwise be the entire budget.
+ */
+function buildConversationContext(chat, excludeLast = true) {
+  if (!chat) return "";
+  let msgs = chat.messages.filter((m) => m.role === "user" || m.role === "assistant");
+  if (excludeLast) msgs = msgs.slice(0, -1);
+  msgs = msgs.slice(-HISTORY_MAX_MESSAGES);
+  if (!msgs.length) return "";
+
+  const lines = msgs.map((m) => {
+    const who = m.role === "user" ? "User" : "Assistant";
+    let body = (m.content || "").replace(/\s+/g, " ").trim();
+    if (body.length > HISTORY_MAX_CHARS_PER_MESSAGE) {
+      body = body.slice(0, HISTORY_MAX_CHARS_PER_MESSAGE) + "…";
+    }
+    return `${who}: ${body}`;
+  });
+
+  let out = `Earlier in this conversation:\n${lines.join("\n")}`;
+  if (out.length > HISTORY_MAX_CHARS_TOTAL) {
+    // Trim from the front: the newest turns are the ones a follow-up refers to.
+    out = "Earlier in this conversation (truncated):\n" +
+      out.slice(out.length - HISTORY_MAX_CHARS_TOTAL);
+  }
+  return out;
+}
+
+/**
+ * Loads the installed local models and populates the picker.
+ *
+ * `GET /models` returns only what is actually on disk, so the dropdown never
+ * offers something that will fail 17 seconds into a cold load. Hidden entirely
+ * when the backend is down or there is nothing to choose between -- a
+ * single-entry dropdown is a decoration, not a control.
+ */
+async function loadModels() {
+  try {
+    const res = await fetch(`${API_BASE_URL}/models`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    state.models = body.models || [];
+    state.modelId = body.active || state.modelId || state.models[0]?.id || null;
+  } catch {
+    state.models = [];
+    state.modelId = null;
+  }
+  renderModelPicker();
+}
+
+function renderModelPicker() {
+  if (!els.modelPicker || !els.modelSelect) return;
+  const show = state.models.length > 1;
+  els.modelPicker.hidden = !show;
+  if (!show) return;
+
+  els.modelSelect.innerHTML = state.models
+    .map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`)
+    .join("");
+  if (state.modelId) els.modelSelect.value = state.modelId;
+  const active = state.models.find((m) => m.id === els.modelSelect.value);
+  if (els.modelDetail) els.modelDetail.textContent = active ? active.detail : "";
+}
+
+/**
+ * Switching model closes the running brain and cold-loads the new one -- 12s
+ * for the NPU, ~17s for the 8B. The server does that work on the next query
+ * rather than eagerly, so the select is only disabled while a query is
+ * actually in flight; here it just records the choice and updates the caption.
+ */
+function onModelChange() {
+  state.modelId = els.modelSelect.value;
+  const active = state.models.find((m) => m.id === state.modelId);
+  if (els.modelDetail) {
+    els.modelDetail.textContent = active
+      ? `${active.detail} - first query after a switch pays a cold load`
+      : "";
+  }
 }
 
 /** Adapts a /route response into the metrics shape `renderProfiler` and
@@ -605,11 +1069,32 @@ async function checkBackend() {
 
 function setBackendStatus(live, tier) {
   state.backendLive = live;
-  if (!els.backendStatus) return;
-  els.backendStatus.textContent = live
-    ? `● Live — routing as ${tier}`
-    : "○ API offline — replies use the offline preview";
-  els.backendStatus.dataset.live = String(live);
+  // Reported in the empty state rather than a permanent sidebar box: it is
+  // read once, when you are deciding whether to trust the next reply, and a
+  // status chip sitting in the corner for the whole session is noise after
+  // that. The tier toggle's own label doubles as the reminder, since offline
+  // is the only time that toggle does anything.
+  if (els.emptyStateHint) {
+    els.emptyStateHint.textContent = live
+      ? `Connected to the two-brain router — routing as ${tier}.`
+      : `Router not reachable at ${API_BASE_URL}. Replies fall back to an offline preview.`;
+    els.emptyStateHint.dataset.live = String(live);
+  }
+  if (els.brainToggleLabel) {
+    els.brainToggleLabel.textContent = live
+      ? "Preview tier (unused while live)"
+      : "Preview tier (offline)";
+  }
+
+  // Both sidebar panels are demo controls. When the router is live the tier
+  // toggle cannot force anything -- `route()` decides -- and the expression
+  // buttons only preview animations. Hidden rather than left present-but-inert:
+  // a control that looks live and does nothing is worse than no control. When
+  // the backend is *down* the toggle is the only thing that does anything, so
+  // it comes back.
+  for (const el of [els.brainToggleWrap, els.expressionPreviewWrap]) {
+    if (el) el.hidden = Boolean(live);
+  }
 }
 
 /**
@@ -629,554 +1114,26 @@ function mockRespond(query, tier) {
   );
 }
 
-/* ---------- Composer attachments ----------
- *
- * Only file *metadata* (name, size, kind) is kept -- never the bytes. Chats
- * live in localStorage (~5MB per origin), so stashing a single PDF there
- * would blow the quota and take the whole history down with it. Nothing
- * reads or uploads the file contents yet either; wiring that up belongs with
- * the `/route` endpoint in README.md's step 1, alongside the repo's existing
- * image path (local VLM sees the image, cloud gets a masked description).
- */
-
-const MAX_ATTACHMENTS = 10;
-
-function formatBytes(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function addAttachments(fileList, kind) {
-  for (const file of fileList) {
-    if (state.attachments.length >= MAX_ATTACHMENTS) break;
-    state.attachments.push({
-      id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      name: file.name,
-      size: file.size,
-      kind,
-    });
-  }
-  renderAttachments();
-  updateSendState();
-}
-
-function removeAttachment(id) {
-  state.attachments = state.attachments.filter((a) => a.id !== id);
-  renderAttachments();
-  updateSendState();
-}
-
-function attachmentChipEl(att, { removable }) {
-  const chip = document.createElement("span");
-  chip.className = "attachment-chip";
-
-  const ICONS = {
-    image:
-      '<svg viewBox="0 0 20 20" width="13" height="13" fill="none"><rect x="2.5" y="4" width="15" height="12" rx="2.5" stroke="currentColor" stroke-width="1.5"/><path d="M3 13.5l3.6-3.2a1.5 1.5 0 0 1 2 0L13 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
-    video:
-      '<svg viewBox="0 0 20 20" width="13" height="13" fill="none"><rect x="2.5" y="5" width="10.5" height="10" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M13 9l3.4-2.4a.7.7 0 0 1 1.1.6v5.6a.7.7 0 0 1-1.1.6L13 11z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
-    file:
-      '<svg viewBox="0 0 20 20" width="13" height="13" fill="none"><path d="M11.5 2.5H6a1.5 1.5 0 0 0-1.5 1.5v12A1.5 1.5 0 0 0 6 17.5h8a1.5 1.5 0 0 0 1.5-1.5V6.5zM11.5 2.5v4h4" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
-  };
-  const icon = document.createElement("span");
-  icon.innerHTML = ICONS[att.kind] || ICONS.file;
-  chip.appendChild(icon);
-
-  const name = document.createElement("span");
-  name.className = "attachment-chip-name";
-  name.textContent = att.name;
-  chip.appendChild(name);
-
-  const size = document.createElement("span");
-  size.className = "attachment-chip-size";
-  size.textContent = formatBytes(att.size);
-  chip.appendChild(size);
-
-  if (removable) {
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "attachment-chip-remove";
-    remove.setAttribute("aria-label", `Remove ${att.name}`);
-    remove.innerHTML = '<svg viewBox="0 0 20 20" width="11" height="11" fill="none"><path d="M5 5l10 10M15 5L5 15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
-    remove.addEventListener("click", () => removeAttachment(att.id));
-    chip.appendChild(remove);
-  }
-
-  return chip;
-}
-
-function renderAttachments() {
-  els.composerAttachments.innerHTML = "";
-  els.composerAttachments.hidden = state.attachments.length === 0;
-  for (const att of state.attachments) {
-    els.composerAttachments.appendChild(attachmentChipEl(att, { removable: true }));
-  }
-}
-
-function clearAttachments() {
-  state.attachments = [];
-  els.fileInput.value = "";
-  els.imageInput.value = "";
-  renderAttachments();
-}
-
-/* ---------- Dictation (voice -> text) ----------
- *
- * ChatGPT's composer dictation, rebuilt: tapping the mic swaps the textarea
- * for a live waveform + elapsed timer with discard/insert buttons, and the
- * transcript lands in the textarea to edit before sending -- it never sends
- * on its own.
- *
- * Two independent browser APIs run at once, on purpose:
- *   - getUserMedia + AnalyserNode drives the waveform off real mic amplitude,
- *     so the bars reflect the actual signal instead of animating on a timer.
- *   - SpeechRecognition produces the transcript.
- * Neither one alone does both jobs: SpeechRecognition exposes no audio levels,
- * and an AnalyserNode can't transcribe.
- *
- * PRIVACY NOTE, and it matters for this repo specifically: Chrome's
- * SpeechRecognition is *not* on-device -- it streams audio to Google's servers
- * for transcription. For a project whose whole thesis is that the local brain
- * keeps data on the device, dictation is therefore a cloud hop that happens
- * before the router ever sees the query, and it bypasses PIIGuard entirely
- * (privacy/guard.py only ever sees the resulting text). Swapping this for a
- * local Whisper endpoint behind README.md step 1's API server is the fix.
- */
-
-const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
-
-const WAVE_BARS = 48;
-const WAVE_TICK_MS = 55;
-const WAVE_GAIN = 2.4;
-
-const dictation = {
-  recognition: null,
-  stream: null,
-  audioCtx: null,
-  analyser: null,
-  sampleBuf: null,
-  rafId: null,
-  timerId: null,
-  startedAt: 0,
-  lastTickAt: 0,
-  levels: new Array(WAVE_BARS).fill(0),
-  finalText: "",
-  interimText: "",
-};
-
-function buildWaveBars() {
-  els.dictationWave.innerHTML = "";
-  for (let i = 0; i < WAVE_BARS; i++) {
-    const bar = document.createElement("div");
-    bar.className = "wave-bar";
-    els.dictationWave.appendChild(bar);
-  }
-}
-
-function paintWave() {
-  const bars = els.dictationWave.children;
-  for (let i = 0; i < bars.length; i++) {
-    // 2px floor keeps a visible idle line during silence, like ChatGPT's.
-    bars[i].style.height = `${2 + dictation.levels[i] * 30}px`;
-  }
-}
-
-/** RMS of the current frame, 0..1, mildly boosted so speech fills the bar height. */
-function currentLevel() {
-  dictation.analyser.getByteTimeDomainData(dictation.sampleBuf);
-  let sumSquares = 0;
-  for (const sample of dictation.sampleBuf) {
-    const centered = (sample - 128) / 128;
-    sumSquares += centered * centered;
-  }
-  const rms = Math.sqrt(sumSquares / dictation.sampleBuf.length);
-  return Math.min(rms * WAVE_GAIN, 1);
-}
-
-/**
- * Mobile's stand-in for the amplitude meter: a travelling wave, so the panel
- * reads as "listening" without pretending to show the microphone signal.
- * See startDictation for why the real meter cannot run here.
- */
-function pulseFrame(now) {
-  dictation.rafId = requestAnimationFrame(pulseFrame);
-  if (now - dictation.lastTickAt < WAVE_TICK_MS) return;
-  dictation.lastTickAt = now;
-  const t = now / 260;
-  for (let i = 0; i < WAVE_BARS; i++) {
-    dictation.levels[i] = 0.18 + 0.32 * (Math.sin(t - i / 5) + 1) / 2;
-  }
-  paintWave();
-}
-
-function waveFrame(now) {
-  dictation.rafId = requestAnimationFrame(waveFrame);
-  if (now - dictation.lastTickAt < WAVE_TICK_MS) return;
-  dictation.lastTickAt = now;
-  dictation.levels.shift();
-  dictation.levels.push(currentLevel());
-  paintWave();
-}
-
-function formatElapsed(ms) {
-  const total = Math.floor(ms / 1000);
-  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
-}
-
-function renderTranscript() {
-  // The transcript is deliberately NOT shown while recording -- ChatGPT's
-  // dictation shows only the waveform and the timer, and the text appears in
-  // the composer when you confirm. Watching words rewrite themselves as the
-  // recogniser revises its guess is distracting, and it invites reading
-  // instead of speaking. It is still accumulated in `dictation`; this only
-  // decides what is painted. showDictationError() still writes here, because
-  // an error is the one thing worth interrupting for.
-  els.dictationTranscript.innerHTML = "";
-  // Never disabled. It was, when there was no transcript yet -- which made the
-  // button unpressable in exactly the case where the user most needs a way
-  // out, and read as "the tick is broken" rather than "nothing was heard".
-  // Confirming with an empty transcript simply closes the panel.
-  els.dictationConfirm.disabled = false;
-}
-
-function showDictationError(message) {
-  els.dictationTranscript.innerHTML = "";
-  const err = document.createElement("span");
-  err.className = "dictation-error";
-  err.textContent = message;
-  els.dictationTranscript.appendChild(err);
-}
-
-async function startDictation() {
-  if (!SpeechRecognitionCtor) return;
-
-  els.composerInner.dataset.dictating = "true";
-  els.dictation.hidden = false;
-  els.dictation.dataset.tier = state.currentTier;
-  els.voiceModeBtn.setAttribute("aria-pressed", "true");
-  state.listening = true;
-
-  dictation.finalText = "";
-  dictation.interimText = "";
-  dictation.levels = new Array(WAVE_BARS).fill(0);
-  dictation.startedAt = performance.now();
-  buildWaveBars();
-  renderTranscript();
-  paintWave();
-
-  els.dictationTime.textContent = "0:00";
-  dictation.timerId = setInterval(() => {
-    els.dictationTime.textContent = formatElapsed(performance.now() - dictation.startedAt);
-  }, 200);
-
-  // The waveform is amplitude-driven on desktop, but NOT on mobile, and that
-  // is deliberate rather than a shortcut.
-  //
-  // On Android, holding a getUserMedia stream open starves SpeechRecognition
-  // of the microphone: the bars animate beautifully and the transcript stays
-  // empty forever. Two APIs, one mic, and recognition loses. Since the
-  // transcript is the entire point of dictation and the waveform is only
-  // feedback, the waveform is what gives way -- mobile gets an activity
-  // animation that is explicitly not claiming to show your voice.
-  if (isMobileDevice()) {
-    dictation.rafId = requestAnimationFrame(pulseFrame);
-  } else {
-    try {
-      dictation.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      dictation.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      dictation.analyser = dictation.audioCtx.createAnalyser();
-      dictation.analyser.fftSize = 1024;
-      dictation.sampleBuf = new Uint8Array(dictation.analyser.fftSize);
-      dictation.audioCtx.createMediaStreamSource(dictation.stream).connect(dictation.analyser);
-      dictation.rafId = requestAnimationFrame(waveFrame);
-    } catch {
-      /* No mic for the meter; SpeechRecognition below may still be granted. */
-    }
-  }
-
-  dictation.recognition = new SpeechRecognitionCtor();
-  dictation.recognition.continuous = true;
-  dictation.recognition.interimResults = true;
-  dictation.recognition.lang = navigator.language || "en-US";
-
-  dictation.recognition.addEventListener("result", (e) => {
-    let interim = "";
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const chunk = e.results[i][0].transcript;
-      if (e.results[i].isFinal) {
-        dictation.finalText = (dictation.finalText + " " + chunk.trim()).trim();
-      } else {
-        interim += chunk;
-      }
-    }
-    dictation.interimText = interim.trim();
-    renderTranscript();
-  });
-
-  dictation.recognition.addEventListener("error", (e) => {
-    if (e.error === "no-speech" || e.error === "aborted") return;
-    showDictationError(
-      e.error === "not-allowed" || e.error === "service-not-allowed"
-        ? "Microphone blocked. Allow mic access for this page, then try again."
-        : `Dictation error: ${e.error}`
-    );
-  });
-
-  // continuous mode still ends itself after a long silence; restart so the
-  // session lasts until the user explicitly discards or inserts.
-  dictation.recognition.addEventListener("end", () => {
-    if (!state.listening) return;
-    try {
-      dictation.recognition.start();
-    } catch {
-      /* Already restarting. */
-    }
-  });
-
-  try {
-    dictation.recognition.start();
-  } catch {
-    /* start() throws if a previous session is still tearing down. */
-  }
-}
-
-/** Tears down mic, waveform and recognition. Returns the transcript so far. */
-function stopDictation() {
-  state.listening = false;
-
-  if (dictation.recognition) {
-    dictation.recognition.abort();
-    dictation.recognition = null;
-  }
-  if (dictation.rafId) cancelAnimationFrame(dictation.rafId);
-  dictation.rafId = null;
-  clearInterval(dictation.timerId);
-  dictation.timerId = null;
-
-  // Release the mic, or the browser keeps showing a "recording" indicator.
-  if (dictation.stream) {
-    for (const track of dictation.stream.getTracks()) track.stop();
-    dictation.stream = null;
-  }
-  if (dictation.audioCtx) {
-    dictation.audioCtx.close();
-    dictation.audioCtx = null;
-  }
-
-  els.composerInner.dataset.dictating = "false";
-  els.dictation.hidden = true;
-  els.voiceModeBtn.setAttribute("aria-pressed", "false");
-
-  return [dictation.finalText, dictation.interimText].filter(Boolean).join(" ").trim();
-}
-
-/** Discard: teardown, nothing reaches the composer. */
-function cancelDictation() {
-  if (!state.listening) return;
-  stopDictation();
-  els.composerInput.focus();
-}
-
-/** Insert: append the transcript to whatever is already typed, for editing. */
-function confirmDictation() {
-  if (!state.listening) return;
-  const transcript = stopDictation();
-  if (transcript) {
-    const existing = els.composerInput.value.trim();
-    els.composerInput.value = existing ? `${existing} ${transcript}` : transcript;
-  }
-  els.composerInput.focus();
-  autoGrow();
-  updateSendState();
-}
-
-function initVoice() {
-  if (!SpeechRecognitionCtor) {
-    els.voiceModeBtn.disabled = true;
-    els.voiceModeBtn.title = "Dictation unavailable — this browser has no SpeechRecognition API.";
-    return;
-  }
-  if (!window.isSecureContext) {
-    els.voiceModeBtn.disabled = true;
-    els.voiceModeBtn.title = "Dictation needs a secure context — open this page over https or localhost.";
-  }
-}
-
-function toggleVoice() {
-  if (state.listening) confirmDictation();
-  else startDictation();
-}
-
-/* ---------- Video mode (camera capture) ----------
- *
- * Real: opens the device camera with getUserMedia, shows a live preview, and
- * captures the current frame to a JPEG attachment. Not a mock.
- *
- * Deliberately mobile-only. The tier this feeds is the Mobile 1B fast brain,
- * and pointing a phone's rear camera at something is the actual interaction
- * being demoed; a laptop webcam pointed at the user's face is a different
- * feature. On desktop the button disables itself and says why, rather than
- * silently doing nothing.
- *
- * Frames are captured in-memory and, like every other attachment here, only
- * their metadata is persisted (see addAttachments) -- a base64 JPEG in
- * localStorage would blow the quota. Sending the pixels anywhere needs
- * README.md step 1's API server; the repo's image path already masks on the
- * far side (local VLM sees the image, cloud gets a masked description).
- */
-
-const CAPTURE_MIME = "image/jpeg";
-const CAPTURE_QUALITY = 0.9;
-
-const camera = { stream: null, facing: "environment" };
-
-/**
- * Mobile detection, best signal first. userAgentData.mobile is the only
- * non-heuristic answer but is Chromium-only; the fallback needs both a coarse
- * pointer and real touch points, since either alone matches touchscreen
- * laptops. iPadOS reports itself as a Mac, so maxTouchPoints catches it.
- */
-function isMobileDevice() {
-  if (typeof navigator.userAgentData?.mobile === "boolean") return navigator.userAgentData.mobile;
-  if (/Android|iPhone|iPod|Mobile/i.test(navigator.userAgent)) return true;
-  const coarse = window.matchMedia?.("(pointer: coarse)").matches ?? false;
-  return coarse && navigator.maxTouchPoints > 1;
-}
-
-function setCameraStatus(message) {
-  els.videomodeStatus.textContent = message;
-}
-
-async function openCameraStream() {
-  if (camera.stream) {
-    for (const track of camera.stream.getTracks()) track.stop();
-    camera.stream = null;
-  }
-  camera.stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: camera.facing },
-    audio: false,
-  });
-  els.videomodePreview.srcObject = camera.stream;
-  els.videomodePreview.dataset.facing = camera.facing;
-  await els.videomodePreview.play().catch(() => {});
-}
-
-async function startVideoMode() {
-  state.videoMode = true;
-  els.composerInner.dataset.videomode = "true";
-  els.videomode.hidden = false;
-  els.videoModeBtn.setAttribute("aria-pressed", "true");
-  els.videoModeBtn.dataset.tier = state.currentTier;
-  setCameraStatus("");
-  els.videomodeShutter.disabled = true;
-
-  try {
-    await openCameraStream();
-    els.videomodeShutter.disabled = false;
-  } catch (err) {
-    els.videomodeShutter.disabled = true;
-    setCameraStatus(
-      err?.name === "NotAllowedError"
-        ? "Camera blocked — allow camera access for this page."
-        : err?.name === "NotFoundError"
-        ? "No camera found on this device."
-        : `Camera unavailable: ${err?.name || "unknown error"}`
-    );
-  }
-}
-
-function stopVideoMode() {
-  state.videoMode = false;
-  if (camera.stream) {
-    for (const track of camera.stream.getTracks()) track.stop();
-    camera.stream = null;
-  }
-  els.videomodePreview.srcObject = null;
-  els.composerInner.dataset.videomode = "false";
-  els.videomode.hidden = true;
-  els.videoModeBtn.setAttribute("aria-pressed", "false");
-}
-
-async function flipCamera() {
-  camera.facing = camera.facing === "environment" ? "user" : "environment";
-  try {
-    await openCameraStream();
-  } catch {
-    setCameraStatus("Couldn't switch camera — this device may only have one.");
-  }
-}
-
-/** Grabs the current preview frame at the stream's native resolution. */
-function captureFrame() {
-  const video = els.videomodePreview;
-  if (!video.videoWidth) return;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  const ctx = canvas.getContext("2d");
-
-  // Undo the preview's front-camera mirroring so the saved frame matches
-  // what the lens actually saw, not the mirror the user was looking at.
-  if (camera.facing === "user") {
-    ctx.translate(canvas.width, 0);
-    ctx.scale(-1, 1);
-  }
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-  canvas.toBlob(
-    (blob) => {
-      if (!blob) return;
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      addAttachments([new File([blob], `capture-${stamp}.jpg`, { type: CAPTURE_MIME })], "image");
-      stopVideoMode();
-      els.composerInput.focus();
-    },
-    CAPTURE_MIME,
-    CAPTURE_QUALITY
-  );
-}
-
-function toggleVideoMode() {
-  if (state.videoMode) stopVideoMode();
-  else startVideoMode();
-}
-
-function initVideoMode() {
-  // Enabled on every device now, not phone-only: a laptop webcam is a
-  // legitimate input for the AI PC tier's VLM, and gating it off meant the
-  // button looked broken on the machine most of the demo runs on.
-  if (!navigator.mediaDevices?.getUserMedia) {
-    els.videoModeBtn.disabled = true;
-    els.videoModeBtn.title = "This browser has no camera API.";
-    return;
-  }
-  if (!window.isSecureContext) {
-    els.videoModeBtn.disabled = true;
-    els.videoModeBtn.title =
-      "Camera needs a secure context. Serve this page over https " +
-      "(ui/serve_https.py) or open it on localhost.";
-  }
-}
-
 async function handleSend(e) {
   e.preventDefault();
   const query = els.composerInput.value.trim();
-  const attachments = state.attachments;
-  if (!query && attachments.length === 0) return;
+  if (!query) return;
 
   let chat = state.chats.find((c) => c.id === state.activeChatId);
-  if (!chat) chat = createChat(query || attachments[0].name);
+  if (!chat) chat = createChat(query);
 
-  chat.messages.push({ role: "user", content: query, attachments, timestamp: Date.now() });
+  chat.messages.push({
+    role: "user",
+    content: query,
+    image: state.attachment?.dataUrl,
+    timestamp: Date.now(),
+  });
   chat.updatedAt = Date.now();
   saveChats();
   renderMessages(chat);
   renderChatList();
 
   els.composerInput.value = "";
-  clearAttachments();
   autoGrow();
   updateSendState();
 
@@ -1195,18 +1152,105 @@ async function handleSend(e) {
     await sleep(EXPRESSION_HOLD_MS.surprised);
   }
 
-  // In flight immediately; the animation below just watches it settle.
-  const routed = sendToRouter(query, "");
-  const looping = playThinkingLooksUntilSettled(thinkingAvatar, routed, THINK_RHYTHM_MS);
+  // Built from `chat.messages`, which already had the current query pushed --
+  // hence `excludeLast`. Read *before* awaiting anything, so a second send
+  // while this one is in flight can't fold a half-finished turn into it.
+  const attachment = state.attachment;
+  clearAttachment();
+  const history = buildConversationContext(chat);
 
-  let tier, answer, metrics, live;
+  // One bubble per tier that actually speaks, created on that tier's first
+  // delta. A split therefore shows the on-device partial in the local colour
+  // and the cloud's gap-fill in its own, filling in as the tokens land.
+  const bubbles = new Map(); // tier -> {row, textEl, text}
+  let pendingRow = thinkingRow; // whichever row is currently animating
+  // Kept for the turn, not just the live row: `renderMessages` rebuilds the
+  // transcript from `chat.messages` when the turn ends, so anything not
+  // persisted onto a message disappears the moment the answer lands.
+  let crossing = null;
+
+  const bubbleFor = (tier) => {
+    let b = bubbles.get(tier);
+    if (b) return b;
+    let row;
+    if (bubbles.size === 0) {
+      row = thinkingRow; // reuse the placeholder already on screen
+    } else {
+      row = renderMessageEl({ role: "assistant", content: "", tier });
+      row.querySelector(".robot-avatar")?.classList.add("thinking");
+      els.messages.appendChild(row);
+    }
+    setRowTier(row, tier);
+    const textEl = document.createElement("div");
+    textEl.className = "markdown";
+    replaceBubbleBody(row, [textEl]);
+    b = { row, textEl, text: "" };
+    bubbles.set(tier, b);
+    pendingRow = row; // the animation follows whichever brain is speaking
+    scrollToBottom();
+    return b;
+  };
+
+  const onEvent = (kind, payload) => {
+    if (kind === "delta") {
+      const b = bubbleFor(payload.tier || "local");
+      b.text += payload.text || "";
+      // Re-render the whole bubble each delta rather than appending text: a
+      // Markdown document is not append-safe -- a list or fence half-arrived is
+      // not valid Markdown, and rendering it incrementally would leave broken
+      // structure behind once the rest lands.
+      b.textEl.innerHTML =
+        typeof renderMarkdown === "function"
+          ? renderMarkdown(b.text)
+          : escapeHtml(b.text).replace(/\n/g, "<br>");
+      scrollToBottom();
+    } else if (kind === "crossing") {
+      crossing = payload;
+      // What actually left the device, shown *while* the cloud is working --
+      // the point is to see it during the wait it bought, not as a footnote
+      // afterwards. Collapsed by default: it is evidence, not content.
+      renderCrossing(bubbleFor("cloud").row.querySelector(".bubble"), payload);
+    } else if (kind === "tier" && payload.tier === "cloud") {
+      // The router has *decided* to cross -- masking, the boundary assert and
+      // the cloud call have not happened yet. Opening the bubble here rather
+      // than on the first cloud delta is the whole point: that delta can be 15s
+      // away, and until it lands the screen would otherwise show a finished
+      // local answer and no sign that anything else is coming.
+      //
+      // Fires with or without a gap. It used to require one, which meant the
+      // "escalating the whole query" case -- the slowest of the two, since the
+      // cloud is answering from scratch -- was the one with no indicator at all.
+      const b = bubbleFor("cloud");
+      if (!b.text) b.textEl.innerHTML = `<span class="cloud-pending">${cloudPendingHtml(payload.gap)}</span>`;
+    }
+  };
+
+  const routed = sendToRouterSSE(query, history, attachment?.dataUrl, onEvent, null);
+  // A getter, not the element: `pendingRow` moves when a split opens the
+  // cloud's row, and the animation should follow it there.
+  const looping = playThinkingLooksUntilSettled(
+    () => pendingRow.querySelector(".robot-avatar"),
+    routed,
+    THINK_RHYTHM_MS
+  );
+
+  let tier, answer, metrics, live, splitAnswers = null;
+  // Fallback for the non-streaming path, where no `crossing` event is
+  // emitted but the finished decision carries the same payload.
+  let body_crossed = null;
   try {
     const body = await routed;
     await looping; // let the current beat finish instead of cutting it off
     tier = body.tier_answered;
     answer = body.answer;
     metrics = metricsFromRouteResponse(body);
+    body_crossed = body.crossed_to_cloud || null;
     live = true;
+    if (tier === "hybrid") {
+      // Two messages, not one: two models answered two different parts, and a
+      // single merged bubble hides precisely that.
+      splitAnswers = { local: body.local_answer, cloud: body.cloud_answer };
+    }
     setBackendStatus(true, body.tier);
   } catch (err) {
     console.warn("two-brain-router API unreachable, using offline preview:", err);
@@ -1215,7 +1259,7 @@ async function handleSend(e) {
     // loop instead of a near-instant reply, same rhythm the mock always had.
     const fallbackTier = state.currentTier;
     await playThinkingLooks(
-      thinkingAvatar,
+      pendingRow.querySelector(".robot-avatar"),
       THINK_MS_BY_TIER[fallbackTier] ?? THINK_MS_BY_TIER.local,
       THINK_RHYTHM_MS
     );
@@ -1226,16 +1270,47 @@ async function handleSend(e) {
     setBackendStatus(false);
   }
 
-  playExpression(thinkingAvatar, "happy", HAPPY_LEAD_MS);
+  playExpression(pendingRow.querySelector(".robot-avatar"), "happy", HAPPY_LEAD_MS);
   await sleep(HAPPY_LEAD_MS);
 
   metrics.actualLatencyMs = performance.now() - thinkingStartedAt;
-  chat.messages.push({ role: "assistant", content: answer, tier, live, timestamp: Date.now(), metrics });
-  chat.updatedAt = Date.now();
+  const at = Date.now();
+  if (splitAnswers) {
+    // Metrics ride on the cloud message alone: they describe the whole turn
+    // (total latency, total cost, what was masked), and `renderMessages` picks
+    // the last assistant message carrying them for the profiler. Duplicating
+    // them onto the local half would double-count the turn in that view.
+    chat.messages.push({ role: "assistant", content: splitAnswers.local, tier: "local", live, timestamp: at });
+    chat.messages.push({
+      role: "assistant", content: splitAnswers.cloud, tier: "cloud", live, timestamp: at, metrics,
+      // Rides on the cloud message so it survives the re-render at the end of
+      // the turn -- and a reload, since it is part of that turn's audit trail.
+      crossing: crossing || body_crossed,
+    });
+  } else {
+    // `live === false` means we fell into the catch: the request failed after
+    // the local half had already streamed and been read, so it is kept rather
+    // than replaced by an offline-preview blob.
+    //
+    // Only on that path. On success `answer` *is* the local text, and pushing
+    // both produced the same reply twice -- once from the stream, once from
+    // the final decision.
+    const streamedLocal = live === false ? bubbles.get("local")?.text : null;
+    if (streamedLocal) {
+      chat.messages.push({ role: "assistant", content: streamedLocal, tier: "local", live: true, timestamp: at });
+    }
+    chat.messages.push({
+      role: "assistant", content: answer, tier, live, timestamp: at, metrics,
+      crossing: tier === "cloud" ? crossing || body_crossed : undefined,
+    });
+  }
+  chat.updatedAt = at;
   saveChats();
   renderMessages(chat);
   renderChatList();
   playExpression(els.messages.querySelector(".message.assistant:last-child .robot-avatar"), "happy");
+  // The profiler describes the *turn*, so a split is still "Local + Cloud"
+  // there even though the transcript now shows it as two messages.
   renderProfiler(metrics, tier);
 }
 
@@ -1245,8 +1320,7 @@ function autoGrow() {
 }
 
 function updateSendState() {
-  const hasText = els.composerInput.value.trim().length > 0;
-  els.sendBtn.disabled = !hasText && state.attachments.length === 0;
+  els.sendBtn.disabled = els.composerInput.value.trim().length === 0;
 }
 
 // Picks the tier for the OFFLINE-FALLBACK reply only (see mockRespond) --
@@ -1260,8 +1334,6 @@ function setTier(tier) {
     seg.setAttribute("aria-checked", String(active));
   }
   els.emptyStateAvatar.dataset.tier = tier;
-  // Keep any engaged composer mode tinted with the tier the avatar is showing.
-  for (const btn of [els.videoModeBtn, els.voiceModeBtn]) btn.dataset.tier = tier;
 }
 
 els.newChatBtn.addEventListener("click", () => {
@@ -1293,43 +1365,15 @@ els.brainToggle.addEventListener("click", (e) => {
   if (btn) setTier(btn.dataset.tier);
 });
 
-els.attachFileBtn.addEventListener("click", () => els.fileInput.click());
-els.attachImageBtn.addEventListener("click", () => els.imageInput.click());
-els.attachVideoBtn.addEventListener("click", () => els.videoInput.click());
-
-els.fileInput.addEventListener("change", (e) => addAttachments(e.target.files, "file"));
-els.imageInput.addEventListener("change", (e) => addAttachments(e.target.files, "image"));
-els.videoInput.addEventListener("change", (e) => addAttachments(e.target.files, "video"));
-
-els.videoModeBtn.addEventListener("click", toggleVideoMode);
-els.voiceModeBtn.addEventListener("click", toggleVoice);
-els.dictationCancel.addEventListener("click", cancelDictation);
-els.dictationConfirm.addEventListener("click", confirmDictation);
-
-els.videomodeClose.addEventListener("click", stopVideoMode);
-els.videomodeFlip.addEventListener("click", flipCamera);
-els.videomodeShutter.addEventListener("click", captureFrame);
-
-// Release mic/camera if the tab goes away rather than holding them open.
-window.addEventListener("pagehide", () => {
-  if (state.listening) stopDictation();
-  if (state.videoMode) stopVideoMode();
-});
-
-// Drag-and-drop onto the composer, same destination as the paperclip.
-els.composer.addEventListener("dragover", (e) => e.preventDefault());
-els.composer.addEventListener("drop", (e) => {
-  e.preventDefault();
-  if (!e.dataTransfer?.files?.length) return;
-  for (const file of e.dataTransfer.files) {
-    addAttachments([file], file.type.startsWith("image/") ? "image" : "file");
-  }
-});
-
 els.exprButtons.addEventListener("click", (e) => {
   const btn = e.target.closest("button");
   if (btn) playExpression(activePreviewAvatar(), btn.dataset.expr);
 });
+
+els.modelSelect?.addEventListener("change", onModelChange);
+els.attachBtn?.addEventListener("click", () => els.attachInput?.click());
+els.attachInput?.addEventListener("change", (e) => setAttachment(e.target.files?.[0]));
+els.attachmentRemove?.addEventListener("click", clearAttachment);
 
 els.profilerPill.addEventListener("click", (e) => {
   e.stopPropagation();
@@ -1339,31 +1383,11 @@ document.addEventListener("click", (e) => {
   if (!els.profiler.contains(e.target)) closeProfilerCard();
 });
 document.addEventListener("keydown", (e) => {
-  if (state.listening) {
-    // Esc discards, Enter inserts -- same keys ChatGPT's dictation uses.
-    if (e.key === "Escape") {
-      e.preventDefault();
-      cancelDictation();
-      return;
-    }
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      confirmDictation();
-      return;
-    }
-  }
-  if (state.videoMode && e.key === "Escape") {
-    e.preventDefault();
-    stopVideoMode();
-    return;
-  }
   if (e.key === "Escape") closeProfilerCard();
 });
 
-initVoice();
-initVideoMode();
 renderChatList();
 showEmptyState();
-renderAttachments();
 updateSendState();
 checkBackend();
+loadModels();

@@ -32,7 +32,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Iterator, Protocol
 
 from two_brain_router.signals.confidence import SELF_REPORT_SUFFIX, parse_self_reported
 from two_brain_router.signals.loader import DATA_DIR, TierSignals
@@ -131,6 +131,13 @@ class Brain(Protocol):
     #: that fails safe.
     trusted_with_raw_pii: bool
 
+    #: Whether this brain implements `answer_stream()` -- yielding its output
+    #: in pieces as it is generated, rather than only when complete. Read via
+    #: `getattr(brain, "streams_tokens", False)`, so a brain without it simply
+    #: isn't streamed; `route_stream` falls back to a single `answer()` call and
+    #: emits the result as one delta.
+    streams_tokens: bool
+
     def answer(self, query: str, context: str = "") -> BrainResponse: ...
 
 
@@ -156,6 +163,30 @@ class VisionBrain(Brain, Protocol):
 def _estimate_tokens(query: str) -> int:
     """Token count the latency/cost estimates are driven off."""
     return max(len(query.split()) * 2, 16)
+
+
+def _iter_sse_deltas(response) -> "Iterator[str]":
+    """Yield `delta.content` strings from an OpenAI-shaped SSE stream.
+
+    Both remote backends speak this: `llama-server` and Cirrascale each emit
+    `data: {...}` lines carrying `choices[0].delta.content`, terminated by
+    `data: [DONE]`. Shared so the two cannot drift apart on parsing.
+    """
+    for raw in response:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            return
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue  # keep-alive or a partial frame; not fatal
+        for choice in chunk.get("choices", []):
+            piece = (choice.get("delta") or {}).get("content")
+            if piece:
+                yield piece
 
 
 def _to_brain_response(raw_text: str, latency_ms: float, structured: bool) -> BrainResponse:
@@ -210,6 +241,7 @@ class LocalFastBrain:
 
     reports_confidence = False
     reports_gaps = False
+    streams_tokens = False  # a stub has nothing to stream
     #: In-process, so it is inside the boundary like the real local brains --
     #: a stub that received *different* input from the thing it stands in for
     #: would make the default path a bad rehearsal for the real one.
@@ -240,6 +272,7 @@ class CloudDeepBrain:
 
     reports_confidence = False
     reports_gaps = False
+    streams_tokens = False  # a stub has nothing to stream
     #: The boundary itself. Never raw text, even as a stub -- if this were ever
     #: True the whole sample would be pointless.
     trusted_with_raw_pii = False
@@ -322,6 +355,7 @@ class CirrascaleDeepBrain:
     #: back -- there is nothing above it to escalate to.
     reports_confidence = False
     reports_gaps = False
+    streams_tokens = True
     #: This class is the reason the boundary exists.
     trusted_with_raw_pii = False
 
@@ -419,6 +453,66 @@ class CirrascaleDeepBrain:
             )
         raise last_error or CloudBrainError("no cloud model answered")
 
+    def answer_stream(self, query: str, context: str = "") -> "Iterator[str]":
+        """Yield the cloud answer in pieces as it is generated.
+
+        Same model-fallback intent as `answer`, but the fallback can only apply
+        **before the first byte**. Once text has been handed to the caller there
+        is no way to retract it, so a mid-stream failure raises rather than
+        silently restarting on the smaller model and splicing two answers
+        together into something neither model actually said.
+        """
+        import urllib.error
+        import urllib.request
+
+        messages = []
+        if context:
+            messages.append({"role": "system", "content": context})
+        messages.append({"role": "user", "content": query})
+
+        candidates = [self.model]
+        if self.FALLBACK_MODEL not in candidates:
+            candidates.append(self.FALLBACK_MODEL)
+
+        last_error: Exception | None = None
+        for model in candidates:
+            payload = json.dumps(
+                {
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": self._MAX_NEW_TOKENS,
+                    "stream": True,
+                }
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                f"{self._endpoint}/chat/completions",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                response = urllib.request.urlopen(request, timeout=self._TIMEOUT_S)
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    detail = json.loads(exc.read().decode("utf-8")).get("message", "")
+                except Exception:  # noqa: BLE001
+                    pass
+                last_error = CloudBrainError(f"cloud endpoint HTTP {exc.code}: {detail}")
+                continue
+            except urllib.error.URLError as exc:
+                last_error = CloudBrainError(f"cloud endpoint unreachable: {exc.reason}")
+                continue
+
+            self.model_used = model
+            with response:
+                yield from _iter_sse_deltas(response)
+            return
+        raise last_error or CloudBrainError("no cloud model answered")
+
 
 class GenieError(RuntimeError):
     """A Genie C API call returned a non-success `Genie_Status_t`."""
@@ -497,6 +591,7 @@ class NpuFastBrain:
     #: data/npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md
     #: (Attempt 5); it separates "can't answer" from "can", not easy from hard.
     reports_confidence = True
+    streams_tokens = True
 
     #: Inside the boundary: this runs *in this process*, through `ctypes` into
     #: `Genie.dll`, on this machine's own NPU. Nothing it is given is
@@ -520,6 +615,14 @@ class NpuFastBrain:
     #: harder: a JSON object cut off mid-string doesn't degrade, it fails to
     #: parse entirely. `"\n\n"` still ends generation well before this in
     #: practice, because single-line JSON is what STRUCTURED_SUFFIX asks for.
+    #:
+    #: **This is not what makes local answers short**, and it is worth writing
+    #: down because it is the first thing anyone suspects. Measured: a
+    #: deliberately detail-hungry question ("explain how a transformer works,
+    #: covering attention, positional encoding, layer norm and training") used
+    #: **165 of 320** tokens. The model closes its JSON object of its own
+    #: accord, well short of the ceiling. Raising this does nothing on its own
+    #: -- tried, no effect -- so it stays a runaway guard rather than a dial.
     _STRUCTURED_MAX_NEW_TOKENS = 320
 
     #: `"\n\n"` is load-bearing, not cosmetic. Left to itself this model emits
@@ -762,6 +865,92 @@ class NpuFastBrain:
             "".join(chunks).strip(), latency_ms, structured=self._structured
         )
 
+    def answer_stream(self, query: str, context: str = "") -> "Iterator[str]":
+        """Yield this model's output token by token, as Genie produces it.
+
+        Worth having on *this* tier above all others: the NPU decodes at a pace
+        where a long reply is measured in seconds-to-tens-of-seconds (4-12s
+        observed, 21s on one merge-sort answer), and a blank screen for that
+        long reads as a hang.
+
+        **Why a thread and a queue rather than a plain generator.**
+        `GenieDialog_query` is blocking and drives the C callback synchronously
+        inside its own call, so there is no point in that flow where Python
+        could `yield`. Running the query on a worker and draining a queue from
+        the generator is what turns a push-shaped C API into a pull-shaped
+        Python one.
+
+        The callback keeps its no-exceptions-escape discipline for the same
+        reason as `answer()`: an exception crossing back into C terminates the
+        process. `queue.Queue.put` on an unbounded queue does not raise, so the
+        hot path stays safe.
+
+        Genie is not asserted thread-safe, and this deliberately does not make
+        it concurrent: exactly one worker runs at a time and the generator is
+        fully drained before returning. `api.py` additionally serialises every
+        route through one lock.
+        """
+        import queue
+        import threading
+
+        prompt = self._render_prompt(query, context)
+        max_new_tokens = (
+            self._STRUCTURED_MAX_NEW_TOKENS if self._structured else self._MAX_NEW_TOKENS
+        )
+        pieces: "queue.Queue[str | None]" = queue.Queue()
+        failure: list[BaseException] = []
+        token_count = 0
+
+        def _on_response(response: bytes, sentence_code: int, _user_data: int) -> None:
+            nonlocal token_count
+            try:
+                if response:
+                    pieces.put(response.decode("utf-8", errors="replace"))
+                    token_count += 1
+                if (
+                    token_count >= max_new_tokens
+                    and sentence_code not in (_GENIE_SENTENCE_END, _GENIE_SENTENCE_ABORT)
+                ):
+                    self._lib.GenieDialog_signal(self._dialog_handle, _GENIE_DIALOG_ACTION_ABORT)
+            except Exception:  # noqa: BLE001 -- must not propagate across the C boundary
+                pass
+
+        # Held in a local so ctypes cannot collect the trampoline mid-call.
+        callback = _GenieQueryCallback(_on_response)
+
+        def _run() -> None:
+            try:
+                self._check(self._lib.GenieDialog_reset(self._dialog_handle), "GenieDialog_reset")
+                self._check(
+                    self._lib.GenieDialog_query(
+                        self._dialog_handle,
+                        prompt.encode("utf-8"),
+                        _GENIE_SENTENCE_COMPLETE,
+                        callback,
+                        None,
+                    ),
+                    "GenieDialog_query",
+                )
+            except BaseException as exc:  # noqa: BLE001 -- re-raised on the consumer's thread
+                failure.append(exc)
+            finally:
+                pieces.put(None)  # sentinel: the producer is done either way
+
+        worker = threading.Thread(target=_run, name="npu-answer-stream", daemon=True)
+        worker.start()
+        try:
+            while True:
+                piece = pieces.get()
+                if piece is None:
+                    break
+                yield piece
+        finally:
+            # Runs even if the consumer abandons the generator (client
+            # disconnect), so the worker is never left detached from its queue.
+            worker.join()
+        if failure:
+            raise failure[0]
+
     def close(self) -> None:
         """Release the Genie dialog + config. Idempotent.
 
@@ -923,6 +1112,7 @@ class GpuLocalBrain:
         # brains' class constants) because this one class covers two shapes.
         self.reports_confidence = self._structured
         self.reports_gaps = self._structured
+        self.streams_tokens = True
         self._model_path = Path(os.environ.get("TWO_BRAIN_GPU_MODEL") or model_path or _GPU_MODEL_PATH)
         env_mmproj = os.environ.get("TWO_BRAIN_GPU_MMPROJ")
         self._mmproj_path = Path(env_mmproj) if env_mmproj else mmproj_path
@@ -1197,6 +1387,67 @@ class GpuLocalBrain:
             return BrainResponse(text=text, latency_ms=latency_ms, cost_usd=0.0)
         return _to_brain_response(text, latency_ms, structured=True)
 
+    def answer_stream(
+        self, query: str, context: str = "", image: Path | None = None
+    ) -> "Iterator[str]":
+        """Yield the answer in pieces as the GPU generates it.
+
+        Matters more here than on the cloud tier: this model decodes at roughly
+        25 tok/s, so a long reply is a minute-plus wait. Shown as it arrives
+        that is tolerable; shown as a blank screen it is not.
+        """
+        import urllib.error
+        import urllib.request
+
+        if image is not None and not self.can_see:
+            raise GpuBrainError(
+                "image passed to a text-only brain -- construct via GpuLocalBrain.for_vision()"
+            )
+
+        structured = self._structured and image is None
+        messages = []
+        system = STRUCTURED_SYSTEM_PROMPT if structured else ""
+        if context:
+            system = f"{system} Context: {context}".strip() if system else context
+        if system:
+            messages.append({"role": "system", "content": system})
+        if image is not None:
+            messages.append({"role": "user", "content": [
+                {"type": "text", "text": query},
+                {"type": "image_url", "image_url": {"url": self._image_data_uri(image)}},
+            ]})
+        else:
+            messages.append(
+                {"role": "user", "content": query + STRUCTURED_SUFFIX if structured else query}
+            )
+
+        payload: dict = {
+            "messages": messages,
+            "max_tokens": (
+                self._MAX_DESCRIBE_TOKENS
+                if image is not None
+                else (self._STRUCTURED_MAX_NEW_TOKENS if structured else self._MAX_NEW_TOKENS)
+            ),
+            "temperature": 0.2 if structured else 0.7,
+            "stream": True,
+        }
+        # No `response_format` here even in structured mode: the grammar is a
+        # nice-to-have, and a server that rejects the field would fail *after*
+        # the stream had started, where `_post_completion`'s retry-without-it
+        # cannot help. `SolutionStreamer` tolerates imperfect JSON anyway.
+        request = urllib.request.Request(
+            f"{self._base_url}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            response = urllib.request.urlopen(request, timeout=300)
+        except urllib.error.HTTPError as exc:  # pragma: no cover - server-side failure
+            raise GpuBrainError(f"llama-server returned HTTP {exc.code}") from exc
+        with response:
+            yield from _iter_sse_deltas(response)
+
     def close(self) -> None:
         proc = self._proc
         if proc is None:
@@ -1262,6 +1513,9 @@ class PhoneFastBrain:
     """
 
     reports_confidence = True
+    #: No token streaming: this brain's own transport returns a complete
+    #: response, and the mobile tier is not wired in yet.
+    streams_tokens = False
     #: Confidence only, no gap decomposition -- this brain is deliberately
     #: untouched by the Shape C work (the phone is not wired in yet; see
     #: docs/ORCHESTRATOR.md). It keeps Shape B exactly as it was, so the mobile

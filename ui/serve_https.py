@@ -44,7 +44,20 @@ CERT_DIR = UI_DIR / ".certs"
 CERT_FILE = CERT_DIR / "cert.pem"
 KEY_FILE = CERT_DIR / "key.pem"
 
-PROXY_PATHS = ("/route", "/health")
+#: Everything api.py serves. Kept in sync with its handler by hand -- a path
+#: missing here is not a 404, it is the HTTPS page silently failing to reach a
+#: backend that is running, which is a much more confusing symptom.
+#:
+#: /route/stream and /route/sse are proxied too, but note the proxy buffers the
+#: whole response before replying, so they arrive as one chunk rather than
+#: incrementally. The UI still renders correctly; it just does not animate.
+PROXY_PATHS = (
+    "/route",
+    "/route/stream",
+    "/route/sse",
+    "/health",
+    "/models",
+)
 MAX_BODY_BYTES = 8 * 1024 * 1024
 
 

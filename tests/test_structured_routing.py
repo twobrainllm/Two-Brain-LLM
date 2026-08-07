@@ -166,9 +166,11 @@ class _ScriptedStructuredBrain:
             text=text, latency_ms=800.0, confidence=confidence, unknown=unknown
         )
         self.received: list[str] = []
+        self.received_context: list[str] = []
 
     def answer(self, query: str, context: str = "") -> BrainResponse:
         self.received.append(query)
+        self.received_context.append(context)
         return self._response
 
 
@@ -244,7 +246,19 @@ def test_a_named_gap_splits_the_query_even_at_high_confidence():
     assert len(deep.calls) == 1
 
 
-def test_the_deep_brain_is_asked_only_about_the_gap():
+def test_the_gap_is_the_question_the_deep_brain_is_asked():
+    """The gap goes in the `query` slot, not buried in the context.
+
+    This is a regression test for a real refusal. With the whole original query
+    as the ask and the gap merely mentioned in context, a live Cirrascale call
+    answered the *whole* placeholder-laden request and refused it:
+
+        "I cannot provide you with a reply that includes your personal
+         information."
+
+    ...when the only thing needed was an ISBN. Asking narrowly is both what
+    makes the split work and what the split was specified to do.
+    """
     brain = _ScriptedStructuredBrain(
         "Half of it.", confidence=0.9, unknown="the other half"
     )
@@ -252,24 +266,59 @@ def test_the_deep_brain_is_asked_only_about_the_gap():
 
     router.route("Do both halves.")
 
-    _query, context = deep.calls[0]
-    assert "Answer only the remaining part it could not: the other half" in context
+    query, context = deep.calls[0]
+    assert query == "the other half", f"the gap must be the question asked, got {query!r}"
+    # The original query is still available, but as background rather than as
+    # the instruction.
+    assert "Do both halves." in context
+    assert context.index("Do both halves.") >= 0
 
 
-def test_low_confidence_with_a_usable_partial_still_splits():
-    """No gap named, but the number alone is below threshold.
+def test_low_confidence_with_no_named_gap_is_a_plain_escalation():
+    """Unconfident overall, but unable to say *which part* is missing.
 
-    The partial answer is kept rather than discarded, which is the difference
-    from `_route_on_confidence`.
+    There is nothing gap-shaped to ask about, so this is an ordinary
+    escalation: the whole query goes and the rough local attempt is discarded,
+    rather than displayed beside a full cloud answer covering the same ground.
+
+    This is also a correctness guard, not only a UX call -- see
+    `test_an_empty_gap_never_becomes_an_empty_question_to_the_cloud`.
     """
     brain = _ScriptedStructuredBrain("A rough attempt.", confidence=0.2)
-    router, _deep = _router(brain)
+    router, deep = _router(brain)
 
     decision = router.route("Something hard.")
 
     assert decision.difficulty_score == pytest.approx(0.8)
-    assert decision.tier_answered == "hybrid"
-    assert decision.local_answer == "A rough attempt."
+    assert decision.tier_answered == "cloud"
+    assert decision.local_answer is None
+    assert any("no specific gap named" in note for note in decision.notes)
+    # The cloud is asked the real question, not an empty one.
+    assert deep.calls[0][0].strip()
+
+
+def test_an_empty_gap_never_becomes_an_empty_question_to_the_cloud():
+    """Regression: the deep brain must never be asked "".
+
+    Shape C sends the *gap* as the deep brain's query. A low-confidence answer
+    with no gap named would otherwise reach `_answer_hybrid` with `gap == ""`
+    and ask the cloud an empty question. Observed on real hardware -- the NPU
+    returned `confidence 0.00` with `unknown` empty for a query it declined --
+    and invisible before the gap became the query, because the old code sent
+    the whole query as the ask regardless of the gap.
+    """
+    brain = _ScriptedStructuredBrain(
+        "I am unable to provide that.", confidence=0.0, unknown=""
+    )
+    router, deep = _router(brain)
+
+    decision = router.route("Draft a reply and give me the exact ISBN of the 1813 edition.")
+
+    assert len(deep.calls) == 1
+    asked, _context = deep.calls[0]
+    assert asked.strip(), "the deep brain was asked an empty question"
+    assert "ISBN" in asked, "the whole query should go when there is no gap to narrow to"
+    assert decision.tier_answered == "cloud"
 
 
 def test_no_usable_partial_is_a_plain_escalation_not_a_split():
@@ -286,14 +335,39 @@ def test_no_usable_partial_is_a_plain_escalation_not_a_split():
 
 
 def test_an_unparseable_confidence_is_maximally_uncertain_not_zero_signal():
+    """The point of this test is the *difficulty*, not the destination.
+
+    `None` means the model ignored the output format entirely, so it is read as
+    maximally uncertain (1.0) rather than scored by some other signal. With no
+    gap named either, that lands on a plain escalation.
+    """
     brain = _ScriptedStructuredBrain("Something.", confidence=None)
     router, _deep = _router(brain)
 
     decision = router.route("A question.")
 
     assert decision.difficulty_score == 1.0
-    assert decision.tier_answered == "hybrid"
+    assert decision.tier_answered == "cloud"
     assert any("no usable confidence signal" in note for note in decision.notes)
+
+
+def test_a_named_gap_still_splits_even_at_zero_confidence():
+    """A gap is a more specific claim than the confidence number, so it wins.
+
+    Guards the fix above from over-reaching: "no gap named" is what routes to a
+    plain escalation, not "low confidence". A model that says *what* it is
+    missing is still worth splitting on, however unsure it is overall.
+    """
+    brain = _ScriptedStructuredBrain(
+        "Half of it.", confidence=0.0, unknown="the other half"
+    )
+    router, deep = _router(brain)
+
+    decision = router.route("Do both halves.")
+
+    assert decision.tier_answered == "hybrid"
+    assert decision.local_answer == "Half of it."
+    assert deep.calls[0][0] == "the other half"
 
 
 def test_both_calls_are_billed_to_the_user():
@@ -383,9 +457,11 @@ def test_pii_from_the_query_never_reaches_the_cloud_unmasked_on_a_split():
     sent = " ".join(deep.calls[0])
     assert "jane.doe@example.com" not in sent
     assert "123-45-6789" not in sent
+    # The original query still crosses -- as masked background, not as the ask.
     assert "[PII_EMAIL_1]" in sent
-    # ...and the user still gets the real values back, rehydrated on-device.
-    assert "jane.doe@example.com" in decision.answer
+    # ...and the user still sees the real values in the half that never left.
+    assert "jane.doe@example.com" in _PII_QUERY  # sanity: the fixture has PII
+    assert decision.local_answer == "I drafted the email."
 
 
 def test_the_raw_partial_answer_is_masked_before_it_crosses():
@@ -464,20 +540,22 @@ def test_withholding_the_partial_sends_strictly_less_off_device():
 
     decision = router.route("A question.")
 
-    _query, context = deep.calls[0]
-    assert "The on-device half." not in context
-    assert "the missing half" in context
+    query, context = deep.calls[0]
+    assert "The on-device half." not in context, "the partial should have been withheld"
+    assert query == "the missing half", "the gap is still asked -- only the partial is withheld"
     # ...and the user still gets both halves back.
     assert decision.local_answer == "The on-device half."
     assert any("partial answer withheld" in note for note in decision.notes)
 
 
-def test_the_gap_survives_context_compression():
-    """`compress_context` keeps the tail, so the gap must be last.
+def test_the_gap_cannot_be_lost_to_context_compression():
+    """Compression can never cost us the thing we are asking about.
 
-    With a long partial answer and a small budget, the partial is what gets
-    trimmed. Losing the gap instead would send the deep brain a context that
-    never says what it is being asked for.
+    It used to be able to: with the gap living in the context, a long partial
+    answer and a small budget could trim the very instruction that said what
+    the deep brain was for. Now the gap is the `query`, which
+    `compress_context` never touches -- so the guarantee is structural rather
+    than a matter of keeping it last in a list.
     """
     brain = _ScriptedStructuredBrain(
         "word " * 500, confidence=0.9, unknown="THE ACTUAL GAP"
@@ -486,8 +564,8 @@ def test_the_gap_survives_context_compression():
 
     decision = router.route("A question.")
 
-    _query, context = deep.calls[0]
-    assert "THE ACTUAL GAP" in context
+    query, context = deep.calls[0]
+    assert query == "THE ACTUAL GAP", "the gap must be unaffected by compression"
     assert len(context) <= 200
     assert any("compressed the escalated gap context" in note for note in decision.notes)
 
@@ -525,3 +603,320 @@ def test_an_image_bearing_query_bypasses_shape_c_rather_than_dropping_the_image(
 
     with pytest.raises(ValueError, match="cannot see"):
         router.route("What is in this picture?", image=__import__("pathlib").Path("nope.png"))
+
+
+# --------------------------------------------------------------------------
+# 2d. Progressive results: the local half, before the cloud half exists
+# --------------------------------------------------------------------------
+
+
+def test_the_local_half_is_handed_out_before_the_cloud_is_called():
+    """`on_progress` fires while the deep brain has not answered yet.
+
+    Asserted by recording the deep brain's call log *at the moment the callback
+    runs*: if the progress event were emitted after the cloud call, the log
+    would already be non-empty. Ordering is the entire feature, so ordering is
+    what's checked -- not merely that the callback fired at all.
+    """
+    brain = _ScriptedStructuredBrain("The local half.", confidence=0.9, unknown="the rest")
+    router, deep = _router(brain)
+
+    seen = []
+    router.route("A question.", on_progress=lambda p: seen.append((p, len(deep.calls))))
+
+    assert len(seen) == 1
+    progress, cloud_calls_so_far = seen[0]
+    assert cloud_calls_so_far == 0, "the cloud was already called before the partial was emitted"
+    assert progress.phase == "local_answer"
+    assert progress.local_answer == "The local half."
+    assert progress.gap == "the rest"
+
+
+def test_progress_carries_the_rehydrated_local_answer_not_placeholders():
+    """What the callback hands out is display-ready.
+
+    A UI paints this string directly, so a `[PII_EMAIL_1]` reaching it would be
+    user-visible. Only relevant when the fast brain was untrusted (the phone) --
+    a trusted brain's answer was never masked -- so that is the case tested.
+    """
+    brain = _ScriptedStructuredBrain(
+        "Replying to [PII_EMAIL_1] now.", confidence=0.9, unknown="the rest"
+    )
+    brain.trusted_with_raw_pii = False
+    router, _deep = _router(brain)
+
+    seen = []
+    router.route("Email jane.doe@example.com about this.", on_progress=seen.append)
+
+    assert seen[0].local_answer == "Replying to jane.doe@example.com now."
+    assert "[PII_" not in seen[0].local_answer
+
+
+def test_no_progress_event_when_the_query_never_leaves():
+    """A locally-answered query has no partial -- there is nothing to wait for,
+    so there is nothing to announce."""
+    brain = _ScriptedStructuredBrain("Answered fully.", confidence=0.95)
+    router, _deep = _router(brain)
+
+    seen = []
+    decision = router.route("An easy question.", on_progress=seen.append)
+
+    assert decision.tier_answered == "local"
+    assert seen == []
+
+
+def test_a_broken_progress_callback_cannot_break_the_request():
+    """A listener that raises is a dead listener, not a failed route.
+
+    The realistic cause is a streaming client disconnecting mid-request. That
+    must not turn a working answer into a 500, corrupt the audit trail, or
+    abandon a cloud call already paid for.
+    """
+    brain = _ScriptedStructuredBrain("The local half.", confidence=0.9, unknown="the rest")
+    router, deep = _router(brain)
+
+    def _explode(_progress):
+        raise ConnectionResetError("client went away")
+
+    decision = router.route("A question.", on_progress=_explode)
+
+    assert decision.tier_answered == "hybrid"
+    assert decision.local_answer == "The local half."
+    assert len(deep.calls) == 1
+
+
+# --------------------------------------------------------------------------
+# 2e. Conversation history (the `context` argument)
+# --------------------------------------------------------------------------
+
+_HISTORY = "Earlier in this conversation:\nUser: what is a CT scan?\nAssistant: It uses X-rays."
+
+
+def test_an_on_device_brain_is_given_the_history_raw():
+    """Multi-turn only works if the local model actually receives the history.
+
+    It never did before: every `_ask(self.fast_brain, ...)` call omitted the
+    context argument, so `route(query, context)` fed the cloud and nothing
+    else, and a follow-up like "explain in more detail" reached the model as a
+    standalone sentence with no referent.
+    """
+    brain = _ScriptedStructuredBrain("Expanded.", confidence=0.95)
+    router, _deep = _router(brain)
+
+    router.route("Explain in more detail", context=_HISTORY)
+
+    assert brain.received_context == [_HISTORY]
+
+
+def test_history_for_an_off_device_brain_is_masked_like_everything_else():
+    """`trusted_with_raw_pii` governs the context too, not just the query.
+
+    Otherwise the phone tier would receive masked queries and raw history --
+    which is the same leak, one field over.
+    """
+    brain = _ScriptedStructuredBrain("Expanded.", confidence=0.95)
+    brain.trusted_with_raw_pii = False
+    router, _deep = _router(brain)
+
+    router.route(
+        "Explain in more detail",
+        context="Earlier: my email is jane.doe@example.com",
+    )
+
+    sent = brain.received_context[0]
+    assert "jane.doe@example.com" not in sent
+    assert "[PII_EMAIL_1]" in sent
+
+
+def test_history_reaches_the_cloud_masked_on_a_split():
+    """The chosen policy: history *does* cross, but never in the clear."""
+    brain = _ScriptedStructuredBrain("Half.", confidence=0.9, unknown="the rest")
+    router, deep = _router(brain)
+
+    decision = router.route(
+        "Explain in more detail",
+        context="Earlier: contact me at jane.doe@example.com",
+    )
+
+    assert decision.tier_answered == "hybrid"
+    _query, context = deep.calls[0]
+    assert "jane.doe@example.com" not in context
+    assert "[PII_EMAIL_1]" in context
+
+
+def test_a_placeholder_that_came_from_the_history_still_rehydrates():
+    """The subtle one: an answer can echo a placeholder minted from the
+    *context*, not the query, so rehydration has to consider both vaults.
+
+    With only the query's vault, `[PII_EMAIL_1]` would reach the user as a
+    literal token -- not a leak, but a visibly broken answer, and exactly the
+    class of bug `_Request.local_vault` exists to prevent.
+    """
+    brain = _ScriptedStructuredBrain("I will write to [PII_EMAIL_1].", confidence=0.95)
+    brain.trusted_with_raw_pii = False  # so masking happens at all
+    router, _deep = _router(brain)
+
+    decision = router.route(
+        "Reply to them",  # no PII in the query itself
+        context="Earlier: my email is jane.doe@example.com",
+    )
+
+    assert decision.answer == "I will write to jane.doe@example.com."
+    assert "[PII_" not in decision.answer
+
+
+def test_no_context_is_still_the_default_and_changes_nothing():
+    brain = _ScriptedStructuredBrain("Answered.", confidence=0.95)
+    router, _deep = _router(brain)
+
+    decision = router.route("A standalone question.")
+
+    assert brain.received_context == [""]
+    assert decision.tier_answered == "local"
+    assert not any("conversation context" in n for n in decision.notes)
+
+
+def test_pii_that_only_appears_in_the_history_is_still_counted():
+    """The audit trail must count what crossed, not just what was typed.
+
+    Found by testing, not by reading: with PII only in the history, the
+    response reported `0 detected / 0 masked` while the trace showed an email
+    being masked at the boundary. The masking was correct -- the *reporting*
+    understated it, which on a privacy demo is the failure that matters, since
+    the profiler would have said "No PII detected" about a request that sent a
+    masked address to the cloud.
+    """
+    brain = _ScriptedStructuredBrain("Half.", confidence=0.9, unknown="the rest")
+    router, deep = _router(brain)
+
+    decision = router.route(
+        "Explain in more detail",  # no PII in the query at all
+        context="Earlier: email me at jane.doe@example.com",
+    )
+
+    assert decision.tier_answered == "hybrid"
+    assert decision.pii_entities_detected == 1, "history PII was not detected"
+    assert decision.pii_entities_masked >= 1, "history PII was masked but not reported as masked"
+    assert "jane.doe@example.com" not in " ".join(deep.calls[0])
+
+
+def test_the_same_entity_in_query_and_history_counts_once():
+    """Detection counts occurrences; the vault keys on values. Reporting the
+    raw occurrence count against a vault-derived masked count would read as
+    "2 detected, 1 masked" -- which looks like a leak and isn't one."""
+    brain = _ScriptedStructuredBrain("Half.", confidence=0.9, unknown="the rest")
+    router, _deep = _router(brain)
+
+    decision = router.route(
+        "Resend to jane.doe@example.com",
+        context="Earlier: email me at jane.doe@example.com",
+    )
+
+    assert decision.pii_entities_detected == 1
+    assert decision.pii_entities_masked == 1
+
+
+# --------------------------------------------------------------------------
+# 2f. Two thresholds, not one -- confidence_escalate_threshold
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("confidence", "expect_local"),
+    [
+        (1.00, True),
+        (0.96, True),
+        (0.95, True),   # the stated boundary: 0.95 must stay local
+        (0.94, True),   # difficulty 0.06 -- under the 0.10 line, still local
+        (0.91, True),   # difficulty 0.09 -- the closest value that must NOT escalate
+        (0.90, False),  # the stated boundary: 0.90 must escalate (difficulty exactly 0.10)
+        (0.85, False),
+        (0.50, False),
+    ],
+)
+def test_confidence_threshold_matches_the_stated_boundary(confidence, expect_local):
+    """Pins the exact request this threshold exists to satisfy: "only if the
+    model is 0.95 or 1 confident, then escalation is not required."
+
+    Every value here is a real decimal a self-reported confidence can actually
+    take (`n/100` for integer `n`), including both boundaries by name -- this
+    is also the regression test for the float-rounding bug `confidence_to_difficulty`
+    had at exactly this threshold (`1.0 - 0.90 == 0.09999999999999998`, not
+    `0.1`, which silently let 0.90 stay local before it was rounded).
+    """
+    brain = _ScriptedStructuredBrain("An answer.", confidence=confidence)
+    router, _deep = _router(brain)
+
+    decision = router.route("Some question.")
+
+    if expect_local:
+        assert decision.tier_answered == "local", f"confidence={confidence} should stay local"
+    else:
+        assert decision.tier_answered == "cloud", f"confidence={confidence} should escalate"
+
+
+def test_the_heuristic_threshold_is_untouched_by_the_confidence_one():
+    """Shape A (no self-rating brain) must still use `escalate_threshold`
+    (0.55), not `confidence_escalate_threshold` (0.10) -- they are read by
+    different code paths on purpose, and a query landing in between the two
+    default values is exactly what would expose them getting mixed up."""
+    from two_brain_router.routing import LocalFastBrain, RoutePolicy, TwoBrainRouter
+    from two_brain_router.signals.loader import TierSignals
+
+    router = TwoBrainRouter(tier="pc", policy=RoutePolicy())
+    router.fast_brain = LocalFastBrain("pc", TierSignals.load("pc_3b", "ai_pc"))
+
+    # A short, plain question scores low on the heuristic (well under 0.55);
+    # if the router were accidentally reading the 0.10 confidence threshold for
+    # this path, a query scoring anywhere in [0.10, 0.55) would flip to "cloud".
+    decision = router.route("What time zone is Tokyo in?")
+    assert decision.difficulty_score < 0.55
+    assert decision.tier_answered == "local"
+
+
+def test_confidence_escalate_threshold_is_configurable():
+    """The field is meant to be overridden, not just re-derived from a
+    hardcoded literal -- a caller building `RoutePolicy(confidence_escalate_threshold=...)`
+    must see it take effect."""
+    from two_brain_router.routing import RoutePolicy
+
+    brain = _ScriptedStructuredBrain("An answer.", confidence=0.80)
+    router, _deep = _router(brain, policy=RoutePolicy(confidence_escalate_threshold=0.5))
+
+    decision = router.route("Some question.")
+
+    # difficulty 0.20 < the overridden 0.5 threshold -> stays local, even
+    # though it would have escalated under the default 0.10.
+    assert decision.tier_answered == "local"
+
+
+# --------------------------------------------------------------------------
+# 2g. confidence_to_difficulty -- the float-precision fix, directly
+# --------------------------------------------------------------------------
+
+
+def test_confidence_to_difficulty_has_no_binary_float_artifacts_at_common_boundaries():
+    """The root-cause test, independent of the router or any threshold.
+
+    `1.0 - 0.90` in IEEE 754 is `0.09999999999999998`, not `0.1` -- confirmed
+    directly here rather than trusted from memory, since that is exactly the
+    kind of claim that silently stops being true if the implementation changes.
+    Every value a self-reported confidence can actually take is `n / 100` for
+    integer `n`; this checks all 101 of them land on an exact 2-decimal-place
+    difficulty, which a threshold comparison can then trust.
+    """
+    from two_brain_router.signals.confidence import confidence_to_difficulty
+
+    for n in range(101):
+        confidence = n / 100.0
+        difficulty = confidence_to_difficulty(confidence)
+        expected = round(1.0 - confidence, 2)
+        assert difficulty == expected, (
+            f"confidence={confidence} -> difficulty={difficulty!r}, "
+            f"expected {expected!r} (a binary-float artifact survived rounding)"
+        )
+        # The specific case that motivated this: 0.90 must land exactly on 0.10,
+        # not 0.09999999999999998, or `difficulty >= 0.10` silently fails.
+        if confidence == 0.90:
+            assert difficulty == 0.10
+            assert difficulty >= 0.10, "the exact bug: 0.90 must reach a 0.10 threshold"

@@ -52,6 +52,54 @@ class RouteDecision:
     #: masked. Always populated. Defaulted so the field could be added without
     #: breaking any existing construction of this dataclass.
     pii_entities_detected: int = 0
+    #: Exactly what crossed the boundary, for display. None when nothing did.
+    #:
+    #:     {"query": "<masked>", "context": "<masked, compressed>",
+    #:      "substitutions": [{"type": "EMAIL", "value": "...", "placeholder": "[PII_EMAIL_1]"}]}
+    #:
+    #: `notes` already carries a one-line version of this, but a UI should not
+    #: have to scrape prose to show the user what left their machine. The raw
+    #: `value` is included deliberately: it is the user's own text, already on
+    #: their screen, and showing `jane.doe@example.com -> [PII_EMAIL_1]` side by
+    #: side is the entire point -- a masked string alone proves nothing without
+    #: what it replaced.
+    crossed_to_cloud: dict | None = None
+
+
+@dataclass
+class RouteProgress:
+    """A partial result, handed out *before* `route()` returns.
+
+    Exists because the two halves of a split have very different latencies --
+    the local model answers in ~4s and the cloud leg has been measured at 15s+
+    -- so waiting for the merge before showing anything wastes an answer that
+    was ready the whole time. `route(..., on_progress=...)` emits one of these
+    at the moment the local half is settled and the cloud call is about to
+    start.
+
+    Deliberately *not* a `RouteDecision`. A decision is final and complete; this
+    is explicitly neither, and giving it its own type means a caller cannot
+    accidentally treat an in-flight partial as the finished record -- the
+    `est_cost_usd`/`est_latency_ms` fields a decision carries are not knowable
+    yet, so they are simply absent rather than present-and-wrong.
+    """
+
+    #: `"local_answer"` -- the local model produced a usable partial and named a
+    #: gap; the deep brain is about to be asked about that gap only.
+    #: `"escalating"` -- nothing usable came back locally (or the fast brain was
+    #: skipped), so the whole query is going to the deep brain and there is no
+    #: partial to show.
+    phase: Literal["local_answer", "escalating"]
+    #: Rehydrated, ready to display. None on `"escalating"`.
+    local_answer: str | None
+    #: What the deep brain is being asked. None on `"escalating"`, where it is
+    #: the whole query rather than a named gap.
+    gap: str | None
+    difficulty_score: float
+    #: What the local half cost, in wall-clock. The cloud half is still running.
+    local_latency_ms: float
+    #: The audit trail *so far*. The final `RouteDecision.notes` is a superset.
+    notes: list[str]
 
 
 @dataclass
@@ -65,6 +113,30 @@ class RoutePolicy:
     """
 
     escalate_threshold: float = 0.55
+    #: The same OR-condition as `escalate_threshold`, but for a brain's own
+    #: self-reported confidence (Shape B/C) rather than the heuristic
+    #: keyword/length scorer (Shape A).
+    #:
+    #: **Deliberately a second number, not a reuse of `escalate_threshold`.**
+    #: That used to be "one threshold, not two" on purpose -- but the two
+    #: signals turned out not to share a scale in practice. Real Phi-3.5/Qwen
+    #: self-reports land in a narrow, over-confident band, 0.85-1.00 (see
+    #: data/npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md,
+    #: Attempt 5's calibration finding), while the heuristic score is an
+    #: arbitrary 0-1 weighted-feature metric tuned separately. A difficulty
+    #: threshold of 0.55 (confidence <= 0.45) was calibrated for the heuristic
+    #: and essentially never fires against that narrow band -- which is the
+    #: observed "it never escalates" symptom this field exists to fix.
+    #: Reusing one number for both would force choosing between "the heuristic
+    #: barely escalates" and "confidence-based paths escalate on nearly every
+    #: answer that isn't perfect", and no single value resolves that.
+    #:
+    #: 0.10 means: escalate on confidence grounds whenever the brain reports
+    #: 0.90 or below; stay local only at 0.95 or above (difficulty <= 0.05,
+    #: comfortably under the 0.10 line even given float rounding on a `/100`
+    #: confidence value). Matches a real user request, verbatim: "only if the
+    #: model is 0.95 or 1 confident, then escalation is not required."
+    confidence_escalate_threshold: float = 0.10
     #: Local answer is preferred whenever it fits this budget at the tier's
     #: profiled per-token rate (data/profile_workload/<tier>.json).
     local_latency_budget_ms: float = 3000
@@ -114,6 +186,18 @@ class RoutePolicy:
             or local_latency_est_ms > self.local_latency_budget_ms
         )
 
+    def confidence_says_escalate(self, difficulty: float) -> bool:
+        """Whether a self-rating brain's own reported difficulty (1 - confidence)
+        is high enough to escalate on confidence grounds alone -- ignoring
+        latency and any named gap, both handled elsewhere.
+
+        Shape B's one and only escalation trigger (`_route_on_confidence`), and
+        one of the two `needs_gap_fill` ORs together for Shape C. Pure, so the
+        threshold's real effect can be checked directly against measured
+        confidence values without a brain in the loop.
+        """
+        return difficulty >= self.confidence_escalate_threshold
+
     def needs_gap_fill(self, difficulty: float, gap: str) -> bool:
         """Does this structured local answer need the deep brain at all?
 
@@ -125,8 +209,9 @@ class RoutePolicy:
           about the half it answered and still be missing the other half.
           Ignoring a stated gap because the overall number looked good would
           throw away the most specific signal in the system.
-        - **Low confidence**, via the same `escalate_threshold` every other path
-          uses. Still one threshold, not two.
+        - **Low confidence**, via `confidence_escalate_threshold` -- see
+          `confidence_says_escalate` and that field's docstring for why this is
+          not the same threshold the heuristic path uses.
 
         Deliberately no latency term, unlike `should_escalate`. By the time this
         is asked the local inference has already been paid for, and the budget
@@ -134,19 +219,29 @@ class RoutePolicy:
         Re-testing it here could only add the deep brain's latency on top of
         time already spent.
         """
-        return bool(gap.strip()) or difficulty >= self.escalate_threshold
+        return bool(gap.strip()) or self.confidence_says_escalate(difficulty)
 
-    def escalation_note(self, difficulty: float, local_latency_est_ms: float) -> str:
+    def escalation_note(
+        self, difficulty: float, local_latency_est_ms: float, threshold: float | None = None
+    ) -> str:
+        # `threshold=None` defaults to the heuristic threshold, matching every
+        # existing caller (Shape A). Confidence-based callers (Shape B/C) pass
+        # `confidence_escalate_threshold` explicitly, so the displayed number is
+        # always the one the decision was actually made against.
+        shown = self.escalate_threshold if threshold is None else threshold
         return (
-            f"escalating: difficulty={difficulty:.2f} (threshold {self.escalate_threshold}) "
+            f"escalating: difficulty={difficulty:.2f} (threshold {shown}) "
             f"or local_latency_est={local_latency_est_ms:.0f}ms > "
             f"budget {self.local_latency_budget_ms}ms"
         )
 
-    def local_note(self, difficulty: float, local_latency_est_ms: float) -> str:
+    def local_note(
+        self, difficulty: float, local_latency_est_ms: float, threshold: float | None = None
+    ) -> str:
+        shown = self.escalate_threshold if threshold is None else threshold
         return (
             f"answering locally: difficulty={difficulty:.2f} < "
-            f"threshold {self.escalate_threshold}, "
+            f"threshold {shown}, "
             f"local_latency_est={local_latency_est_ms:.0f}ms within budget"
         )
 

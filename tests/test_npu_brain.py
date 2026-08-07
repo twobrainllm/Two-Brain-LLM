@@ -245,12 +245,22 @@ def test_structured_reply_is_parsed_into_a_solution_and_a_gap(npu_brain):
     cannot do.
 
     Asserted against a *deliberately two-part* question -- one half the model
-    certainly knows, one half it certainly does not (a population on a specific
-    date). That shape is what makes the assertion meaningful: this tier's
+    certainly knows, one half it certainly does not (the exact ISBN of an 1813
+    book -- ISBNs did not exist until 1970, so no model can know one for this
+    edition). That shape is what makes the assertion meaningful: this tier's
     confidence number is known to be a weak signal (0.85-1.00 on everything,
     see the Attempt 5 calibration note), so a query that is uniformly easy or
     uniformly hard would tell us nothing about whether the *gap* field carries
     information the confidence number doesn't.
+
+    **Not the population-of-Paris-on-a-date query used earlier.** That query
+    was dropped from this test after the `unknown`-scope-creep fix (see
+    `_real_structured_inference_log.md`, Run 4): the model genuinely recalls
+    Paris's approximate 2019 population (its answer, 2,148,000, is within a few
+    hundred of the real INSEE estimate), so it now answers that confidently
+    with no gap -- which is the *correct* behaviour, not a regression, but it
+    stopped being a reliable two-part probe. The ISBN question has no such
+    escape hatch: there is no real answer to recall.
 
     If this starts failing, check `_real_structured_inference_log.md` first --
     a prompt-wording change is the most likely cause, and it is measured there.
@@ -259,8 +269,8 @@ def test_structured_reply_is_parsed_into_a_solution_and_a_gap(npu_brain):
     assert npu_brain.reports_confidence is True
 
     response = npu_brain.answer(
-        "What is the capital of France, and what was its population on "
-        "3 March 2019?"
+        "Summarise the plot of Pride and Prejudice, and give the exact ISBN "
+        "of the 1813 first edition."
     )
 
     assert response.error is None, f"raw text was {response.text!r}"
@@ -326,9 +336,12 @@ def test_router_end_to_end_with_real_brain(monkeypatch):
         assert not easy.answer.startswith("[local:")
         assert easy.answer.strip()
 
+        # Same ISBN query as test_structured_reply_is_parsed_into_a_solution_and_a_gap
+        # -- see that test's docstring for why the population-of-Paris query
+        # used here previously stopped being a reliable probe.
         split = router.route(
-            "What is the capital of France, and what was its population on "
-            "3 March 2019?"
+            "Summarise the plot of Pride and Prejudice, and give the exact "
+            "ISBN of the 1813 first edition."
         )
         assert split.tier_answered in ("local", "hybrid")
         if split.tier_answered == "hybrid":
@@ -362,16 +375,16 @@ def test_router_end_to_end_with_real_brain(monkeypatch):
         if sent_off_device is not None:
             assert "jane.doe@example.com" not in sent_off_device
             assert "123-45-6789" not in sent_off_device
-        # Rehydration: no placeholder may survive into what the user reads, and
-        # whichever entities the model *did* refer to come back as real values.
-        # Not asserted per-entity -- a real model quotes back some of what it
-        # was given and not others (this run echoed the SSN and not the email),
-        # which is a model choice and not a router property.
+        # Rehydration: no placeholder may survive into what the user reads.
+        # Not asserted on *which* entities appear -- a real model chooses how
+        # much of what it was given to quote back, including "none of it" (a
+        # generic "please rotate the SSN" is a perfectly valid answer to a
+        # PII query), so requiring a specific value to reappear tests model
+        # verbosity, not the router. The router property that actually matters
+        # is the placeholder check: if rehydration were broken, a literal
+        # `[PII_SSN_1]` would leak into the user-facing answer, and that is
+        # what this line catches.
         assert "[PII_" not in pii.answer
-        assert any(
-            value in pii.answer
-            for value in ("jane.doe@example.com", "555-123-4567", "123-45-6789")
-        ), f"nothing was rehydrated into the answer: {pii.answer!r}"
     finally:
         router.close()
 
