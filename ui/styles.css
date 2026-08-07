@@ -882,6 +882,107 @@ button, input, textarea {
 #attach-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 #attach-btn.has-image { background: var(--brain-local); color: #fff; }
 #attach-btn:disabled { color: var(--text-tertiary); cursor: not-allowed; }
+
+/* ---------- Dictation ---------- */
+
+#voice-btn {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+#voice-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+#voice-btn:disabled { color: var(--text-tertiary); cursor: not-allowed; opacity: 0.5; }
+
+/* Recording: the input row gives way to the dictation row entirely, rather
+   than the two sitting side by side. Same as ChatGPT -- while you are
+   speaking there is nothing to type into. */
+.composer-stack[data-dictating="true"] .composer-inner,
+.composer-stack[data-dictating="true"] .attachment-preview {
+  display: none;
+}
+
+.dictation[hidden] { display: none; }
+
+.dictation {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 6px 10px;
+  background: var(--bg-composer);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.dictation-btn {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.dictation-cancel { background: var(--bg-hover); color: var(--text-secondary); }
+.dictation-cancel:hover { background: var(--bg-active); color: var(--text-primary); }
+.dictation-confirm { background: var(--text-primary); color: var(--bg-composer); }
+.dictation-btn:focus-visible { outline: 2px solid var(--brain-local); outline-offset: 2px; }
+
+.dictation-wave {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  height: 30px;
+  overflow: hidden;
+}
+
+.wave-bar {
+  flex: 1;
+  min-width: 2px;
+  max-width: 4px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--brain-local);
+  transition: height 0.06s linear;
+}
+
+.dictation-time {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  min-width: 34px;
+  text-align: right;
+}
+
+.dictation-error {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  padding: 6px 4px 0;
+  text-align: center;
+}
+
+.dictation-error:empty { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .wave-bar { transition: none; }
+}
 #attach-btn:disabled:hover { background: transparent; color: var(--text-tertiary); }
 
 .attachment-preview {

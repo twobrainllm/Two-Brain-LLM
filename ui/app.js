@@ -101,6 +101,9 @@ const els = {
   profilerFooter: document.getElementById("profiler-footer"),
   emptyStateHint: document.getElementById("empty-state-hint"),
   brainToggleLabel: document.getElementById("brain-toggle-label"),
+  // null: the visible attach button was removed from the composer. The input
+  // and every code path below it still work, so re-adding the button is a
+  // one-line markup change -- every use of this is already `?.`-guarded.
   attachBtn: document.getElementById("attach-btn"),
   attachInput: document.getElementById("attach-input"),
   attachmentPreview: document.getElementById("attachment-preview"),
@@ -1409,3 +1412,297 @@ showEmptyState();
 updateSendState();
 checkBackend();
 loadModels();
+
+/* ---------- Dictation (voice -> text) ----------------------------------
+ *
+ * ChatGPT's composer dictation. Tapping the mic swaps the input row for a
+ * waveform and an elapsed timer with discard/insert buttons; the transcript
+ * lands in the textarea on confirm, to edit before sending. It never sends on
+ * its own.
+ *
+ * Self-contained on purpose: everything below reaches the rest of this file
+ * only through `els.composerInput`, `autoGrow()` and `updateSendState()`, so
+ * it can be updated or lifted out without touching the routing code.
+ *
+ * Three things learned from running this on a real phone:
+ *
+ * 1. The transcript is NOT shown while recording. Words rewriting themselves
+ *    as the recogniser revises its guess is distracting, and it invites
+ *    reading instead of speaking. ChatGPT shows waveform and timer only.
+ *
+ * 2. No getUserMedia on mobile. Holding an audio stream open for a real
+ *    amplitude meter starves SpeechRecognition of the microphone on Android:
+ *    the bars animate perfectly and the transcript stays empty forever. The
+ *    transcript is the point, so the meter gives way -- mobile gets a
+ *    travelling wave that reads as "listening" without claiming to be your
+ *    voice, and desktop keeps the real meter, where both APIs coexist.
+ *
+ * 3. Confirm is never disabled. It was, when no transcript had arrived --
+ *    which made the button dead in exactly the case where the user most needs
+ *    a way out, and read as "the tick is broken".
+ *
+ * PRIVACY NOTE, and it matters for this project specifically: Chrome's
+ * SpeechRecognition is not on-device -- it streams audio to Google's servers.
+ * Dictation is therefore a cloud hop that happens BEFORE the router sees
+ * anything, and it bypasses PIIGuard entirely, which only ever sees the
+ * resulting text. A local Whisper endpoint behind api.py is the fix.
+ */
+
+const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+const WAVE_BARS = 44;
+const WAVE_TICK_MS = 55;
+const WAVE_GAIN = 2.4;
+
+const dictationEls = {
+  stack: document.querySelector(".composer-stack"),
+  panel: document.getElementById("dictation"),
+  wave: document.getElementById("dictation-wave"),
+  time: document.getElementById("dictation-time"),
+  cancel: document.getElementById("dictation-cancel"),
+  confirm: document.getElementById("dictation-confirm"),
+  button: document.getElementById("voice-btn"),
+  error: document.getElementById("dictation-error"),
+};
+
+const dictation = {
+  active: false,
+  recognition: null,
+  stream: null,
+  audioCtx: null,
+  analyser: null,
+  sampleBuf: null,
+  rafId: null,
+  timerId: null,
+  startedAt: 0,
+  lastTickAt: 0,
+  levels: new Array(WAVE_BARS).fill(0),
+  finalText: "",
+  interimText: "",
+};
+
+function isMobileDevice() {
+  if (typeof navigator.userAgentData?.mobile === "boolean") return navigator.userAgentData.mobile;
+  if (/Android|iPhone|iPod|Mobile/i.test(navigator.userAgent)) return true;
+  const coarse = window.matchMedia?.("(pointer: coarse)").matches ?? false;
+  return coarse && navigator.maxTouchPoints > 1;
+}
+
+function buildWaveBars() {
+  dictationEls.wave.innerHTML = "";
+  for (let i = 0; i < WAVE_BARS; i++) {
+    const bar = document.createElement("div");
+    bar.className = "wave-bar";
+    dictationEls.wave.appendChild(bar);
+  }
+}
+
+function paintWave() {
+  const bars = dictationEls.wave.children;
+  for (let i = 0; i < bars.length; i++) {
+    bars[i].style.height = `${2 + dictation.levels[i] * 26}px`;
+  }
+}
+
+/** RMS of the current frame, 0..1, boosted so speech fills the bars. */
+function currentLevel() {
+  dictation.analyser.getByteTimeDomainData(dictation.sampleBuf);
+  let sumSquares = 0;
+  for (const sample of dictation.sampleBuf) {
+    const centered = (sample - 128) / 128;
+    sumSquares += centered * centered;
+  }
+  return Math.min(Math.sqrt(sumSquares / dictation.sampleBuf.length) * WAVE_GAIN, 1);
+}
+
+function waveFrame(now) {
+  dictation.rafId = requestAnimationFrame(waveFrame);
+  if (now - dictation.lastTickAt < WAVE_TICK_MS) return;
+  dictation.lastTickAt = now;
+  dictation.levels.shift();
+  dictation.levels.push(currentLevel());
+  paintWave();
+}
+
+/** Mobile's stand-in: a travelling wave, not the microphone signal. */
+function pulseFrame(now) {
+  dictation.rafId = requestAnimationFrame(pulseFrame);
+  if (now - dictation.lastTickAt < WAVE_TICK_MS) return;
+  dictation.lastTickAt = now;
+  const t = now / 260;
+  for (let i = 0; i < WAVE_BARS; i++) {
+    dictation.levels[i] = 0.18 + 0.32 * ((Math.sin(t - i / 5) + 1) / 2);
+  }
+  paintWave();
+}
+
+function formatElapsed(ms) {
+  const total = Math.floor(ms / 1000);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+async function startDictation() {
+  if (!SpeechRecognitionCtor || dictation.active) return;
+
+  dictation.active = true;
+  dictation.finalText = "";
+  dictation.interimText = "";
+  dictation.levels = new Array(WAVE_BARS).fill(0);
+  dictation.startedAt = performance.now();
+
+  dictationEls.error.textContent = "";
+  dictationEls.stack.dataset.dictating = "true";
+  dictationEls.panel.hidden = false;
+  dictationEls.button.setAttribute("aria-pressed", "true");
+  buildWaveBars();
+  paintWave();
+
+  dictationEls.time.textContent = "0:00";
+  dictation.timerId = setInterval(() => {
+    dictationEls.time.textContent = formatElapsed(performance.now() - dictation.startedAt);
+  }, 200);
+
+  if (isMobileDevice()) {
+    dictation.rafId = requestAnimationFrame(pulseFrame);
+  } else {
+    try {
+      dictation.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      dictation.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      dictation.analyser = dictation.audioCtx.createAnalyser();
+      dictation.analyser.fftSize = 1024;
+      dictation.sampleBuf = new Uint8Array(dictation.analyser.fftSize);
+      dictation.audioCtx.createMediaStreamSource(dictation.stream).connect(dictation.analyser);
+      dictation.rafId = requestAnimationFrame(waveFrame);
+    } catch {
+      /* Meter unavailable; recognition below may still be granted. */
+      dictation.rafId = requestAnimationFrame(pulseFrame);
+    }
+  }
+
+  dictation.recognition = new SpeechRecognitionCtor();
+  dictation.recognition.continuous = true;
+  dictation.recognition.interimResults = true;
+  dictation.recognition.lang = navigator.language || "en-US";
+
+  dictation.recognition.addEventListener("result", (e) => {
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const chunk = e.results[i][0].transcript;
+      if (e.results[i].isFinal) {
+        dictation.finalText = `${dictation.finalText} ${chunk.trim()}`.trim();
+      } else {
+        interim += chunk;
+      }
+    }
+    dictation.interimText = interim.trim();
+  });
+
+  dictation.recognition.addEventListener("error", (e) => {
+    if (e.error === "no-speech" || e.error === "aborted") return;
+    dictationEls.error.textContent =
+      e.error === "not-allowed" || e.error === "service-not-allowed"
+        ? "Microphone blocked - allow mic access for this page, then try again."
+        : `Dictation error: ${e.error}`;
+  });
+
+  // continuous still ends itself after a long silence; restart so the session
+  // lasts until the user discards or inserts.
+  dictation.recognition.addEventListener("end", () => {
+    if (!dictation.active) return;
+    try {
+      dictation.recognition.start();
+    } catch {
+      /* already restarting */
+    }
+  });
+
+  try {
+    dictation.recognition.start();
+  } catch {
+    /* a previous session is still tearing down */
+  }
+}
+
+/** Tears everything down and returns the transcript so far. */
+function stopDictation() {
+  dictation.active = false;
+
+  if (dictation.recognition) {
+    dictation.recognition.abort();
+    dictation.recognition = null;
+  }
+  if (dictation.rafId) cancelAnimationFrame(dictation.rafId);
+  dictation.rafId = null;
+  clearInterval(dictation.timerId);
+  dictation.timerId = null;
+
+  // Release the mic, or the browser keeps showing a recording indicator.
+  if (dictation.stream) {
+    for (const track of dictation.stream.getTracks()) track.stop();
+    dictation.stream = null;
+  }
+  if (dictation.audioCtx) {
+    dictation.audioCtx.close();
+    dictation.audioCtx = null;
+  }
+
+  dictationEls.stack.dataset.dictating = "false";
+  dictationEls.panel.hidden = true;
+  dictationEls.button.setAttribute("aria-pressed", "false");
+
+  return [dictation.finalText, dictation.interimText].filter(Boolean).join(" ").trim();
+}
+
+function cancelDictation() {
+  if (!dictation.active) return;
+  stopDictation();
+  els.composerInput.focus();
+}
+
+function confirmDictation() {
+  if (!dictation.active) return;
+  const transcript = stopDictation();
+  if (transcript) {
+    const existing = els.composerInput.value.trim();
+    els.composerInput.value = existing ? `${existing} ${transcript}` : transcript;
+  } else {
+    dictationEls.error.textContent = "Nothing was heard - check the microphone and try again.";
+  }
+  els.composerInput.focus();
+  autoGrow();
+  updateSendState();
+}
+
+if (dictationEls.button) {
+  if (!SpeechRecognitionCtor) {
+    dictationEls.button.disabled = true;
+    dictationEls.button.title = "Dictation unavailable - this browser has no SpeechRecognition API.";
+  } else if (!window.isSecureContext) {
+    dictationEls.button.disabled = true;
+    dictationEls.button.title =
+      "Dictation needs a secure context - serve this page over https (ui/serve_https.py) or use localhost.";
+  }
+
+  dictationEls.button.addEventListener("click", () => {
+    if (dictation.active) confirmDictation();
+    else startDictation();
+  });
+  dictationEls.cancel.addEventListener("click", cancelDictation);
+  dictationEls.confirm.addEventListener("click", confirmDictation);
+
+  document.addEventListener("keydown", (e) => {
+    if (!dictation.active) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelDictation();
+    } else if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      confirmDictation();
+    }
+  });
+
+  // Do not hold the microphone if the tab goes away mid-session.
+  window.addEventListener("pagehide", () => {
+    if (dictation.active) stopDictation();
+  });
+}
