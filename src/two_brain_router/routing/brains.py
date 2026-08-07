@@ -267,6 +267,136 @@ class CirrascaleDeepBrain:
         raise last_error or CloudBrainError("no cloud model answered")
 
 
+class BrainUnavailableError(RuntimeError):
+    """A served brain could not be reached, or answered with a non-200.
+
+    Distinct from the other brain errors on purpose: per
+    `L_INTERFACE_CONTRACT.md`, an unreachable fast brain is an *escalate*
+    signal, not a crash -- the router catches this specific type and falls
+    through to the deep brain rather than failing the user's request.
+    """
+
+
+class OpenAIHttpBrain:
+    """A fast brain served over an OpenAI-shaped HTTP endpoint.
+
+    Deliberately generic rather than phone-specific: this is one class for
+    any served model speaking `POST /v1/chat/completions`, which today means
+    the Mobile tier's Llama-3.2-3B on a Galaxy S25 (real device, or
+    `tools/phone/mock_phone_brain_server.py` for development) and tomorrow
+    could mean a hosted AI-PC endpoint. The contract it implements is
+    `docs/L_INTERFACE_CONTRACT.md`.
+
+    Follows the `NpuFastBrain` precedent: a flat class here rather than a
+    `routing/brains/` subpackage, with `urllib` imported lazily inside the
+    request method so the base package stays stdlib-only and importable
+    without a live endpoint.
+
+    **Loopback is enforced, and that is a privacy control, not a convenience.**
+    `docs/PHONE_BRAIN.md` reconciliation point #1 flags that `base_url` is an
+    ordinary argument -- point it at a remote host and the query leaves the
+    device silently. The router masks before calling any brain (invariant #1),
+    so what arrives here is already masked; but "on-device" is load-bearing
+    for the mobile tier's whole claim, so a non-loopback host is refused
+    outright unless explicitly overridden. With `adb forward tcp:8000
+    tcp:8000` the phone *is* reachable at 127.0.0.1 over USB, so the strict
+    default costs nothing in the intended setup.
+    """
+
+    _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+    _DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+    _DEFAULT_MODEL = "llama-3.2-3b-instruct"
+    _MAX_NEW_TOKENS = 256
+    _TEMPERATURE = 0.2
+    #: Short on purpose. The contract says a timeout means "escalate", and a
+    #: phone that has not produced a first token in this long has already lost
+    #: to the cloud round-trip anyway.
+    _TIMEOUT_S = 60
+
+    def __init__(
+        self,
+        tier: str,
+        signals: TierSignals,
+        base_url: str | None = None,
+        model: str | None = None,
+        allow_remote: bool = False,
+    ) -> None:
+        self.tier = tier
+        self.signals = signals
+        self.base_url = (
+            base_url or os.environ.get("TWO_BRAIN_PHONE_URL") or self._DEFAULT_BASE_URL
+        ).rstrip("/")
+        self.model = model or os.environ.get("TWO_BRAIN_PHONE_MODEL") or self._DEFAULT_MODEL
+        if not allow_remote:
+            self._assert_loopback(self.base_url)
+
+    @classmethod
+    def _assert_loopback(cls, base_url: str) -> None:
+        from urllib.parse import urlparse
+
+        host = (urlparse(base_url).hostname or "").lower()
+        if host not in cls._LOOPBACK_HOSTS:
+            raise ValueError(
+                f"refusing to send queries to non-loopback host {host!r}. The mobile "
+                "tier's privacy claim is that the query stays on the device; reach the "
+                "phone over USB with `adb forward tcp:8000 tcp:8000` so the endpoint is "
+                "127.0.0.1. Pass allow_remote=True only if you have a specific reason "
+                "and have accepted that the query leaves this machine in the clear."
+            )
+
+    def _post(self, messages: list[dict]) -> tuple[dict, float]:
+        import urllib.error
+        import urllib.request
+
+        payload = json.dumps(
+            {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": self._MAX_NEW_TOKENS,
+                "temperature": self._TEMPERATURE,
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        start = time.perf_counter()
+        try:
+            with urllib.request.urlopen(request, timeout=self._TIMEOUT_S) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise BrainUnavailableError(f"phone brain HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise BrainUnavailableError(f"phone brain unreachable: {exc.reason}") from exc
+        except (TimeoutError, OSError) as exc:
+            raise BrainUnavailableError(f"phone brain timed out: {exc}") from exc
+        return body, (time.perf_counter() - start) * 1000
+
+    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+        messages = []
+        if context:
+            messages.append({"role": "system", "content": context})
+        messages.append({"role": "user", "content": masked_query})
+
+        body, latency_ms = self._post(messages)
+        try:
+            text = body["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError, TypeError) as exc:
+            raise BrainUnavailableError(f"unexpected response shape: {str(body)[:200]}") from exc
+
+        return BrainResponse(
+            text=text,
+            latency_ms=latency_ms,
+            # On-device inference has no per-token billing. The real cost is
+            # battery and thermal headroom, which this dataclass has no field
+            # for and profile_workload does not measure -- so zero here is
+            # "not billed", not "free".
+            cost_usd=0.0,
+        )
+
+
 class GenieError(RuntimeError):
     """A Genie C API call returned a non-success `Genie_Status_t`."""
 

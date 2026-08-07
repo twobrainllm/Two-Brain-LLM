@@ -20,11 +20,13 @@ from typing import Literal
 from two_brain_router.privacy import MaskResult, PIIGuard, assert_masked_token_invariant
 from two_brain_router.routing.brains import (
     Brain,
+    BrainUnavailableError,
     CirrascaleDeepBrain,
     CloudDeepBrain,
     GpuLocalBrain,
     LocalFastBrain,
     NpuFastBrain,
+    OpenAIHttpBrain,
 )
 from two_brain_router.routing.policy import RouteDecision, RoutePolicy
 from two_brain_router.signals import DifficultyEstimator, TierSignals
@@ -46,22 +48,35 @@ _TIER_FILES: dict[str, tuple[str, str]] = {
 _NPU_BRAIN_ENV_VAR = "TWO_BRAIN_NPU_BRAIN"
 _GPU_BRAIN_ENV_VAR = "TWO_BRAIN_GPU_BRAIN"
 _CLOUD_BRAIN_ENV_VAR = "TWO_BRAIN_CLOUD_BRAIN"
+#: Opt-in switch for the real phone-served fast brain (mobile tier only).
+#: Same shape as the NPU/GPU gates above: unset, the mobile tier keeps its
+#: stub and the package stays stdlib-only and offline. Point it at either
+#: `tools/phone/mock_phone_brain_server.py` or a real S25 reached over
+#: `adb forward tcp:8000 tcp:8000` -- the brain refuses non-loopback hosts.
+_PHONE_BRAIN_ENV_VAR = "TWO_BRAIN_PHONE_BRAIN"
 
 
 def _build_fast_brain(tier: Tier, signals: TierSignals) -> Brain:
-    """Pick the AI-PC tier's fast brain; both real backends are opt-in.
+    """Pick the tier's fast brain; every real backend is opt-in.
 
-    Neither real brain is the default -- unset, the base package stays
-    stdlib-only and uses the mock. Which of the two *should* be preferred is an
-    open question: the GPU is ~3x faster on throughput, but the NPU exists for
-    power efficiency and perf-per-watt has not been measured. See
-    docs/local-inference-status.md. GPU wins if both are set, purely so the
+    No real brain is the default -- unset, the base package stays stdlib-only
+    and uses the mock. For the AI-PC tier, which of GPU/NPU *should* be
+    preferred is an open question: the GPU is ~3x faster on throughput, but the
+    NPU exists for power efficiency and perf-per-watt has not been measured.
+    See docs/local-inference-status.md. GPU wins if both are set, purely so the
     combination is deterministic rather than an error.
+
+    The mobile tier gets `OpenAIHttpBrain`, because that model runs on a
+    physically separate device and has to be reached over a wire. That is the
+    one real difference from the AI-PC tier, which deliberately avoided an HTTP
+    hop by running in-process (see docs/npu-deployment.md).
     """
     if tier == "pc" and os.environ.get(_GPU_BRAIN_ENV_VAR) == "1":
         return GpuLocalBrain(tier, signals)
     if tier == "pc" and os.environ.get(_NPU_BRAIN_ENV_VAR) == "1":
         return NpuFastBrain(tier, signals)
+    if tier == "mobile" and os.environ.get(_PHONE_BRAIN_ENV_VAR) == "1":
+        return OpenAIHttpBrain(tier, signals)
     return LocalFastBrain(tier, signals)
 
 
@@ -125,7 +140,22 @@ class TwoBrainRouter:
             return self._escalate(guard, masked_query_result, context, difficulty, notes, image)
 
         notes.append(self.policy.local_note(difficulty, local_latency_est))
-        return self._answer_locally(guard, masked_query_result, difficulty, notes, image)
+        try:
+            return self._answer_locally(guard, masked_query_result, difficulty, notes, image)
+        except BrainUnavailableError as exc:
+            # L_INTERFACE_CONTRACT.md: a timeout or non-200 from a *served*
+            # fast brain is an escalate signal, not a user-visible failure --
+            # "don't block the user". Only this one error type falls through;
+            # a real bug in an in-process brain still raises.
+            #
+            # An image-bearing query is the exception: escalating one requires
+            # describe_image() on the very brain that just failed, so there is
+            # nothing to fall back to. Fail loudly rather than silently
+            # dropping the image and answering about the text alone.
+            if image is not None:
+                raise
+            notes.append(f"local brain unavailable ({exc}); escalating rather than failing")
+            return self._escalate(guard, masked_query_result, context, difficulty, notes, image)
 
     def _answer_locally(
         self,
