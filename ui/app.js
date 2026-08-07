@@ -51,8 +51,28 @@ const els = {
   emptyStateAvatar: document.getElementById("empty-state-avatar"),
   messages: document.getElementById("messages"),
   composer: document.getElementById("composer"),
+  composerInner: document.querySelector(".composer-inner"),
   composerInput: document.getElementById("composer-input"),
+  composerAttachments: document.getElementById("composer-attachments"),
+  dictation: document.getElementById("dictation"),
+  dictationWave: document.getElementById("dictation-wave"),
+  dictationTime: document.getElementById("dictation-time"),
+  dictationTranscript: document.getElementById("dictation-transcript"),
+  dictationCancel: document.getElementById("dictation-cancel"),
+  dictationConfirm: document.getElementById("dictation-confirm"),
+  videomode: document.getElementById("videomode"),
+  videomodePreview: document.getElementById("videomode-preview"),
+  videomodeClose: document.getElementById("videomode-close"),
+  videomodeFlip: document.getElementById("videomode-flip"),
+  videomodeShutter: document.getElementById("videomode-shutter"),
+  videomodeStatus: document.getElementById("videomode-status"),
   sendBtn: document.getElementById("send-btn"),
+  fileInput: document.getElementById("file-input"),
+  imageInput: document.getElementById("image-input"),
+  attachFileBtn: document.getElementById("attach-file-btn"),
+  attachImageBtn: document.getElementById("attach-image-btn"),
+  videoModeBtn: document.getElementById("video-mode-btn"),
+  voiceModeBtn: document.getElementById("voice-mode-btn"),
   brainToggle: document.getElementById("brain-toggle"),
   exprButtons: document.getElementById("expr-buttons"),
   robotTemplate: document.getElementById("robot-svg-template"),
@@ -198,6 +218,9 @@ const state = {
   currentTier: "local",
   searchQuery: "",
   backendLive: null, // null = not checked yet, true/false after checkBackend()
+  attachments: [],
+  videoMode: false,
+  listening: false,
 };
 
 function loadChats() {
@@ -245,7 +268,11 @@ function chatMatchesSearch(chat, query) {
   if (!query) return true;
   const q = query.toLowerCase();
   if (chat.title.toLowerCase().includes(q)) return true;
-  return chat.messages.some((m) => m.content.toLowerCase().includes(q));
+  return chat.messages.some(
+    (m) =>
+      m.content.toLowerCase().includes(q) ||
+      m.attachments?.some((a) => a.name.toLowerCase().includes(q))
+  );
 }
 
 function renderChatList() {
@@ -386,9 +413,19 @@ function renderMessageEl(msg) {
     bubble.appendChild(badge);
   }
 
-  const text = document.createElement("div");
-  text.innerHTML = escapeHtml(msg.content).replace(/\n/g, "<br>");
-  bubble.appendChild(text);
+  if (msg.attachments?.length) {
+    const attachRow = document.createElement("div");
+    for (const att of msg.attachments) {
+      attachRow.appendChild(attachmentChipEl(att, { removable: false }));
+    }
+    bubble.appendChild(attachRow);
+  }
+
+  if (msg.content) {
+    const text = document.createElement("div");
+    text.innerHTML = escapeHtml(msg.content).replace(/\n/g, "<br>");
+    bubble.appendChild(text);
+  }
 
   row.appendChild(bubble);
   return row;
@@ -582,21 +619,516 @@ function mockRespond(query, tier) {
   );
 }
 
+/* ---------- Composer attachments ----------
+ *
+ * Only file *metadata* (name, size, kind) is kept -- never the bytes. Chats
+ * live in localStorage (~5MB per origin), so stashing a single PDF there
+ * would blow the quota and take the whole history down with it. Nothing
+ * reads or uploads the file contents yet either; wiring that up belongs with
+ * the `/route` endpoint in README.md's step 1, alongside the repo's existing
+ * image path (local VLM sees the image, cloud gets a masked description).
+ */
+
+const MAX_ATTACHMENTS = 10;
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function addAttachments(fileList, kind) {
+  for (const file of fileList) {
+    if (state.attachments.length >= MAX_ATTACHMENTS) break;
+    state.attachments.push({
+      id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      name: file.name,
+      size: file.size,
+      kind,
+    });
+  }
+  renderAttachments();
+  updateSendState();
+}
+
+function removeAttachment(id) {
+  state.attachments = state.attachments.filter((a) => a.id !== id);
+  renderAttachments();
+  updateSendState();
+}
+
+function attachmentChipEl(att, { removable }) {
+  const chip = document.createElement("span");
+  chip.className = "attachment-chip";
+
+  const icon = document.createElement("span");
+  icon.innerHTML =
+    att.kind === "image"
+      ? '<svg viewBox="0 0 20 20" width="13" height="13" fill="none"><rect x="2.5" y="4" width="15" height="12" rx="2.5" stroke="currentColor" stroke-width="1.5"/><path d="M3 13.5l3.6-3.2a1.5 1.5 0 0 1 2 0L13 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
+      : '<svg viewBox="0 0 20 20" width="13" height="13" fill="none"><path d="M11.5 2.5H6a1.5 1.5 0 0 0-1.5 1.5v12A1.5 1.5 0 0 0 6 17.5h8a1.5 1.5 0 0 0 1.5-1.5V6.5zM11.5 2.5v4h4" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>';
+  chip.appendChild(icon);
+
+  const name = document.createElement("span");
+  name.className = "attachment-chip-name";
+  name.textContent = att.name;
+  chip.appendChild(name);
+
+  const size = document.createElement("span");
+  size.className = "attachment-chip-size";
+  size.textContent = formatBytes(att.size);
+  chip.appendChild(size);
+
+  if (removable) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "attachment-chip-remove";
+    remove.setAttribute("aria-label", `Remove ${att.name}`);
+    remove.innerHTML = '<svg viewBox="0 0 20 20" width="11" height="11" fill="none"><path d="M5 5l10 10M15 5L5 15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+    remove.addEventListener("click", () => removeAttachment(att.id));
+    chip.appendChild(remove);
+  }
+
+  return chip;
+}
+
+function renderAttachments() {
+  els.composerAttachments.innerHTML = "";
+  els.composerAttachments.hidden = state.attachments.length === 0;
+  for (const att of state.attachments) {
+    els.composerAttachments.appendChild(attachmentChipEl(att, { removable: true }));
+  }
+}
+
+function clearAttachments() {
+  state.attachments = [];
+  els.fileInput.value = "";
+  els.imageInput.value = "";
+  renderAttachments();
+}
+
+/* ---------- Dictation (voice -> text) ----------
+ *
+ * ChatGPT's composer dictation, rebuilt: tapping the mic swaps the textarea
+ * for a live waveform + elapsed timer with discard/insert buttons, and the
+ * transcript lands in the textarea to edit before sending -- it never sends
+ * on its own.
+ *
+ * Two independent browser APIs run at once, on purpose:
+ *   - getUserMedia + AnalyserNode drives the waveform off real mic amplitude,
+ *     so the bars reflect the actual signal instead of animating on a timer.
+ *   - SpeechRecognition produces the transcript.
+ * Neither one alone does both jobs: SpeechRecognition exposes no audio levels,
+ * and an AnalyserNode can't transcribe.
+ *
+ * PRIVACY NOTE, and it matters for this repo specifically: Chrome's
+ * SpeechRecognition is *not* on-device -- it streams audio to Google's servers
+ * for transcription. For a project whose whole thesis is that the local brain
+ * keeps data on the device, dictation is therefore a cloud hop that happens
+ * before the router ever sees the query, and it bypasses PIIGuard entirely
+ * (privacy/guard.py only ever sees the resulting text). Swapping this for a
+ * local Whisper endpoint behind README.md step 1's API server is the fix.
+ */
+
+const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+const WAVE_BARS = 48;
+const WAVE_TICK_MS = 55;
+const WAVE_GAIN = 2.4;
+
+const dictation = {
+  recognition: null,
+  stream: null,
+  audioCtx: null,
+  analyser: null,
+  sampleBuf: null,
+  rafId: null,
+  timerId: null,
+  startedAt: 0,
+  lastTickAt: 0,
+  levels: new Array(WAVE_BARS).fill(0),
+  finalText: "",
+  interimText: "",
+};
+
+function buildWaveBars() {
+  els.dictationWave.innerHTML = "";
+  for (let i = 0; i < WAVE_BARS; i++) {
+    const bar = document.createElement("div");
+    bar.className = "wave-bar";
+    els.dictationWave.appendChild(bar);
+  }
+}
+
+function paintWave() {
+  const bars = els.dictationWave.children;
+  for (let i = 0; i < bars.length; i++) {
+    // 2px floor keeps a visible idle line during silence, like ChatGPT's.
+    bars[i].style.height = `${2 + dictation.levels[i] * 30}px`;
+  }
+}
+
+/** RMS of the current frame, 0..1, mildly boosted so speech fills the bar height. */
+function currentLevel() {
+  dictation.analyser.getByteTimeDomainData(dictation.sampleBuf);
+  let sumSquares = 0;
+  for (const sample of dictation.sampleBuf) {
+    const centered = (sample - 128) / 128;
+    sumSquares += centered * centered;
+  }
+  const rms = Math.sqrt(sumSquares / dictation.sampleBuf.length);
+  return Math.min(rms * WAVE_GAIN, 1);
+}
+
+function waveFrame(now) {
+  dictation.rafId = requestAnimationFrame(waveFrame);
+  if (now - dictation.lastTickAt < WAVE_TICK_MS) return;
+  dictation.lastTickAt = now;
+  dictation.levels.shift();
+  dictation.levels.push(currentLevel());
+  paintWave();
+}
+
+function formatElapsed(ms) {
+  const total = Math.floor(ms / 1000);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function renderTranscript() {
+  els.dictationTranscript.innerHTML = "";
+  if (dictation.finalText) {
+    els.dictationTranscript.appendChild(document.createTextNode(dictation.finalText));
+  }
+  if (dictation.interimText) {
+    const interim = document.createElement("span");
+    interim.className = "interim";
+    interim.textContent = (dictation.finalText ? " " : "") + dictation.interimText;
+    els.dictationTranscript.appendChild(interim);
+  }
+  els.dictationTranscript.scrollTop = els.dictationTranscript.scrollHeight;
+  els.dictationConfirm.disabled = !dictation.finalText && !dictation.interimText;
+}
+
+function showDictationError(message) {
+  els.dictationTranscript.innerHTML = "";
+  const err = document.createElement("span");
+  err.className = "dictation-error";
+  err.textContent = message;
+  els.dictationTranscript.appendChild(err);
+}
+
+async function startDictation() {
+  if (!SpeechRecognitionCtor) return;
+
+  els.composerInner.dataset.dictating = "true";
+  els.dictation.hidden = false;
+  els.dictation.dataset.tier = state.currentTier;
+  els.voiceModeBtn.setAttribute("aria-pressed", "true");
+  state.listening = true;
+
+  dictation.finalText = "";
+  dictation.interimText = "";
+  dictation.levels = new Array(WAVE_BARS).fill(0);
+  dictation.startedAt = performance.now();
+  buildWaveBars();
+  renderTranscript();
+  paintWave();
+
+  els.dictationTime.textContent = "0:00";
+  dictation.timerId = setInterval(() => {
+    els.dictationTime.textContent = formatElapsed(performance.now() - dictation.startedAt);
+  }, 200);
+
+  // Waveform. A failure here is non-fatal -- transcription still works, the
+  // bars just stay flat, so it must not abort the dictation session.
+  try {
+    dictation.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    dictation.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    dictation.analyser = dictation.audioCtx.createAnalyser();
+    dictation.analyser.fftSize = 1024;
+    dictation.sampleBuf = new Uint8Array(dictation.analyser.fftSize);
+    dictation.audioCtx.createMediaStreamSource(dictation.stream).connect(dictation.analyser);
+    dictation.rafId = requestAnimationFrame(waveFrame);
+  } catch {
+    /* No mic for the meter; SpeechRecognition below may still be granted. */
+  }
+
+  dictation.recognition = new SpeechRecognitionCtor();
+  dictation.recognition.continuous = true;
+  dictation.recognition.interimResults = true;
+  dictation.recognition.lang = navigator.language || "en-US";
+
+  dictation.recognition.addEventListener("result", (e) => {
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const chunk = e.results[i][0].transcript;
+      if (e.results[i].isFinal) {
+        dictation.finalText = (dictation.finalText + " " + chunk.trim()).trim();
+      } else {
+        interim += chunk;
+      }
+    }
+    dictation.interimText = interim.trim();
+    renderTranscript();
+  });
+
+  dictation.recognition.addEventListener("error", (e) => {
+    if (e.error === "no-speech" || e.error === "aborted") return;
+    showDictationError(
+      e.error === "not-allowed" || e.error === "service-not-allowed"
+        ? "Microphone blocked. Allow mic access for this page, then try again."
+        : `Dictation error: ${e.error}`
+    );
+  });
+
+  // continuous mode still ends itself after a long silence; restart so the
+  // session lasts until the user explicitly discards or inserts.
+  dictation.recognition.addEventListener("end", () => {
+    if (!state.listening) return;
+    try {
+      dictation.recognition.start();
+    } catch {
+      /* Already restarting. */
+    }
+  });
+
+  try {
+    dictation.recognition.start();
+  } catch {
+    /* start() throws if a previous session is still tearing down. */
+  }
+}
+
+/** Tears down mic, waveform and recognition. Returns the transcript so far. */
+function stopDictation() {
+  state.listening = false;
+
+  if (dictation.recognition) {
+    dictation.recognition.abort();
+    dictation.recognition = null;
+  }
+  if (dictation.rafId) cancelAnimationFrame(dictation.rafId);
+  dictation.rafId = null;
+  clearInterval(dictation.timerId);
+  dictation.timerId = null;
+
+  // Release the mic, or the browser keeps showing a "recording" indicator.
+  if (dictation.stream) {
+    for (const track of dictation.stream.getTracks()) track.stop();
+    dictation.stream = null;
+  }
+  if (dictation.audioCtx) {
+    dictation.audioCtx.close();
+    dictation.audioCtx = null;
+  }
+
+  els.composerInner.dataset.dictating = "false";
+  els.dictation.hidden = true;
+  els.voiceModeBtn.setAttribute("aria-pressed", "false");
+
+  return [dictation.finalText, dictation.interimText].filter(Boolean).join(" ").trim();
+}
+
+/** Discard: teardown, nothing reaches the composer. */
+function cancelDictation() {
+  if (!state.listening) return;
+  stopDictation();
+  els.composerInput.focus();
+}
+
+/** Insert: append the transcript to whatever is already typed, for editing. */
+function confirmDictation() {
+  if (!state.listening) return;
+  const transcript = stopDictation();
+  if (transcript) {
+    const existing = els.composerInput.value.trim();
+    els.composerInput.value = existing ? `${existing} ${transcript}` : transcript;
+  }
+  els.composerInput.focus();
+  autoGrow();
+  updateSendState();
+}
+
+function initVoice() {
+  if (!SpeechRecognitionCtor) {
+    els.voiceModeBtn.disabled = true;
+    els.voiceModeBtn.title = "Dictation unavailable — this browser has no SpeechRecognition API.";
+    return;
+  }
+  if (!window.isSecureContext) {
+    els.voiceModeBtn.disabled = true;
+    els.voiceModeBtn.title = "Dictation needs a secure context — open this page over https or localhost.";
+  }
+}
+
+function toggleVoice() {
+  if (state.listening) confirmDictation();
+  else startDictation();
+}
+
+/* ---------- Video mode (camera capture) ----------
+ *
+ * Real: opens the device camera with getUserMedia, shows a live preview, and
+ * captures the current frame to a JPEG attachment. Not a mock.
+ *
+ * Deliberately mobile-only. The tier this feeds is the Mobile 1B fast brain,
+ * and pointing a phone's rear camera at something is the actual interaction
+ * being demoed; a laptop webcam pointed at the user's face is a different
+ * feature. On desktop the button disables itself and says why, rather than
+ * silently doing nothing.
+ *
+ * Frames are captured in-memory and, like every other attachment here, only
+ * their metadata is persisted (see addAttachments) -- a base64 JPEG in
+ * localStorage would blow the quota. Sending the pixels anywhere needs
+ * README.md step 1's API server; the repo's image path already masks on the
+ * far side (local VLM sees the image, cloud gets a masked description).
+ */
+
+const CAPTURE_MIME = "image/jpeg";
+const CAPTURE_QUALITY = 0.9;
+
+const camera = { stream: null, facing: "environment" };
+
+/**
+ * Mobile detection, best signal first. userAgentData.mobile is the only
+ * non-heuristic answer but is Chromium-only; the fallback needs both a coarse
+ * pointer and real touch points, since either alone matches touchscreen
+ * laptops. iPadOS reports itself as a Mac, so maxTouchPoints catches it.
+ */
+function isMobileDevice() {
+  if (typeof navigator.userAgentData?.mobile === "boolean") return navigator.userAgentData.mobile;
+  if (/Android|iPhone|iPod|Mobile/i.test(navigator.userAgent)) return true;
+  const coarse = window.matchMedia?.("(pointer: coarse)").matches ?? false;
+  return coarse && navigator.maxTouchPoints > 1;
+}
+
+function setCameraStatus(message) {
+  els.videomodeStatus.textContent = message;
+}
+
+async function openCameraStream() {
+  if (camera.stream) {
+    for (const track of camera.stream.getTracks()) track.stop();
+    camera.stream = null;
+  }
+  camera.stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: camera.facing },
+    audio: false,
+  });
+  els.videomodePreview.srcObject = camera.stream;
+  els.videomodePreview.dataset.facing = camera.facing;
+  await els.videomodePreview.play().catch(() => {});
+}
+
+async function startVideoMode() {
+  state.videoMode = true;
+  els.composerInner.dataset.videomode = "true";
+  els.videomode.hidden = false;
+  els.videoModeBtn.setAttribute("aria-pressed", "true");
+  els.videoModeBtn.dataset.tier = state.currentTier;
+  setCameraStatus("");
+  els.videomodeShutter.disabled = true;
+
+  try {
+    await openCameraStream();
+    els.videomodeShutter.disabled = false;
+  } catch (err) {
+    els.videomodeShutter.disabled = true;
+    setCameraStatus(
+      err?.name === "NotAllowedError"
+        ? "Camera blocked — allow camera access for this page."
+        : err?.name === "NotFoundError"
+        ? "No camera found on this device."
+        : `Camera unavailable: ${err?.name || "unknown error"}`
+    );
+  }
+}
+
+function stopVideoMode() {
+  state.videoMode = false;
+  if (camera.stream) {
+    for (const track of camera.stream.getTracks()) track.stop();
+    camera.stream = null;
+  }
+  els.videomodePreview.srcObject = null;
+  els.composerInner.dataset.videomode = "false";
+  els.videomode.hidden = true;
+  els.videoModeBtn.setAttribute("aria-pressed", "false");
+}
+
+async function flipCamera() {
+  camera.facing = camera.facing === "environment" ? "user" : "environment";
+  try {
+    await openCameraStream();
+  } catch {
+    setCameraStatus("Couldn't switch camera — this device may only have one.");
+  }
+}
+
+/** Grabs the current preview frame at the stream's native resolution. */
+function captureFrame() {
+  const video = els.videomodePreview;
+  if (!video.videoWidth) return;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const ctx = canvas.getContext("2d");
+
+  // Undo the preview's front-camera mirroring so the saved frame matches
+  // what the lens actually saw, not the mirror the user was looking at.
+  if (camera.facing === "user") {
+    ctx.translate(canvas.width, 0);
+    ctx.scale(-1, 1);
+  }
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  canvas.toBlob(
+    (blob) => {
+      if (!blob) return;
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      addAttachments([new File([blob], `capture-${stamp}.jpg`, { type: CAPTURE_MIME })], "image");
+      stopVideoMode();
+      els.composerInput.focus();
+    },
+    CAPTURE_MIME,
+    CAPTURE_QUALITY
+  );
+}
+
+function toggleVideoMode() {
+  if (state.videoMode) stopVideoMode();
+  else startVideoMode();
+}
+
+function initVideoMode() {
+  if (!isMobileDevice()) {
+    els.videoModeBtn.disabled = true;
+    els.videoModeBtn.title = "Video mode is mobile-only — open this page on a phone to use the camera.";
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia || !window.isSecureContext) {
+    els.videoModeBtn.disabled = true;
+    els.videoModeBtn.title = "Camera needs a secure context — open this page over https.";
+  }
+}
+
 async function handleSend(e) {
   e.preventDefault();
   const query = els.composerInput.value.trim();
-  if (!query) return;
+  const attachments = state.attachments;
+  if (!query && attachments.length === 0) return;
 
   let chat = state.chats.find((c) => c.id === state.activeChatId);
-  if (!chat) chat = createChat(query);
+  if (!chat) chat = createChat(query || attachments[0].name);
 
-  chat.messages.push({ role: "user", content: query, timestamp: Date.now() });
+  chat.messages.push({ role: "user", content: query, attachments, timestamp: Date.now() });
   chat.updatedAt = Date.now();
   saveChats();
   renderMessages(chat);
   renderChatList();
 
   els.composerInput.value = "";
+  clearAttachments();
   autoGrow();
   updateSendState();
 
@@ -665,7 +1197,8 @@ function autoGrow() {
 }
 
 function updateSendState() {
-  els.sendBtn.disabled = els.composerInput.value.trim().length === 0;
+  const hasText = els.composerInput.value.trim().length > 0;
+  els.sendBtn.disabled = !hasText && state.attachments.length === 0;
 }
 
 // Picks the tier for the OFFLINE-FALLBACK reply only (see mockRespond) --
@@ -679,6 +1212,8 @@ function setTier(tier) {
     seg.setAttribute("aria-checked", String(active));
   }
   els.emptyStateAvatar.dataset.tier = tier;
+  // Keep any engaged composer mode tinted with the tier the avatar is showing.
+  for (const btn of [els.videoModeBtn, els.voiceModeBtn]) btn.dataset.tier = tier;
 }
 
 els.newChatBtn.addEventListener("click", () => {
@@ -710,6 +1245,37 @@ els.brainToggle.addEventListener("click", (e) => {
   if (btn) setTier(btn.dataset.tier);
 });
 
+els.attachFileBtn.addEventListener("click", () => els.fileInput.click());
+els.attachImageBtn.addEventListener("click", () => els.imageInput.click());
+
+els.fileInput.addEventListener("change", (e) => addAttachments(e.target.files, "file"));
+els.imageInput.addEventListener("change", (e) => addAttachments(e.target.files, "image"));
+
+els.videoModeBtn.addEventListener("click", toggleVideoMode);
+els.voiceModeBtn.addEventListener("click", toggleVoice);
+els.dictationCancel.addEventListener("click", cancelDictation);
+els.dictationConfirm.addEventListener("click", confirmDictation);
+
+els.videomodeClose.addEventListener("click", stopVideoMode);
+els.videomodeFlip.addEventListener("click", flipCamera);
+els.videomodeShutter.addEventListener("click", captureFrame);
+
+// Release mic/camera if the tab goes away rather than holding them open.
+window.addEventListener("pagehide", () => {
+  if (state.listening) stopDictation();
+  if (state.videoMode) stopVideoMode();
+});
+
+// Drag-and-drop onto the composer, same destination as the paperclip.
+els.composer.addEventListener("dragover", (e) => e.preventDefault());
+els.composer.addEventListener("drop", (e) => {
+  e.preventDefault();
+  if (!e.dataTransfer?.files?.length) return;
+  for (const file of e.dataTransfer.files) {
+    addAttachments([file], file.type.startsWith("image/") ? "image" : "file");
+  }
+});
+
 els.exprButtons.addEventListener("click", (e) => {
   const btn = e.target.closest("button");
   if (btn) playExpression(activePreviewAvatar(), btn.dataset.expr);
@@ -723,10 +1289,31 @@ document.addEventListener("click", (e) => {
   if (!els.profiler.contains(e.target)) closeProfilerCard();
 });
 document.addEventListener("keydown", (e) => {
+  if (state.listening) {
+    // Esc discards, Enter inserts -- same keys ChatGPT's dictation uses.
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelDictation();
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      confirmDictation();
+      return;
+    }
+  }
+  if (state.videoMode && e.key === "Escape") {
+    e.preventDefault();
+    stopVideoMode();
+    return;
+  }
   if (e.key === "Escape") closeProfilerCard();
 });
 
+initVoice();
+initVideoMode();
 renderChatList();
 showEmptyState();
+renderAttachments();
 updateSendState();
 checkBackend();
