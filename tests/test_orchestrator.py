@@ -71,6 +71,39 @@ def fake_npu_brain(monkeypatch):
     monkeypatch.setattr("two_brain_router.routing.router.NpuFastBrain", _FakeNpuFastBrain)
     return _FakeNpuFastBrain
 
+
+class _FakeGpuLocalBrain:
+    """Stand-in for the real `GpuLocalBrain` -- avoids needing the llama.cpp
+    OpenCL build and GGUF weights just to verify `_build_escalation_brain`
+    prefers it over the NPU (matching `_build_fast_brain`'s own preference).
+    `tests/test_gpu_brain.py` covers the real thing separately."""
+
+    instances: list["_FakeGpuLocalBrain"] = []
+    reports_confidence = False
+
+    def __init__(self, tier, signals):
+        self.tier = tier
+        self.signals = signals
+        self.received_queries: list[str] = []
+        self.closed = False
+        _FakeGpuLocalBrain.instances.append(self)
+
+    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+        self.received_queries.append(masked_query)
+        return BrainResponse(
+            text=f"[gpu second-opinion answer to: {masked_query!r}]", latency_ms=210.0, cost_usd=0.0
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def fake_gpu_brain(monkeypatch):
+    _FakeGpuLocalBrain.instances.clear()
+    monkeypatch.setattr("two_brain_router.routing.router.GpuLocalBrain", _FakeGpuLocalBrain)
+    return _FakeGpuLocalBrain
+
 # --------------------------------------------------------------------------
 # A real, tiny L-contract server
 # --------------------------------------------------------------------------
@@ -452,3 +485,35 @@ def test_router_close_closes_the_escalation_brain(monkeypatch, fake_npu_brain):
     assert router.escalation_brain is not None
     router.close()
     assert fake_npu_brain.instances[-1].closed is True
+
+
+def test_escalation_brain_prefers_gpu_over_npu_when_both_are_configured(
+    monkeypatch, fake_npu_brain, fake_gpu_brain
+):
+    """_build_escalation_brain delegates to _build_fast_brain("pc", ...)
+    rather than hardcoding NpuFastBrain -- this is the payoff: the mobile
+    tier's escalation target follows whichever real AI-PC brain this
+    machine is configured for, with zero escalation-brain-specific code,
+    matching _build_fast_brain's own GPU-over-NPU preference exactly."""
+    monkeypatch.setenv("TWO_BRAIN_PHONE_BRAIN", "1")
+    monkeypatch.setenv("TWO_BRAIN_GPU_BRAIN", "1")
+    monkeypatch.setenv("TWO_BRAIN_NPU_BRAIN", "1")  # both set -- GPU must win
+
+    router = TwoBrainRouter(tier="mobile")
+    try:
+        assert isinstance(router.escalation_brain, fake_gpu_brain)
+        assert fake_npu_brain.instances == [], "NPU brain must not even be constructed"
+    finally:
+        router.close()
+
+
+def test_escalation_brain_uses_npu_when_only_npu_is_configured(monkeypatch, fake_npu_brain, fake_gpu_brain):
+    monkeypatch.setenv("TWO_BRAIN_PHONE_BRAIN", "1")
+    monkeypatch.setenv("TWO_BRAIN_NPU_BRAIN", "1")
+
+    router = TwoBrainRouter(tier="mobile")
+    try:
+        assert isinstance(router.escalation_brain, fake_npu_brain)
+        assert fake_gpu_brain.instances == []
+    finally:
+        router.close()

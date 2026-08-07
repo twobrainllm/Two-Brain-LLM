@@ -9,9 +9,9 @@ to L (fast brain), O (orchestrator), and C (deep brain); the mapping is:
 
 | Contract name | This codebase |
 |---|---|
-| **L** — fast brain | `NpuFastBrain` (AI PC) / `PhoneFastBrain` (Mobile) / `LocalFastBrain` (stub) |
+| **L** — fast brain | `NpuFastBrain` / `GpuLocalBrain` (AI PC, either real) / `PhoneFastBrain` (Mobile, real) / `LocalFastBrain` (stub) |
 | **O** — orchestrator | `TwoBrainRouter` + `RoutePolicy` |
-| **C** — deep brain | `CloudDeepBrain` (stub — gap #4) |
+| **C** — deep brain | `CirrascaleDeepBrain` (real) / `CloudDeepBrain` (stub — gap #4 unaffected either way) |
 
 ---
 
@@ -117,45 +117,111 @@ differs is only the note text, so the audit trail still says *why*.
 
 **"Not confident" no longer means "the cloud."** When a second, better
 *local* opinion is configured — today: mobile's `PhoneFastBrain` escalating
-to the AI PC's own `NpuFastBrain` — that model is asked directly instead:
+to whichever real AI-PC brain this machine is running — that model is asked
+directly instead:
 
 ```
-"not confident" ─┬─ escalation brain configured? ── yes ──▶ NpuFastBrain(masked_query) ─▶ rehydrate
-                 └─ no ─────────────────────────────────▶ CloudDeepBrain (as before)
+"not confident" ─┬─ escalation brain configured? ── yes ──▶ escalation_brain(masked_query) ─▶ rehydrate
+                 └─ no ─────────────────────────────────▶ CloudDeepBrain / CirrascaleDeepBrain (as before)
 ```
 
 `TwoBrainRouter.escalation_brain` (`_build_escalation_brain` in `router.py`)
-is `None` unless **both** `TWO_BRAIN_PHONE_BRAIN=1` and `TWO_BRAIN_NPU_BRAIN=1`
-are set on the `mobile` tier — same two flags each brain already used
-individually, no third switch invented. It's `None` on the `pc` tier
-unconditionally: `pc`'s own fast brain already *is* this model when the flag
-is on (`_build_fast_brain`), and this hardware doesn't support two live Genie
-sessions at once (`tests/test_npu_brain.py`'s `npu_brain` fixture).
+does **not** hardcode `NpuFastBrain`. It delegates to
+`_build_fast_brain("pc", ...)` — the exact function the `pc` tier itself
+uses to pick its own fast brain — and uses whatever comes back, as long as
+it isn't the stub. Concretely, on the `mobile` tier with
+`TWO_BRAIN_PHONE_BRAIN=1`:
+
+| `TWO_BRAIN_GPU_BRAIN` | `TWO_BRAIN_NPU_BRAIN` | `escalation_brain` |
+|---|---|---|
+| `1` | `1` | `GpuLocalBrain` — GPU wins, same preference `_build_fast_brain` has for its own tier |
+| `1` | unset | `GpuLocalBrain` |
+| unset | `1` | `NpuFastBrain` |
+| unset | unset | `None` — falls back to the cloud, exactly as before |
+
+This is deliberate, not incidental: the AI-PC tier's own fast-brain choice
+and the mobile tier's escalation target must never be able to drift apart,
+and delegating means a third AI-PC backend (or a change to which one wins)
+is automatically correct here too, with no escalation-brain-specific edit.
+`tests/test_orchestrator.py::test_escalation_brain_prefers_gpu_over_npu_when_both_are_configured`
+pins this.
+
+It's `None` on the `pc` tier unconditionally: `pc`'s own fast brain already
+*is* this model when the flag is on (`_build_fast_brain`), and — specifically
+for `NpuFastBrain` — this hardware doesn't support two live Genie sessions at
+once (`tests/test_npu_brain.py`'s `npu_brain` fixture).
 
 What this buys, and what it costs:
 
-- **Still `tier_answered = "local"`, not a new tier value.** `NpuFastBrain`
-  runs in-process on this machine (`docs/npu-deployment.md`) — nothing about
-  this path reaches the cloud boundary `CloudDeepBrain` represents, which is
-  the invariant that actually matters here. The audit trail (`notes`) still
-  says which brain answered; only the enum stayed binary.
+- **Still `tier_answered = "local"`, not a new tier value.** Both
+  `NpuFastBrain` (Genie, in-process `ctypes`) and `GpuLocalBrain`
+  (`llama-server`, loopback HTTP) run on this machine — nothing about this
+  path reaches the cloud boundary `CloudDeepBrain`/`CirrascaleDeepBrain`
+  represents, which is the invariant that actually matters here. The audit
+  trail (`notes`) still says which brain answered; only the enum stayed
+  binary.
 - **Two real local inferences on one query, by design.** The phone answers
   (or the budget pre-check skips it), and if that's not confident, the AI PC
   answers too. Nothing here optimizes for latency — `RouteDecision.est_latency_ms`
   bills both, same accounting the discarded-local-answer case already used.
 - **Masking still comes first, for every brain.** `route()`'s step 1-2 run
   before any brain is called, so the escalation brain — same as the phone,
-  same as the cloud — only ever sees `masked_query.masked_text`.
+  same as the cloud — only ever sees `masked_query.masked_text`. No image can
+  reach it either: only `GpuLocalBrain.for_vision()` instances `can_see`, and
+  nothing in the escalation path passes an image (mobile's `PhoneFastBrain`
+  isn't vision-capable, so `route()` never has one to forward — see "Image
+  routing" below).
 - **Fails loudly, not silently, without the real hardware/runtime stack.**
-  Constructing `NpuFastBrain` without `onnxruntime_qnn` installed (or the
-  Genie artifact) raises immediately from `TwoBrainRouter.__init__` — the
-  exact same failure mode the `pc` tier's own real brain already has, not a
-  new one. There is no silent fallback to a stub here; if you set both flags,
-  you need the real stack.
+  Constructing `NpuFastBrain` without `onnxruntime_qnn` installed, or
+  `GpuLocalBrain` without the `llama-server` OpenCL build / GGUF weights,
+  raises immediately from `TwoBrainRouter.__init__` — the exact same failure
+  mode the `pc` tier's own real brain already has, not a new one. There is no
+  silent fallback to a stub here; if you set the flags, you need the real
+  stack.
 
 Cleanup: `TwoBrainRouter.close()` closes `fast_brain` and `escalation_brain`,
-whichever are real — `api.py`'s `serve()` calls it in `finally`, and anything
-constructing a router directly should too.
+whichever are real (including `GpuLocalBrain`'s `llama-server` child process)
+— `api.py`'s `serve()` calls it in `finally`, and anything constructing a
+router directly should too.
+
+---
+
+## Real cloud, real GPU, and image routing (from `main`)
+
+Independent of this branch's confidence-routing work, `main` made two more
+seams real and closed a fourth:
+
+- **`CirrascaleDeepBrain`** — a real Cloud AI 100 endpoint (Cirrascale AI
+  Suite), behind `TWO_BRAIN_CLOUD_BRAIN=1`. Replaces `CloudDeepBrain`'s
+  datasheet-guess stub with real measured latency and real published
+  per-model pricing. Building it raises immediately if
+  `INFERENCE_CLOUD_ENDPOINT`/`INFERENCE_CLOUD_API_KEY` aren't set — no
+  silent fallback, same posture as every other real brain here.
+- **`GpuLocalBrain`** — a real Adreno GPU brain (`llama-server`, OpenCL),
+  behind `TWO_BRAIN_GPU_BRAIN=1`. One class serves both plain LLM and VLM
+  weights; `GpuLocalBrain.for_vision()` loads a multimodal projector.
+  Does not self-rate (Shape A) — a real option for later, not a backend
+  limitation.
+- **Image routing** — `route(query, context, image)`. An image never leaves
+  the device: the cloud tier has no VLM at all, so an image-bearing query
+  that needs to escalate is first *described* on-device
+  (`GpuLocalBrain.describe_image`), and only that description — masked,
+  same as any other text — is eligible to cross the boundary. Requires a
+  vision-capable `fast_brain` (`can_see`); `route()` raises if an image is
+  supplied to one that isn't.
+- **A real, still-open privacy gap, deliberately pinned in the suite:**
+  `privacy/patterns.py` only covers regex-shaped identifiers — person names
+  are not masked. `tests/test_privacy.py::test_known_gap_person_names_are_not_masked`
+  asserts the current broken behavior on purpose, so this stays visible
+  rather than hidden behind `test_escalated_pii_never_reaches_cloud_unmasked`
+  (which only ever checks an email). If you fix name masking, that test
+  should start failing — invert it, don't delete it.
+
+None of this needed a change to the confidence-routing work above, and
+vice versa: `_build_deep_brain`/`_build_fast_brain` compose with
+`_build_escalation_brain` exactly because each only reasons about its own
+piece (which brain answers this tier) — see "Where code goes" in
+`../CLAUDE.md` for why that seam discipline is the point.
 
 ---
 
@@ -229,11 +295,13 @@ Against the real device, the only change is that the server is the phone
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `TWO_BRAIN_NPU_BRAIN` | unset | `1` enables the real NPU brain (pc tier) |
+| `TWO_BRAIN_NPU_BRAIN` | unset | `1` enables the real NPU brain (pc tier, or mobile's escalation target) |
+| `TWO_BRAIN_GPU_BRAIN` | unset | `1` enables the real GPU brain (pc tier, or mobile's escalation target) — wins over NPU if both are set |
 | `TWO_BRAIN_PHONE_BRAIN` | unset | `1` enables the real phone brain (mobile tier) |
 | `TWO_BRAIN_PHONE_URL` | `http://127.0.0.1:8000` | where L is served |
 | `TWO_BRAIN_PHONE_MODEL` | `llama-3.2-3b-instruct` | model id sent in the request |
 | `TWO_BRAIN_PHONE_ALLOW_REMOTE` | unset | `1` permits a non-loopback L (see below) |
+| `TWO_BRAIN_CLOUD_BRAIN` | unset | `1` enables the real Cirrascale cloud brain (needs `INFERENCE_CLOUD_ENDPOINT`/`INFERENCE_CLOUD_API_KEY`) |
 
 Both brains are **off by default**, so the base package stays stdlib-only and
 the test suite never depends on hardware or a served endpoint being up.
