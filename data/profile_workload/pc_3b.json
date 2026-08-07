@@ -1,16 +1,25 @@
 {
-  "_mock": true,
-  "_reason": "No real artifact to profile (convert_model blocked, see ../convert_model/_real_attempts_log.md). Envelope shape and measurement_notes convention copied from the real profile_workload call in _real_call_log.md; values are plausible estimates for a QDQ-int8 3B model on Hexagon v73 (45 TOPS, this machine's real detected NPU).",
-  "model_id": "qwen2.5-3b-instruct",
+  "_mock": false,
+  "_reason": "Real capture from an actual model, replacing the earlier no-artifact mock (see ../../superpowers/deploy-local-brain-npu.md Phase 2/3 and ../npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md for the full run). Not every field could be measured this pass -- each is marked individually in measurement_notes rather than filled with a plausible guess, matching this project's receipts rule.",
+  "model_id": "phi-3.5-mini-instruct",
   "device_tier": "AI PC",
   "platform": "windows",
-  "runtime": "npu",
-  "latency_ms": {"ttft_mean": 140, "ttft_p95": 210, "per_token_mean": 44.8},
-  "throughput_tokens_per_s": 22.3,
-  "power_mw": {"npu_active": 3400, "idle": 210},
-  "energy_per_1k_tokens_mj": 2005,
+  "runtime": "genie_qnn_htp",
+  "latency_ms": {"ttft_mean": 142, "ttft_p95": 142, "per_token_mean": 94.5},
+  "throughput_tokens_per_s": 10.6,
+  "power_mw": {"npu_active": 0, "idle": 0},
+  "energy_per_1k_tokens_mj": 0,
   "token_cost_usd_per_1k": 0.0,
-  "memory_peak_mb": 3760,
-  "utilization": {"npu": 0.71, "cpu": 0.22, "gpu": 0.0},
-  "measurement_notes": {"all_fields": "mocked:no_real_artifact -- see _real_call_log.md"}
+  "memory_peak_mb": 0,
+  "utilization": {"npu": 0.0, "cpu": 0.0, "gpu": 0.0},
+  "measurement_notes": {
+    "runtime": "corrected:previous mock said model_id qwen2.5-3b-instruct / runtime npu (generic) -- real artifact is Qualcomm's Genie SDK running Phi-3.5-mini-instruct on the QnnHtp (Hexagon) backend, not ONNX Runtime GenAI/QNN-EP (see ../npu_model/phi-3.5-mini-instruct/_real_download_log.md)",
+    "latency": "measured:genie-t2t-run.exe, single real run (n=1) -- see ../npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md",
+    "ttft_p95": "not_measured:n=1, no distribution yet -- set equal to ttft_mean pending a multi-run capture, not a computed percentile",
+    "throughput_tokens_per_s": "derived:1000/per_token_mean",
+    "power_mw": "not_measured:no power-draw instrumentation attached to this run",
+    "energy_per_1k_tokens_mj": "not_measured:depends on power_mw",
+    "memory_peak_mb": "not_measured:process RSS not sampled during this run",
+    "utilization": "not_measured:this system's GPU Engine perf-counter set has no NPU-labeled instance -- see _real_inference_smoke_log.md's utilization section"
+  }
 }
