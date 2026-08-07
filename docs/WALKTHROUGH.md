@@ -365,7 +365,7 @@ rather than the Llama-3.2-3B w4a16 that actually runs, so the latency budget
 pre-check reasons about the wrong model until a real `bench_phone_brain.py`
 run against an S25 replaces it.
 
-### 4. Replace the difficulty heuristic with a real confidence signal (P2 — depends on 3) — DONE for mobile
+### 4. Replace the difficulty heuristic with a real confidence signal (P2 — depends on 3) — DONE for both real tiers
 
 Once the fast brain runs, `DifficultyEstimator.score()` becomes obsolete:
 escalate on the fast brain's own logprob entropy or margin instead of on the

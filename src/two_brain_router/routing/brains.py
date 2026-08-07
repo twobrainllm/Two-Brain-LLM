@@ -46,7 +46,8 @@ class BrainResponse:
     latency_ms: float
     cost_usd: float = 0.0
     #: The brain's own confidence in this answer, `[0.0, 1.0]`, or None when
-    #: this brain emits no such signal (every stub, and NpuFastBrain). See
+    #: this brain emits no such signal (LocalFastBrain, CloudDeepBrain -- the
+    #: stubs; both real brains, NpuFastBrain included, self-rate). See
     #: signals/confidence.py for why None and 0.0 mean different things.
     confidence: float | None = None
     #: Set when the brain could not be reached or misbehaved. The router

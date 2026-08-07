@@ -169,7 +169,7 @@ a piece that is currently mocked:
 | Seam | Replace when | Contract to keep |
 |---|---|---|
 | `privacy/guard.py` | `quad.privacy` (gap G8) becomes available here | `mask` / `rehydrate` / invariant |
-| `signals/difficulty.py` | a fast brain can emit a real signal — **done for mobile**, see `signals/confidence.py` | `score(query) -> float` in `[0, 1]` |
+| `signals/difficulty.py` | a fast brain can emit a real signal — **done for both local tiers**, see `signals/confidence.py` | `score(query) -> float` in `[0, 1]` |
 | `routing/brains.py` | a tier gets a real artifact — **done for both local tiers** | the `Brain` protocol → `BrainResponse` |
 
 When swapping a mock for the real thing, **change only that module** — if the

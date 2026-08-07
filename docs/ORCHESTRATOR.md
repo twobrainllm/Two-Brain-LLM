@@ -26,9 +26,12 @@ A brain declares which shape it needs via `Brain.reports_confidence`.
 
 ### Shape A — brain does not self-rate (`reports_confidence = False`)
 
-Used by `LocalFastBrain` (stub) and `NpuFastBrain`. This is the original
-flow: score the query from surface features, decide, and only pay for a local
-inference if the decision was "stay local".
+Used by the stubs, `LocalFastBrain` and `CloudDeepBrain` -- i.e. the default
+stdlib-only path with no real brain configured. `NpuFastBrain` used to be a
+Shape A example too; it moved to Shape B (below) once it started self-rating
+-- see "Per-tier signal" further down. This is the original flow: score the
+query from surface features, decide, and only pay for a local inference if
+the decision was "stay local".
 
 ```
 mask ─▶ assert ─▶ heuristic score ─▶ escalate? ─┬─ no ──▶ fast brain ──▶ rehydrate
@@ -37,10 +40,12 @@ mask ─▶ assert ─▶ heuristic score ─▶ escalate? ─┬─ no ──�
 
 ### Shape B — brain self-rates (`reports_confidence = True`)
 
-Used by `PhoneFastBrain`. Per `src/phone_brain/L_INTERFACE_CONTRACT.md`, L
-answers *and* rates its own confidence in **one** call, and O — never L —
-applies the threshold. Since the signal arrives attached to the answer, the
-brain must be asked before the decision:
+Used by both real brains: `PhoneFastBrain` (mobile) and `NpuFastBrain` (AI
+PC) -- see "Per-tier signal" below for when the latter moved here. Per
+`src/phone_brain/L_INTERFACE_CONTRACT.md`, L answers *and* rates its own
+confidence in **one** call, and O — never L — applies the threshold. Since
+the signal arrives attached to the answer, the brain must be asked before the
+decision:
 
 ```
 mask ─▶ assert ─▶ budget pre-check ─┬─ over budget ──▶ "not confident" ─▶ …
