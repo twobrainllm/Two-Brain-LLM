@@ -156,7 +156,7 @@ text is what actually leaves the device, the final answer is rehydrated):
 
 ```
 > My email is jane.doe@example.com and my phone is 555-123-4567 -- can you draft a reply telling the sender their SSN 123-45-6789 was found in an old backup and needs to be rotated?
-  routed to: cloud | difficulty=0.40 | est_latency_ms=1159 | est_cost_usd=0.11520
+  routed to: cloud | difficulty=0.40 | est_latency_ms=1479 | est_cost_usd=0.00004
   - masked 3 PII entities before any routing decision
   - escalating: difficulty=0.40 (threshold 0.55) or local_latency_est=4855ms > budget 3000ms
   - sent off-device (masked): 'My email is [PII_EMAIL_1] and my phone is [PII_PHONE_1] -- can you draft a reply telling the sender their SSN [PII_SSN_1] was found in an old backup and needs to be rotated?'
