@@ -49,7 +49,7 @@ is a GitHub ZIP download with no `.git`). Consequences:
 
 ---
 
-## Branch state — one seam closed, two more efforts in flight
+## Branch state — both local seams closed, evaluation still in flight
 
 This sample has grown beyond `main`'s original architecture, across several
 branches, faster than the docs. Know which branch you're on before assuming
@@ -58,7 +58,8 @@ what exists:
 | Branch | Adds | Status |
 |---|---|---|
 | `main` | Everything in the base architecture, **plus the AI-PC-tier `NpuFastBrain`** (merged via PR #1, `ca97bdd`) | Merged, stable |
-| `local_brain` (this branch, if you're reading this on it) | `main`, merged in — so it has `NpuFastBrain` too — **plus** `src/phone_brain/`, a real Mobile-tier fast brain (Genie/QNN on a Galaxy S25), built by Nikhita | `NpuFastBrain`: done. `phone_brain`: **not wired into `routing/brains.py`** |
+| `local_brain` | `main` + `src/phone_brain/` — the Mobile-tier fast brain (Genie/QNN on a Galaxy S25), built by Nikhita, as a standalone package | Superseded by `js/orchestrator` |
+| `js/orchestrator` | `local_brain` + **`PhoneFastBrain`**, wiring that phone brain in behind the `Brain` seam, plus confidence-driven routing | Both local tiers now have a real brain |
 | `p4-eval-demo` (`origin` only — not checked out here) | `evaluation/` — a benchmark/scenario harness, built by THRISHA | In progress; not reviewed against this branch |
 
 **The AI-PC tier's fast-brain seam is closed for real.** `NpuFastBrain`
@@ -73,19 +74,83 @@ captures. Full build history, real bugs found and fixed, and every receipt:
 (the finished version) and [`docs/npu-deployment.md`](docs/npu-deployment.md)
 (short architecture summary). See also [next step #3](docs/WALKTHROUGH.md#next-steps).
 
-**The Mobile tier's fast-brain seam is still open**, and `src/phone_brain/`
-is real, substantial progress toward it — but it is a standalone package,
-not yet absorbed. Read **[`docs/PHONE_BRAIN.md`](docs/PHONE_BRAIN.md)** before
-touching it — it audits what was actually built there against the code (not
-just the docs it shipped with), and lists five concrete things to reconcile
-before it can be merged: privacy ordering (self-reported confidence currently
-sends the **raw, unmasked** prompt to the phone — a direct violation of
-invariant #1 below if wired in as-is), a duplicated escalation threshold, a
-structural change to `route()` (answer and confidence arrive in one call, so
-escalating means discarding a paid-for answer), a model/fixture mismatch with
-`data/profile_workload/mobile_1b.json`, and a pytest-collection footgun in
-`test_phone_brain.py`'s filename. **Do not wire `phone_brain` into
-`TwoBrainRouter` without reading that list first.**
+**The AI PC tier is now on Shape C — read
+[`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md) before touching `route()`.**
+Both AI-PC brains (`NpuFastBrain`, `GpuLocalBrain`) ask the local model for a
+single-line JSON object — `{solution, confidence, unknown}` — so it solves what
+it can *and names the part it can't*. A named `unknown` splits the query: the
+local answer is kept and shown, and only the gap goes to the deep brain
+(`tier_answered="hybrid"`). Real-hardware receipts, including the two defects
+this turned up, are in
+`data/npu_model/phi-3.5-mini-instruct/_real_structured_inference_log.md`.
+
+Three consequences worth knowing before you plan work here:
+
+- **A named gap escalates regardless of the confidence number.** That is the
+  point: this tier's confidence is measurably uninformative (0.95–1.00 on
+  everything), while the gap field discriminates cleanly.
+- **`routing/policy.py` is no longer untouched.** It gained
+  `local_partial_budget_ms`, `send_partial_to_cloud` and a pure
+  `needs_gap_fill()`. It is still pure — that was always the real constraint.
+- **Shape C is text-only.** An image-bearing query still takes the heuristic
+  path, because neither Shape B nor C has anywhere to put an image. Image
+  behaviour is unchanged; extending Shape C to images is the next step.
+
+`TWO_BRAIN_STRUCTURED=0` reverts both AI-PC brains to Shape B.
+
+**To watch the data path, run the API server and read the trace**
+(`src/two_brain_router/trace.py`, on by default there, `--trace` on the CLI).
+It prints each brain call's input and output with an `[ON-DEVICE -- raw text]`
+or `[OFF-DEVICE -- masked]` banner, every value-to-placeholder substitution at
+a crossing, and the rehydration on the way back. Every `answer()` call in the
+router goes through `TwoBrainRouter._ask` so nothing can quietly escape the
+trace — keep it that way. It is ASCII-only on purpose: box-drawing characters
+crash a `cp1252` Windows console, taking the server with them.
+
+**`NpuFastBrain` self-rates as well** (Shape B, the format Shape C
+generalised), so the AI PC tier routes on the model's own confidence rather
+than the keyword heuristic. As
+`ORCHESTRATOR.md` predicted, this needed a prompt change plus a re-profile and
+**no** router change — `route()` and `policy.py` were untouched. Three real
+defects turned up while getting there and are fixed and logged in
+`data/npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md` (Attempt 5):
+`_check` treated Genie *warnings* as fatal (so the class's own token cap crashed
+the call it was meant to truncate), `close()` was not idempotent (double-free
+corrupting the next session), and `genie-t2t-run.exe` hits Windows MAX_PATH in a
+deep checkout. **Read Attempt 5's calibration finding before trusting this
+tier's confidence number** — it separates "answered" from "didn't", not easy
+from hard.
+
+**The Mobile tier's fast-brain seam is closed too**, on branch
+`js/orchestrator`. `PhoneFastBrain` (`routing/brains.py`) speaks the
+OpenAI-shaped contract in `src/phone_brain/L_INTERFACE_CONTRACT.md` and is
+wired into `TwoBrainRouter` behind `TWO_BRAIN_PHONE_BRAIN=1`. It was the first
+brain to **self-rate**, which flips the order of the routing decision —
+read **[`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md)** before changing
+`route()`; it explains the two decision shapes and why the latency budget is
+checked before the call and never after.
+
+Four of the five reconciliation points from
+[`docs/PHONE_BRAIN.md`](docs/PHONE_BRAIN.md) are resolved in that work (privacy
+ordering, the duplicated threshold, the `route()` restructure, and the
+`test_phone_brain.py` → `bench_phone_brain.py` rename). **One is still open:**
+the model/fixture mismatch — `data/profile_workload/mobile_1b.json` is still a
+mock describing Qwen2.5-1.5B int4, while the phone brain runs
+Llama-3.2-3B w4a16. Real numbers need a `bench_phone_brain.py` run against the
+actual S25, with a receipt, per the `data/` rule below. Until then the mobile
+tier's *latency budget pre-check* is reasoning from the wrong model.
+
+**Mobile's "not confident" path now has a third destination, not just the
+cloud.** When `TWO_BRAIN_NPU_BRAIN=1` is also set, an unconfident phone
+answer is followed by a direct call to the AI PC's `NpuFastBrain` — the same
+real model the `pc` tier uses — instead of falling back to the surface-feature
+heuristic or escalating straight to the cloud. Still `tier_answered="local"`
+(nothing crosses the cloud boundary); still masked-text-only into that brain;
+deliberately not latency-optimized (two real local inferences on one query
+when the phone isn't confident). See
+[`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md)'s "The escalation brain"
+section before touching `TwoBrainRouter.escalation_brain` or
+`_build_escalation_brain`.
 
 ---
 
@@ -95,21 +160,71 @@ The point of this sample is a privacy guarantee. It lives in the *ordering*
 inside `routing/router.py::TwoBrainRouter.route`, and any change to routing
 must preserve all four:
 
-1. **Mask first.** The query is masked *before* any routing decision is made —
-   before difficulty scoring, before latency estimation. A decision made on raw
-   text has already read the PII.
+1. **Mask at the boundary, and nowhere earlier.** Every string that leaves this
+   machine is masked immediately before it goes, and never carried around
+   pre-masked. `Brain.trusted_with_raw_pii` marks which side of the boundary a
+   brain sits on: the AI PC's own models (`NpuFastBrain` in-process,
+   `GpuLocalBrain` in a loopback child process) get the query **exactly as the
+   user typed it**, because nothing they are given is transmitted and masking
+   them would cost answer quality while protecting nothing. Everything else —
+   both cloud brains, and `PhoneFastBrain`, which runs on a physically separate
+   device even though `adb reverse` makes the hop look like loopback — receives
+   masked text only.
+
+   > **This inverted in the Shape C work.** It previously read "mask first…
+   > before any brain is called". If you find docs or comments still asserting
+   > that ordering, they are stale — `routing/router.py`'s module docstring is
+   > the current statement. The flag defaults to `False` everywhere it is read
+   > (`getattr(brain, "trusted_with_raw_pii", False)`), so a brain that forgets
+   > to declare it gets masked input rather than a leak.
+
 2. **The invariant check is fatal.** `assert_masked_token_invariant` runs on
-   every request and raises. Never downgrade it to a warning, a log line, or a
-   test-only assertion.
+   everything that crosses and raises. Never downgrade it to a warning, a log
+   line, or a test-only assertion. `_Request.mask_for_boundary` is the single
+   method that pairs the mask with the assert — every path to
+   `deep_brain.answer` goes through it, which is what makes a missing
+   mask/assert greppable.
 3. **Only masked text crosses the boundary.** `CloudDeepBrain.answer` receives
    masked query + masked, compressed context. The vault never leaves the
    process. Escalated *context* gets masked too, not just the query.
+   **This now includes text the local model wrote itself, and that is the
+   sharpest edge in the codebase.** On a Shape C split, the `unknown` gap and
+   (unless `send_partial_to_cloud=False`) the partial answer both cross — and
+   the model that wrote them was handed the **raw** query, so they can quote a
+   real email address verbatim rather than a placeholder. Query-level masking
+   cannot save you here: these strings did not exist when the query was read.
+   Both are masked at the crossing and both get the invariant asserted, exactly
+   like an image description.
+   `tests/test_structured_routing.py::test_the_raw_partial_answer_is_masked_before_it_crosses`
+   is the one to keep passing.
+   **`PhoneFastBrain` is on the far side of a boundary as well** — the mobile
+   model runs on a physically separate device over HTTP — so the same rule
+   applies to it, and it additionally refuses a non-loopback host without an
+   explicit opt-in. **`escalation_brain` (`NpuFastBrain`, when mobile's phone
+   isn't confident) is not on the far side of this specific boundary** — it
+   runs in-process on this machine, so it never reaches the cloud — but it
+   still only ever receives `masked_query.masked_text`, same as every other
+   brain here.
 4. **Rehydrate last, on-device.** Only after the answer is back.
 
+The confidence path is safe for a different reason than it used to be. A
+self-rating brain is called *before* the routing decision (see
+[`docs/ORCHESTRATOR.md`](docs/ORCHESTRATOR.md)), so the decision is now made on
+raw text — which is fine precisely because the thing making it is on-device:
+the difficulty heuristic is a pure local function, and the confidence/gap
+signals come from the local model, which was already trusted with the query by
+the time it produced them. Nothing about the decision is transmitted; only what
+invariant 1 masks is.
+
 `tests/test_routing.py::test_escalated_pii_never_reaches_cloud_unmasked` is the
-regression test for all of this. If you change the router, that test must still
-pass unmodified — if it needs editing to pass, the guarantee changed and that
-is a review-worthy decision, not a test fix.
+regression test for all of this;
+`tests/test_orchestrator.py::test_pii_never_reaches_the_phone_or_the_cloud_unmasked`
+is its counterpart for the phone boundary — it asserts against the bytes that
+actually went out over the socket, not a mocked call; and
+`tests/test_structured_routing.py::test_pii_the_local_model_invented_in_the_gap_is_masked_before_it_crosses`
+covers the split path's new surface. If you change the router,
+all three must still pass unmodified — if either needs editing to pass, the
+guarantee changed and that is a review-worthy decision, not a test fix.
 
 ---
 
@@ -122,8 +237,15 @@ a piece that is currently mocked:
 | Seam | Replace when | Contract to keep |
 |---|---|---|
 | `privacy/guard.py` | `quad.privacy` (gap G8) becomes available here | `mask` / `rehydrate` / invariant |
-| `signals/difficulty.py` | a fast-brain artifact can emit real logprobs | `score(query) -> float` in `[0, 1]` |
-| `routing/brains.py` | a tier gets a real artifact | the `Brain` protocol → `BrainResponse` |
+| `signals/difficulty.py` | a fast brain can emit a real signal — **done for both local tiers**, see `signals/confidence.py` and `signals/structured.py` | `score(query) -> float` in `[0, 1]` |
+| `routing/brains.py` | a tier gets a real artifact — **done for both local tiers** | the `Brain` protocol → `BrainResponse` |
+
+`signals/structured.py` is the newest of these and follows the same rule as
+`confidence.py` and `policy.py`: **pure**, text in and parsed values out, no I/O
+and no reference to a brain. `brains.py` calls into it; nothing there calls
+back. Its `parse_structured` never raises — a badly-formatted model reply
+degrades down a three-rung ladder (JSON → bare `CONFIDENCE:` → no signal at
+all) rather than becoming an exception the router has to special-case.
 
 When swapping a mock for the real thing, **change only that module** — if the
 swap forces edits in `router.py`, the seam was drawn in the wrong place.
@@ -134,24 +256,21 @@ tier switch), nothing in `policy.py` or `signals/`.
 `routing/policy.py` is pure (no I/O, no brain calls) on purpose, so escalation
 rules can be unit-tested directly. Keep it that way.
 
-**One of the remaining seams already has a real, unmerged candidate
-filler** — see Branch state above before starting from scratch:
+Both fast-brain seams now have real fillers (`NpuFastBrain`, `PhoneFastBrain`),
+so `brains.py` is the worked example for a third: add a class to the **flat**
+module, keep runtime imports lazy, and register it in `_build_fast_brain`
+behind its own env var. Don't split it into a `routing/brains/` subpackage —
+that was proposed once and the codebase went the other way.
 
-- `routing/brains.py` (Mobile tier) — `src/phone_brain/` (this branch)
-  built a working Genie/QNN on-device server speaking an OpenAI-shaped HTTP
-  contract for a Llama-3.2-3B-Instruct fast brain. Absorb it as another class
-  in the existing flat `brains.py` (an `OpenAIHttpBrain`, generic over any
-  OpenAI-shaped endpoint) — following the precedent `NpuFastBrain` already
-  set, not as a new `routing/brains/` subpackage; see `docs/PHONE_BRAIN.md`
-  for the corrected layout — after resolving its five reconciliation points,
-  not as-is. (Contrast with `NpuFastBrain`, which deliberately avoided an
-  HTTP hop for the AI-PC tier — see `docs/npu-deployment.md` for why; the
-  phone case is different because the model has to run on a physically
-  separate device.)
-- `signals/difficulty.py` — `src/phone_brain/confidence_estimator.py` is a
-  candidate real signal (self-reported / self-consistency / hybrid), but it
-  returns *confidence*, not this seam's *difficulty*. Invert it
-  (`score = 1 - confidence`) rather than importing it directly.
+`signals/difficulty.py` (the surface-feature heuristic) is still the signal for
+any brain with `reports_confidence = False`, so it is not dead code — but that
+set is now **only the stubs** (`LocalFastBrain`, `CloudDeepBrain`), i.e. the
+default stdlib-only path. Both real brains self-rate. **It is
+no longer the fallback for an unparseable confidence** — that used to be true
+but isn't any more: `route()`'s confidence path now treats "no parseable
+number" the same as "definitely not confident" (`difficulty = 1.0`), not a
+second, different signal. See `docs/ORCHESTRATOR.md`'s "`confidence = None`
+is not `confidence = 0.0`" section for why conflating the two was wrong.
 
 ---
 
@@ -198,9 +317,25 @@ PYTHONPATH=src ../../.venv/Scripts/python.exe -m two_brain_router
 
 `tests/conftest.py` puts `src/` on `sys.path`, so the suite runs uninstalled.
 
+Both real brains are **off by default** — the suite and the demo run
+stdlib-only with stub brains unless you opt in:
+
+```powershell
+# Mobile tier against the real phone brain -- no phone needed, use the mock:
+.venv\Scripts\python.exe src\phone_brain\mock_phone_brain_server.py --port 8000
+$env:TWO_BRAIN_PHONE_BRAIN=1
+.venv\Scripts\python.exe -m two_brain_router --tier mobile
+```
+
+`docs/ORCHESTRATOR.md` has the full env-var table. One trap worth repeating:
+use **`127.0.0.1`, not `localhost`** — on this machine `localhost` costs ~2s
+per call (IPv6 `::1` attempted first, server binds IPv4 only), which is enough
+to blow the 3000ms routing budget on its own.
+
 The demo transcript in the README is **byte-exact output**. If a change alters
 it, update the README in the same commit — a stale transcript is worse than
-none.
+none. The `--tier pc` transcript is the one pinned there; it is unaffected by
+the mobile tier's brain, since `pc` uses the non-confidence path.
 
 ---
 

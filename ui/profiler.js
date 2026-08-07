@@ -51,16 +51,24 @@ function detectPII(text) {
 const PROFILE = {
   local: {
     source: "data/profile_workload/pc_3b.json",
-    ttftMeanMs: 142,
-    perTokenMeanMs: 94.5,
+    // Re-ported after the Shape B re-profile (n=8 through NpuFastBrain itself).
+    // Previously 142 / 94.5, measured on a different prompt and a runaway
+    // generation that drifted into larger context buckets.
+    ttftMeanMs: 105.9,
+    perTokenMeanMs: 74.2,
     tokenCostUsdPer1k: 0.0,
   },
   cloud: {
     source: "data/profile_workload/cloud_large.json",
-    networkRttMeanMs: 45,
-    ttftMeanMs: 320,
-    perTokenMeanMs: 12.4,
-    tokenCostUsdPer1k: 1.8,
+    // Real Cirrascale AI Suite measurement (Llama-3.3-70B), replacing the old
+    // datasheet guess -- previously 45 / 320 / 12.4 / 1.8, the last of which
+    // made a single query look like $1.03. ttft isn't separable without
+    // streaming, so it's folded into networkRttMeanMs (0 here), matching
+    // cloud_large.json's own _ttft_note.
+    networkRttMeanMs: 263,
+    ttftMeanMs: 0,
+    perTokenMeanMs: 19.0,
+    tokenCostUsdPer1k: 0.00069,
   },
 };
 

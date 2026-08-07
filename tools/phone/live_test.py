@@ -13,7 +13,7 @@ Nothing here writes to the device. It reads properties, forwards a port, and
 sends prompts.
 
     --mock   skip the adb steps and test a local server instead
-             (tools/phone/mock_phone_brain_server.py). That is how you verify
+             (src/phone_brain/mock_phone_brain_server.py). That is how you verify
              this harness itself without hardware.
 """
 from __future__ import annotations
@@ -223,14 +223,19 @@ def step_router(base_url: str) -> bool:
 
     router = TwoBrainRouter(tier="mobile")
     brain = type(router.fast_brain).__name__
-    if brain != "OpenAIHttpBrain":
+    if brain != "PhoneFastBrain":
         report(FAIL, "router selected the phone brain", f"got {brain}")
         return False
     report(PASS, "router selected the phone brain", f"{brain} -> {router.fast_brain.base_url}")
 
+    # Capture exactly what leaves for the device. PhoneFastBrain builds the
+    # request inside _post_chat_completion(prompt), so the prompt string is
+    # what crosses the wire.
     sent: list = []
-    original_post = router.fast_brain._post
-    router.fast_brain._post = lambda messages: (sent.append(messages) or original_post(messages))
+    original_post = router.fast_brain._post_chat_completion
+    router.fast_brain._post_chat_completion = lambda prompt: (
+        sent.append(prompt) or original_post(prompt)
+    )
 
     probe = "email bob@example.com and call 555-123-4567 about lunch"
     try:

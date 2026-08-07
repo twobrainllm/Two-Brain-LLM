@@ -41,7 +41,15 @@ def print_decision(query: str, decision: RouteDecision) -> None:
     )
     for note in decision.notes:
         print(f"  - {note}")
-    print(f"  answer: {decision.answer}")
+    if decision.tier_answered == "hybrid":
+        # Print the two halves separately rather than the merged `answer`: the
+        # whole point of this decision is that they came from different brains,
+        # and a merged blob hides exactly the thing worth seeing.
+        print(f"  gap the local brain named: {decision.gap}")
+        print(f"  answer (local): {decision.local_answer}")
+        print(f"  answer (cloud): {decision.cloud_answer}")
+    else:
+        print(f"  answer: {decision.answer}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,12 +67,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query", help="route a single query instead of the demo set")
     parser.add_argument("--context", default="", help="context to attach to --query")
     parser.add_argument("--json", action="store_true", help="emit the decision as JSON")
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="print every call's input and output, and what was masked before "
+        "it left the device (includes raw PII)",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    router = TwoBrainRouter(tier=args.tier)
+    # Opt-in here, unlike `api.py` where it defaults on. Two reasons: this
+    # command already prints a compact per-query summary, so the trace is
+    # additive rather than the only output; and the README pins this exact
+    # transcript byte-for-byte, so a default-on trace would invalidate it.
+    # Never under --json -- that mode is for piping, and human-readable frames
+    # on the same stream would corrupt it.
+    router = TwoBrainRouter(tier=args.tier, trace=args.trace and not args.json)
 
     queries = [(args.query, args.context)] if args.query else DEMO_QUERIES
     for query, context in queries:

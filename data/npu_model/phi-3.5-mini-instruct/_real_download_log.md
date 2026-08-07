@@ -147,6 +147,41 @@ downloaded and documented here (a real repo, really fetched) but are
 unused by the shipped `NpuFastBrain`; nothing in the Decision section's
 in-process/no-server reasoning changes.
 
+## Re-placed in a second checkout (2026-08-06) -- copied, not re-fetched
+
+The `.../Downloads/QUAD/QUAD-Client-main/samples/two_brain_privacy_router`
+checkout started with no `raw/` at all (it is gitignored). Rather than a fresh
+S3 GET, the zip was copied from a sibling clone on the same machine
+(`C:\Users\qc_de\dev\hollowbyte\Two-Brain-LLM`) and verified against the
+receipt above **before** extraction:
+
+- size `2078158835` -- exact match
+- SHA256 `4e1573f75d666e0bf2a24678dcfb539edfc9e7c8a109e1c3f9b8913633718e13`
+  -- exact match
+
+Since the hash matches, the bytes are provably identical to what S3 served, so
+this is equivalent for correctness. It is **not** an independent re-verification
+that the URL above is still live -- that was not attempted on this pass, and
+nothing here should be read as claiming it.
+
+### Correction to the file table above: `genie_config.json` is 5,375 bytes, not 5,376
+
+Verifying the extracted files against the table in "Files fetched, real" turned
+up one mismatch. Seven of eight match exactly; `genie_config.json` came out of
+the verified zip at **5,375** bytes.
+
+Byte-diffing against the sibling clone's copy found the cause at offset 694:
+that clone's file reads `"use-mmap": false` where the pristine archive says
+`"use-mmap": true`. `true` -> `false` is exactly the missing byte. So the
+**table above recorded a locally-modified file**, not the archive's own
+contents -- the edit is documented nowhere in that clone, and this is the first
+time it has been noticed.
+
+The pristine value is kept here, unmodified. `use-mmap: true` was then tested
+and is not merely harmless: cold load is roughly twice as fast (6.5 s vs the
+13.1 s Attempt 3b recorded against the edited config). See
+`_real_inference_smoke_log.md` Attempt 5.
+
 ## Not vendored into git
 
 Per `.gitignore`, `data/npu_model/**/raw/`, `*.zip`, `*.bin`, `*.dll`,

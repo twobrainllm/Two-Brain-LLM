@@ -351,14 +351,21 @@ changed — the seam held. `tests/test_npu_brain.py` has the Phase 6
 verification suite (skips without the real runtime/artifact, passes for
 real under `.venv-npu`).
 
-**This closes the AI-PC tier only.** The Mobile tier's fast brain is a
-separate, still-open effort — `src/phone_brain/` on branch `local_brain`
-has a working Genie/QNN server for Llama-3.2-3B-Instruct on a Galaxy S25,
-but it isn't wired into `Brain`/`TwoBrainRouter` yet and has real issues to
-resolve first (it currently sends the raw, unmasked query off-device before
-any routing decision). See `docs/PHONE_BRAIN.md`.
+**The Mobile tier is closed too, on branch `js/orchestrator`.**
+`PhoneFastBrain` wires `src/phone_brain/`'s Genie/QNN server for
+Llama-3.2-3B-Instruct on a Galaxy S25 in behind the same `Brain` seam, over
+the OpenAI-shaped contract in `src/phone_brain/L_INTERFACE_CONTRACT.md`.
+Enabled with `TWO_BRAIN_PHONE_BRAIN=1`; testable against the mock server with
+no phone attached. See [`ORCHESTRATOR.md`](ORCHESTRATOR.md) and
+[`PHONE_BRAIN.md`](PHONE_BRAIN.md).
 
-### 4. Replace the difficulty heuristic with a real confidence signal (P2 — depends on 3)
+What's still mocked for mobile is the *fixture*, not the brain:
+`data/profile_workload/mobile_1b.json` still describes Qwen2.5-1.5B int4
+rather than the Llama-3.2-3B w4a16 that actually runs, so the latency budget
+pre-check reasons about the wrong model until a real `bench_phone_brain.py`
+run against an S25 replaces it.
+
+### 4. Replace the difficulty heuristic with a real confidence signal (P2 — depends on 3) — DONE for both real tiers
 
 Once the fast brain runs, `DifficultyEstimator.score()` becomes obsolete:
 escalate on the fast brain's own logprob entropy or margin instead of on the
@@ -366,6 +373,37 @@ presence of the word "derive". Keep the `score(query) -> float` signature so
 `policy.py` is untouched. This is the single biggest quality improvement
 available — surface features misfire in both directions (the demo's query 3
 scores 0.40 for a genuinely easy request).
+
+**Done for the mobile tier** via `signals/confidence.py` — not logprobs
+(unavailable, and `L_INTERFACE_CONTRACT.md` says explicitly not to depend on
+them) but the model's own self-reported confidence, inverted into the same
+difficulty scale so `policy.py` really is untouched, exactly as this item
+asked. The predicted misfire is now observable: with a real signal, demo
+query 3 scores **0.08** and stays on-device, where the heuristic escalated it.
+
+Two follow-ups this opened. The first is now closed; the second got *worse* news
+than expected:
+
+- ~~**The AI PC tier still uses the heuristic.**~~ **DONE.** `NpuFastBrain` now
+  self-rates too. It cost exactly what was predicted — a prompt change plus a
+  re-profile, no router change (`route()` and `policy.py` untouched; only
+  `brains.py` and `data/profile_workload/pc_3b.json` moved). Both real brains
+  are now Shape B, so `DifficultyEstimator` is the signal only for the stub
+  brains, i.e. the default stdlib-only path. Receipts, including three real
+  defects found and fixed on the way:
+  `data/npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md` Attempt 5.
+- **Calibration is unverified on real hardware** — now **partly verified, and
+  the answer is not encouraging.** On the AI PC tier, across 8 real queries the
+  self-report came back 0.85–1.00 with one unparseable: a merge-sort derivation
+  rated itself the same 0.95 as "What is the capital of France?". Inverted, that
+  is difficulty 0.00–0.15, all far under the 0.55 threshold — so this tier's
+  escalations are in practice decided by the latency budget pre-check, not by
+  the confidence. The signal reliably separates "produced a number" from
+  "didn't"; it does not yet separate easy from hard, which is most of what this
+  item was after. The threshold was deliberately not retuned to compensate.
+  `confidence_estimator.py`'s `hybrid()` remains the documented fallback and is
+  still a `signals/confidence.py`-only change. The **mobile** tier's calibration
+  is still unverified — that needs the real S25.
 
 ### 5. Compress context with the fast brain instead of truncating (P2 — depends on 3)
 

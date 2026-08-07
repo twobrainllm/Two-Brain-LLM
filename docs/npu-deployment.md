@@ -71,6 +71,12 @@ anything above `brains.py`. Neither condition applies today.
 - Real, working, on-NPU inference through this exact path -- confirmed via
   `QnnGraph_execute` execution logs against the `QnnHtp` backend and a real
   QNN profiler capture (`data/npu_model/phi-3.5-mini-instruct/receipts/`).
+- **The brain self-rates.** `answer()` returns a `BrainResponse.confidence`
+  alongside the text, so this tier routes on the model's own number rather than
+  the surface-feature heuristic (Shape B -- `docs/ORCHESTRATOR.md`). That is a
+  prompt-level change; the runtime mechanics above are unaffected. Measured
+  caveat: the number's *discrimination* is weak on this artifact, and
+  `ORCHESTRATOR.md` records why that was left visible rather than tuned away.
 - Wired into `TwoBrainRouter` for the `pc_3b` tier, gated behind the
   `TWO_BRAIN_NPU_BRAIN=1` env var so the base package stays stdlib-only by
   default (`router.py::_build_fast_brain`).
