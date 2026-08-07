@@ -328,9 +328,13 @@ function renderMessageEl(msg) {
     const badge = document.createElement("div");
     badge.className = "tier-badge";
     const tier = msg.tier || "local";
-    badge.innerHTML =
-      `<span class="tier-dot" data-tier="${tier}"></span>` +
-      (tier === "local" ? "Local brain (simulated)" : "Cloud brain (simulated)");
+    // "(simulated)" must mean the *routing* was simulated, not that the brain
+    // behind it returned a stub. A real decision that happened to reach a
+    // stubbed brain is still a real decision, and labelling it simulated
+    // undersells the only part that is actually running.
+    const label = tier === "local" ? "Local brain" : "Cloud brain";
+    const suffix = msg.metrics?.live ? " · routed live" : " (simulated)";
+    badge.innerHTML = `<span class="tier-dot" data-tier="${tier}"></span>${label}${suffix}`;
     bubble.appendChild(badge);
   }
 
