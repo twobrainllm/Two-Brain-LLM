@@ -1293,7 +1293,23 @@ class PhoneFastBrain:
 
     #: Matches confidence_estimator.py's request shape exactly -- the L
     #: contract pins these four fields.
-    _MAX_TOKENS = 256
+    #: Generation cap for one on-device answer.
+    #:
+    #: 256 was too low against the real model: "tell me about ancient
+    #: civilizations" was cut off mid-sentence, which reads as a broken answer
+    #: rather than a budget. 512 is the compromise -- at the ~16 tok/s measured
+    #: on an S25 that is roughly 30s worst case, and most answers finish well
+    #: before it.
+    #:
+    #: Raising this can no longer lose the confidence rating, because the model
+    #: is asked for it on the first line (see _SELF_RATE_SYSTEM). Before that
+    #: change, a higher cap would have made truncation *more* likely to eat the
+    #: rating on exactly the long answers worth keeping.
+    #:
+    #: Overridable per-run without a code change, since the right value depends
+    #: on the device and the demo: a phone that is thermally throttled wants
+    #: less, a benchmark wants more.
+    _MAX_TOKENS = int(os.environ.get("TWO_BRAIN_PHONE_MAX_TOKENS") or 512)
     _TEMPERATURE = 0.2
 
     #: The self-rating instruction, as a system message, asking for the rating
