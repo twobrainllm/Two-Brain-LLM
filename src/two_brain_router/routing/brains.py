@@ -24,7 +24,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Iterator, Protocol
 
 from two_brain_router.signals.loader import DATA_DIR, TierSignals
 
@@ -126,6 +126,30 @@ class CloudBrainError(RuntimeError):
     """The Cloud AI 100 inference endpoint returned a non-OK response."""
 
 
+def _iter_sse_deltas(response) -> "Iterator[str]":
+    """Yield `delta.content` strings from an OpenAI-shaped SSE stream.
+
+    Both backends speak this: llama-server and Cirrascale each emit
+    `data: {...}` lines with a `choices[0].delta.content`, terminated by
+    `data: [DONE]`. Shared so the two brains cannot drift apart on parsing.
+    """
+    for raw in response:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            return
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue  # keep-alive or a partial frame; not fatal
+        for choice in chunk.get("choices", []):
+            piece = (choice.get("delta") or {}).get("content")
+            if piece:
+                yield piece
+
+
 class CirrascaleDeepBrain:
     """Off-device deep brain, running for real on hosted Cloud AI 100 silicon.
 
@@ -169,7 +193,11 @@ class CirrascaleDeepBrain:
     #: the 70B is unavailable, which is a real and observed condition.
     DEFAULT_MODEL = "Llama-3.3-70B"
     FALLBACK_MODEL = "Llama-3.1-8B"
-    _MAX_NEW_TOKENS = 512
+    # A ceiling, not a target -- the model still stops at EOS. Every catalogue
+    # model has an 8K context that must also hold the prompt and, for an
+    # escalated image query, the local VLM's description, so this deliberately
+    # leaves room rather than claiming the whole window.
+    _MAX_NEW_TOKENS = int(os.environ.get("TWO_BRAIN_CLOUD_MAX_TOKENS", "2048"))
     _TIMEOUT_S = 300
 
     def __init__(
@@ -264,6 +292,63 @@ class CirrascaleDeepBrain:
                     usage.get("completion_tokens", 0),
                 ),
             )
+        raise last_error or CloudBrainError("no cloud model answered")
+
+    def answer_stream(self, masked_query: str, context: str = "") -> "Iterator[str]":
+        """Yield the answer in pieces as the cloud generates it.
+
+        Same model-fallback intent as `answer`, but the fallback can only apply
+        before the first byte: once text has been emitted to the caller there is
+        no way to retract it, so a mid-stream failure raises instead of
+        silently restarting on the smaller model and producing a spliced answer.
+        """
+        import urllib.error
+        import urllib.request
+
+        messages = []
+        if context:
+            messages.append({"role": "system", "content": context})
+        messages.append({"role": "user", "content": masked_query})
+
+        candidates = [self.model]
+        if self.FALLBACK_MODEL not in candidates:
+            candidates.append(self.FALLBACK_MODEL)
+
+        last_error: Exception | None = None
+        for model in candidates:
+            payload = json.dumps({
+                "model": model,
+                "messages": messages,
+                "max_tokens": self._MAX_NEW_TOKENS,
+                "stream": True,
+            }).encode("utf-8")
+            request = urllib.request.Request(
+                f"{self._endpoint}/chat/completions",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                response = urllib.request.urlopen(request, timeout=self._TIMEOUT_S)
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    detail = json.loads(exc.read().decode("utf-8")).get("message", "")
+                except Exception:  # noqa: BLE001
+                    pass
+                last_error = CloudBrainError(f"cloud endpoint HTTP {exc.code}: {detail}")
+                continue
+            except urllib.error.URLError as exc:
+                last_error = CloudBrainError(f"cloud endpoint unreachable: {exc.reason}")
+                continue
+
+            self.model_used = model
+            with response:
+                yield from _iter_sse_deltas(response)
+            return
         raise last_error or CloudBrainError("no cloud model answered")
 
 
@@ -519,12 +604,34 @@ _GPU_MODEL_PATH = DATA_DIR / "npu_model" / "phi-3.5-mini-instruct" / "gguf" / "P
 #: flash-attention kernels cover only 64/128, so `mmproj_offload=False` is
 #: mandatory or the process segfaults.
 _VLM_DIR = DATA_DIR / "vlm_gpu_model"
-_VLM_MODEL_PATH = _VLM_DIR / "qwen3-vl-8b-instruct" / "raw" / "Qwen3-VL-8B-Instruct-Q4_0.gguf"
-_VLM_MMPROJ_PATH = _VLM_DIR / "qwen3-vl-8b-instruct" / "raw" / "mmproj-F16.gguf"
-#: The speed-oriented alternative: one point behind on the eval, but keeps the
-#: vision encoder on the GPU (head_dim 64) and is ~39% faster.
-_VLM_FAST_MODEL_PATH = _VLM_DIR / "qwen3-vl-4b-instruct" / "raw" / "Qwen3-VL-4B-Instruct-Q8_0.gguf"
-_VLM_FAST_MMPROJ_PATH = _VLM_DIR / "qwen3-vl-4b-instruct" / "raw" / "mmproj-Qwen3VL-4B-Instruct-f16.gguf"
+_VLM_8B_DIR = _VLM_DIR / "qwen3-vl-8b-instruct" / "raw"
+_VLM_4B_DIR = _VLM_DIR / "qwen3-vl-4b-instruct" / "raw"
+_VLM_4B_MMPROJ = _VLM_4B_DIR / "mmproj-Qwen3VL-4B-Instruct-f16.gguf"
+
+#: prefer -> (model, mmproj, mmproj_offload). All three run on the Adreno.
+#:
+#:   quality   8B Q4_0  7/7   slowest; vision encoder forced to CPU
+#:   balanced  4B Q8_0  6/7   vision on GPU
+#:   speed     4B Q4_0  5/7   vision on GPU, the quant Adreno is optimised for
+#:
+#: Only the 8B needs mmproj_offload=False, and it is not optional there: its
+#: vision tower is head_dim 72, OpenCL's flash-attention kernels cover 64/128,
+#: and leaving offload on segfaults the process.
+_VLM_VARIANTS: dict[str, tuple[Path, Path, bool]] = {
+    "quality": (_VLM_8B_DIR / "Qwen3-VL-8B-Instruct-Q4_0.gguf", _VLM_8B_DIR / "mmproj-F16.gguf", False),
+    "balanced": (_VLM_4B_DIR / "Qwen3-VL-4B-Instruct-Q8_0.gguf", _VLM_4B_MMPROJ, True),
+    "speed": (_VLM_4B_DIR / "Qwen3-VL-4B-Instruct-Q4_0.gguf", _VLM_4B_MMPROJ, True),
+}
+
+#: Default: speed. Interactive chat is the workload, and there the 8B's extra
+#: eval point does not pay for itself -- it decodes at ~13 tok/s against the
+#: 4B Q4_0's ~21, so a 1024-token reply takes roughly 77s instead of 48s.
+#: Override with TWO_BRAIN_VLM_PREFER=quality|balanced|speed.
+_VLM_DEFAULT_PREFER = os.environ.get("TWO_BRAIN_VLM_PREFER", "speed")
+
+# Kept for the existing tests/imports; points at whatever the default is.
+_VLM_MODEL_PATH = _VLM_VARIANTS[_VLM_DEFAULT_PREFER][0]
+_VLM_MMPROJ_PATH = _VLM_VARIANTS[_VLM_DEFAULT_PREFER][1]
 
 
 class GpuLocalBrain:
@@ -570,10 +677,24 @@ class GpuLocalBrain:
     is ~3 s (see data/npu_model/phi-3.5-mini-instruct/_real_geniex_hybrid_log.md).
     """
 
-    _MAX_NEW_TOKENS = 48
-    _MAX_DESCRIBE_TOKENS = 512
-    _N_CTX = 4096
+    # 48 was inherited from NpuFastBrain, where it existed to bound output
+    # because Genie's EOS handling was unreliable (see that class's docstring).
+    # llama.cpp stops cleanly on EOS, so the cap is only a safety ceiling here
+    # -- and at 48 tokens (~35 words) it truncated every real chat answer
+    # mid-sentence. These are ceilings, not targets: a short answer still
+    # returns as soon as the model emits EOS, so raising them costs nothing
+    # except on genuinely long replies.
+    _MAX_NEW_TOKENS = int(os.environ.get("TWO_BRAIN_GPU_MAX_TOKENS", "4096"))
+    _MAX_DESCRIBE_TOKENS = int(os.environ.get("TWO_BRAIN_GPU_DESCRIBE_TOKENS", "2048"))
+    # Must hold the prompt, the image tokens when one is attached, *and* the
+    # reply -- so it has to exceed _MAX_NEW_TOKENS with room to spare, not
+    # merely equal it. 16384 leaves ~12k for prompt and image alongside a
+    # full-length answer. KV cache for the 4B at this size is ~2.4 GB, well
+    # inside the Adreno's ~15.9 GB.
+    _N_CTX = int(os.environ.get("TWO_BRAIN_GPU_N_CTX", "16384"))
     _STARTUP_TIMEOUT_S = 120.0
+    #: A long local answer can run for minutes at ~21 tok/s.
+    _TIMEOUT_S = 900
 
     def __init__(
         self,
@@ -623,29 +744,30 @@ class GpuLocalBrain:
         return any(marker in text for marker in self.GPU_PLACEMENT_MARKERS)
 
     @classmethod
-    def for_vision(cls, tier: str, signals: TierSignals, prefer: str = "quality", **kw) -> "GpuLocalBrain":
-        """Construct with the measured-best vision weights.
+    def for_vision(cls, tier: str, signals: TierSignals, prefer: str | None = None, **kw) -> "GpuLocalBrain":
+        """Construct with vision weights, chosen by measurement.
 
-        `prefer="quality"` -> Qwen3-VL-8B-Instruct-Q4_0 (7/7 on the eval), with
-        `mmproj_offload=False` because its vision encoder cannot run on the GPU.
-        `prefer="speed"` -> Qwen3-VL-4B-Instruct-Q8_0 (6/7), vision encoder on
-        the GPU, ~39% faster.
+        `prefer` is one of `quality` (8B Q4_0, 7/7), `balanced` (4B Q8_0, 6/7)
+        or `speed` (4B Q4_0, 5/7); it defaults to `TWO_BRAIN_VLM_PREFER`, and
+        that in turn defaults to `speed`. Scores and timings come from
+        data/vlm_gpu_model/_eval/RESULTS.md.
 
-        Both are still text-in/text-out today: `answer()` does not accept an
-        image, for the protocol and privacy reasons in this class's docstring.
-        Loading the projector means the instance is ready when that lands, and
-        it makes the recommended weights a default rather than folklore.
-        See data/vlm_gpu_model/_eval/RESULTS.md.
+        The default favours latency because the workload is interactive chat:
+        the 4B decodes at roughly 21 tok/s against the 8B's 13, so a long reply
+        arrives in about half the time. The accuracy cost is real and measured
+        -- weakest on counting and stylised-glyph OCR -- so pick `quality` for
+        anything where being wrong matters more than waiting.
         """
-        if prefer not in ("quality", "speed"):
-            raise ValueError(f"prefer must be 'quality' or 'speed', got {prefer!r}")
-        if prefer == "quality":
-            kw.setdefault("model_path", _VLM_MODEL_PATH)
-            kw.setdefault("mmproj_path", _VLM_MMPROJ_PATH)
-            kw.setdefault("mmproj_offload", False)  # mandatory for the 8B; segfaults otherwise
-        else:
-            kw.setdefault("model_path", _VLM_FAST_MODEL_PATH)
-            kw.setdefault("mmproj_path", _VLM_FAST_MMPROJ_PATH)
+        prefer = prefer or _VLM_DEFAULT_PREFER
+        if prefer not in _VLM_VARIANTS:
+            raise ValueError(
+                f"prefer must be one of {', '.join(_VLM_VARIANTS)}; got {prefer!r}"
+            )
+        model, mmproj, offload = _VLM_VARIANTS[prefer]
+        kw.setdefault("model_path", model)
+        kw.setdefault("mmproj_path", mmproj)
+        # Not a preference for the 8B: leaving offload on segfaults it.
+        kw.setdefault("mmproj_offload", offload)
         return cls(tier, signals, **kw)
 
     def _server_exe(self) -> Path:
@@ -822,7 +944,7 @@ class GpuLocalBrain:
 
         start = time.perf_counter()
         try:
-            with urllib.request.urlopen(request, timeout=300) as resp:
+            with urllib.request.urlopen(request, timeout=self._TIMEOUT_S) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:  # pragma: no cover - server-side failure
             raise GpuBrainError(f"llama-server returned HTTP {exc.code}: {exc.read()[:200]!r}") from exc
@@ -830,6 +952,53 @@ class GpuLocalBrain:
 
         text = body["choices"][0]["message"]["content"]
         return BrainResponse(text=text.strip(), latency_ms=latency_ms, cost_usd=0.0)
+
+    def answer_stream(
+        self, masked_query: str, context: str = "", image: Path | None = None
+    ) -> "Iterator[str]":
+        """Yield the answer in pieces as the GPU generates it.
+
+        The reason this matters here more than on the cloud tier: the local
+        model decodes at ~21 tok/s, so a long reply is a minute-plus wait. Shown
+        as it arrives that is tolerable; shown as a blank screen it is not.
+        """
+        import urllib.error
+        import urllib.request
+
+        if image is not None and not self.can_see:
+            raise GpuBrainError(
+                "image passed to a text-only brain -- construct via GpuLocalBrain.for_vision()"
+            )
+
+        messages = []
+        if context:
+            messages.append({"role": "system", "content": context})
+        if image is not None:
+            messages.append({"role": "user", "content": [
+                {"type": "text", "text": masked_query},
+                {"type": "image_url", "image_url": {"url": self._image_data_uri(image)}},
+            ]})
+        else:
+            messages.append({"role": "user", "content": masked_query})
+
+        payload = json.dumps({
+            "messages": messages,
+            "max_tokens": self._MAX_DESCRIBE_TOKENS if image is not None else self._MAX_NEW_TOKENS,
+            "temperature": 0.7,
+            "stream": True,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self._base_url}/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            response = urllib.request.urlopen(request, timeout=self._TIMEOUT_S)
+        except urllib.error.HTTPError as exc:  # pragma: no cover - server-side failure
+            raise GpuBrainError(f"llama-server returned HTTP {exc.code}") from exc
+        with response:
+            yield from _iter_sse_deltas(response)
 
     def close(self) -> None:
         proc = self._proc

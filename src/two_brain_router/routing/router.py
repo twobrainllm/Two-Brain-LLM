@@ -14,6 +14,7 @@ process.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -89,6 +90,41 @@ def _build_deep_brain(signals: TierSignals) -> Brain:
     if os.environ.get(_CLOUD_BRAIN_ENV_VAR) == "1":
         return CirrascaleDeepBrain(signals)
     return CloudDeepBrain(signals)
+
+
+class _IncrementalRehydrator:
+    """Rehydrates placeholders in a stream, without splitting one across chunks.
+
+    Rehydration is a plain string replace on a complete answer. Streaming breaks
+    that: `[PII_EMAIL_1]` can arrive as `[PII_EM` then `AIL_1]`, and replacing
+    per chunk would emit the placeholder verbatim to the user.
+
+    So text is held back whenever the tail could still become a placeholder --
+    anything after an unmatched `[` -- and released once the bracket closes or
+    the tail can no longer be a prefix of one. Invariant #5 is unchanged: this
+    runs on-device, after the answer is back, and the vault never leaves.
+    """
+
+    def __init__(self, guard: PIIGuard, vault: dict[str, str]) -> None:
+        self._guard = guard
+        self._vault = vault
+        self._pending = ""
+
+    def feed(self, chunk: str) -> str:
+        self._pending += chunk
+        cut = self._pending.rfind("[")
+        if cut == -1:
+            out, self._pending = self._pending, ""
+        elif "]" in self._pending[cut:]:
+            # The last bracket is closed, so nothing is mid-placeholder.
+            out, self._pending = self._pending, ""
+        else:
+            out, self._pending = self._pending[:cut], self._pending[cut:]
+        return self._guard.rehydrate(out, self._vault) if out else ""
+
+    def flush(self) -> str:
+        out, self._pending = self._pending, ""
+        return self._guard.rehydrate(out, self._vault) if out else ""
 
 
 class TwoBrainRouter:
@@ -181,6 +217,116 @@ class TwoBrainRouter:
 
         notes.append(self.policy.local_note(difficulty, local_latency_est))
         return self._answer_locally(guard, masked_query_result, difficulty, notes, image)
+
+    def route_stream(
+        self,
+        query: str,
+        context: str = "",
+        image: Path | None = None,
+        force_tier: Tier2 | None = None,
+    ):
+        """Route one query, yielding the answer as it is generated.
+
+        Yields `("meta", {...})` once the tier is decided, then `("delta", str)`
+        repeatedly, then `("done", {...})`.
+
+        The privacy ordering is identical to `route()` and deliberately still
+        blocking where it must be: masking, the invariant, and -- for an
+        escalated image -- describing the image and masking that description all
+        complete *before* the first delta. Only generation is streamed.
+        """
+        notes: list[str] = []
+        guard = PIIGuard()
+
+        masked_query_result = guard.mask(query)
+        assert_masked_token_invariant(query, masked_query_result)
+        if masked_query_result.vault:
+            n = len(masked_query_result.vault)
+            notes.append(f"masked {n} PII entit{'y' if n == 1 else 'ies'} before any routing decision")
+
+        if image is not None and not getattr(self.fast_brain, "can_see", False):
+            raise ValueError(
+                "an image was supplied but the fast brain cannot see -- "
+                "enable TWO_BRAIN_GPU_BRAIN=1 and build it with GpuLocalBrain.for_vision()"
+            )
+        if image is not None:
+            notes.append("image stays on-device: the cloud tier has no VLM")
+
+        difficulty = self.difficulty.score(query)
+        local_latency_est = self.policy.estimate_local_latency_ms(self.local.profile, query)
+
+        if force_tier is not None and ui_test_enabled():
+            would_be = "cloud" if self.policy.should_escalate(difficulty, local_latency_est) else "local"
+            notes.append(f"tier forced to {force_tier} (UI_TEST=1; policy would have said {would_be})")
+            escalate = force_tier == "cloud"
+        else:
+            if force_tier is not None:
+                notes.append(f"ignored force_tier={force_tier}: UI_TEST is not enabled, so the policy decides")
+            escalate = self.policy.should_escalate(difficulty, local_latency_est)
+            notes.append(
+                self.policy.escalation_note(difficulty, local_latency_est)
+                if escalate
+                else self.policy.local_note(difficulty, local_latency_est)
+            )
+
+        vault = dict(masked_query_result.vault)
+        if escalate:
+            # Same as _escalate, and for the same reasons -- the image is turned
+            # into words here, before anything is streamed, and those words are
+            # masked like any other text.
+            if image is not None:
+                described = self.fast_brain.describe_image(image, masked_query_result.masked_text)
+                masked_description = guard.mask(described.text)
+                assert_masked_token_invariant(described.text, masked_description)
+                vault.update(masked_description.vault)
+                context = (
+                    f"{context}\n\n{masked_description.masked_text}".strip()
+                    if context
+                    else masked_description.masked_text
+                )
+                notes.append(
+                    f"image described on-device into {len(masked_description.masked_text)} chars; "
+                    f"masked {len(masked_description.vault)} PII entit"
+                    f"{'y' if len(masked_description.vault) == 1 else 'ies'} in the description"
+                )
+            masked_context = guard.mask(context) if context else MaskResult(masked_text="", vault={})
+            vault.update(masked_context.vault)
+            compressed, was_compressed = self.policy.compress_context(masked_context.masked_text)
+            if was_compressed:
+                notes.append(f"compressed escalated context to {len(compressed)} chars")
+            if masked_query_result.vault:
+                notes.append(f"sent off-device (masked): {masked_query_result.masked_text!r}")
+            stream = self.deep_brain.answer_stream(masked_query_result.masked_text, compressed)
+        else:
+            kwargs = {"image": image} if image is not None else {}
+            stream = self.fast_brain.answer_stream(masked_query_result.masked_text, **kwargs)
+
+        tier = "cloud" if escalate else "local"
+        yield ("meta", {
+            "tier_answered": tier,
+            "difficulty_score": difficulty,
+            "pii_entities_masked": len(masked_query_result.vault),
+            "notes": notes,
+        })
+
+        rehydrator = _IncrementalRehydrator(guard, vault)
+        started = time.perf_counter()
+        n_chars = 0
+        for piece in stream:
+            n_chars += len(piece)
+            out = rehydrator.feed(piece)
+            if out:
+                yield ("delta", out)
+        tail = rehydrator.flush()
+        if tail:
+            yield ("delta", tail)
+
+        yield ("done", {
+            "tier_answered": tier,
+            "est_latency_ms": (time.perf_counter() - started) * 1000,
+            "est_cost_usd": 0.0,
+            "chars": n_chars,
+        })
 
     def _answer_locally(
         self,

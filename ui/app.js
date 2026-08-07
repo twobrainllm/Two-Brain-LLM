@@ -326,12 +326,21 @@ function renderMessageEl(msg) {
     const tier = msg.tier || "local";
     badge.innerHTML =
       `<span class="tier-dot" data-tier="${tier}"></span>` +
-      (tier === "local" ? "Local brain (simulated)" : "Cloud brain (simulated)");
+      (tier === "local" ? "Local brain" : "Cloud brain");
     bubble.appendChild(badge);
   }
 
   const text = document.createElement("div");
-  text.innerHTML = escapeHtml(msg.content).replace(/\n/g, "<br>");
+  // Assistant replies arrive as Markdown. renderMarkdown escapes the model
+  // output before applying any pattern, so this is not an injection point.
+  // User messages stay literal: what someone typed should be shown as typed,
+  // not reinterpreted.
+  if (msg.role === "assistant") {
+    text.className = "markdown";
+    text.innerHTML = renderMarkdown(msg.content);
+  } else {
+    text.innerHTML = escapeHtml(msg.content).replace(/\n/g, "<br>");
+  }
   bubble.appendChild(text);
 
   row.appendChild(bubble);
@@ -506,6 +515,72 @@ async function askBackend(query, tier, imageDataUrl) {
   return body;
 }
 
+/**
+ * Stream an answer, calling `onDelta(fullTextSoFar)` as tokens arrive.
+ *
+ * The local brain decodes at ~21 tok/s, so a long reply is a minute of blank
+ * screen without this. Resolves to the same shape askBackend returns, so the
+ * caller's bookkeeping is unchanged.
+ *
+ * EventSource is not usable here: it is GET-only, and the request carries a
+ * JSON body with an optional base64 image. So this reads the fetch body as a
+ * stream and parses the SSE frames directly.
+ */
+async function askBackendStreaming(query, tier, imageDataUrl, onDelta) {
+  const res = await fetch("/api/chat/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message: query, tier, image: imageDataUrl || undefined }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `backend returned ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const result = { answer: "" };
+  let buffer = "";
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // SSE frames are separated by a blank line; the last piece may be partial.
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+
+    for (const frame of frames) {
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      if (!data) continue;
+      let payload;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        continue;
+      }
+
+      if (event === "delta") {
+        result.answer += payload.text || "";
+        onDelta(result.answer);
+      } else if (event === "meta") {
+        Object.assign(result, payload);
+      } else if (event === "done") {
+        Object.assign(result, payload, { answer: result.answer });
+      } else if (event === "error") {
+        throw new Error(payload.error || "stream failed");
+      }
+    }
+  }
+  return result;
+}
+
 /* ── Image attachment ─────────────────────────────────────────────────── */
 function clearAttachment() {
   state.attachment = null;
@@ -609,7 +684,21 @@ async function handleSend(e) {
   let metrics;
   if (state.backend) {
     try {
-      const result = await askBackend(query, tier, attachment?.dataUrl);
+      // Paint into the placeholder bubble as tokens arrive, so a long local
+      // reply shows progress instead of a blank wait.
+      const liveText = thinkingRow.querySelector(".bubble > div:last-child");
+      const result = await askBackendStreaming(
+        query,
+        tier,
+        attachment?.dataUrl,
+        (soFar) => {
+          if (!liveText) return;
+          thinkingAvatar?.classList.remove("thinking");
+          liveText.className = "markdown";
+          liveText.innerHTML = renderMarkdown(soFar);
+          scrollToBottom();
+        },
+      );
       answer = result.answer;
       // The server reports which brain actually answered. Under UI_TEST=0 the
       // policy may well have overruled the toggle, so trust the response

@@ -144,31 +144,47 @@ def test_gate_is_off_by_default(monkeypatch):
 _VLM_PRESENT = _VLM_MODEL_PATH.exists() and _VLM_MMPROJ_PATH.exists()
 
 
-@pytest.mark.skipif(not _VLM_PRESENT, reason="VLM weights not present (gitignored)")
-def test_for_vision_uses_the_eval_winning_defaults(tmp_path):
-    """The recommended VLM config is a default, not folklore in a doc.
+def test_vision_variants_match_the_eval():
+    """Each `prefer` maps to the weights RESULTS.md measured, with the right flags.
 
-    Pins the outcome of data/vlm_gpu_model/_eval/RESULTS.md: 8B Q4_0 scored
-    7/7, ahead of 4B Q8_0 and even 4B BF16 at 6/7. If someone changes the
-    default, this should make them justify it against the eval.
+    Cheap to run (no model is loaded), so it guards the mapping even on a
+    machine without the weights. The default is `speed` because the workload is
+    interactive chat -- the 4B decodes at ~21 tok/s against the 8B's ~13 -- and
+    that is a deliberate trade of 5/7 against 7/7, not an oversight.
 
-    mmproj_offload MUST be False here: the 8B's vision tower is head_dim 72,
-    llama.cpp's OpenCL flash-attention kernels cover only 64/128, and leaving
-    offload on segfaults the process.
+    mmproj_offload MUST be False for the 8B and only the 8B: its vision tower is
+    head_dim 72, llama.cpp's OpenCL flash-attention kernels cover only 64/128,
+    and leaving offload on segfaults the process.
     """
+    from two_brain_router.routing.brains import _VLM_DEFAULT_PREFER, _VLM_VARIANTS
+
+    quality, balanced, speed = (_VLM_VARIANTS[k] for k in ("quality", "balanced", "speed"))
+
+    assert "8B" in quality[0].name and "Q4_0" in quality[0].name
+    assert quality[2] is False, "the 8B's vision encoder must stay off the GPU"
+    assert "4B" in balanced[0].name and "Q8_0" in balanced[0].name
+    assert balanced[2] is True
+    assert "4B" in speed[0].name and "Q4_0" in speed[0].name
+    assert speed[2] is True
+
+    assert _VLM_DEFAULT_PREFER == "speed", (
+        "default changed -- justify it against data/vlm_gpu_model/_eval/RESULTS.md"
+    )
+
+
+@pytest.mark.skipif(not _VLM_PRESENT, reason="VLM weights not present (gitignored)")
+def test_for_vision_loads_the_default_variant(tmp_path):
+    """The default really loads and answers, with its projector attached."""
     brain = GpuLocalBrain.for_vision(
         "pc", TierSignals.load("pc_3b", "ai_pc"), log_path=tmp_path / "srv.log"
     )
     try:
-        assert "8B" in brain._model_path.name and "Q4_0" in brain._model_path.name
+        assert brain._model_path == _VLM_MODEL_PATH
         assert brain._mmproj_path is not None, "vision defaults must load a projector"
-        assert brain._mmproj_offload is False, "8B vision encoder must stay off the GPU"
 
         response = brain.answer("Name three primary colours.")
         assert response.text.strip()
-        assert brain.verify_gpu_placement(), "language model should still be on the GPU"
-        log = (tmp_path / "srv.log").read_text(encoding="utf-8", errors="replace")
-        assert "CLIP using CPU backend" in log, "vision encoder must be on CPU for the 8B"
+        assert brain.verify_gpu_placement(), "language model should be on the GPU"
     finally:
         brain.close()
 

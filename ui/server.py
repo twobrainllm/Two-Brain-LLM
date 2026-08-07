@@ -132,8 +132,41 @@ class Handler(SimpleHTTPRequestHandler):
             "vision": bool(getattr(router.fast_brain, "can_see", False)),
         })
 
+    def _sse(self, event: str, data: dict) -> None:
+        self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def _chat_stream(self, message: str, tier, image_path: Path | None) -> None:
+        """Server-Sent Events, so the browser paints tokens as they generate.
+
+        A local reply runs at ~21 tok/s, so a long answer is a minute-plus of
+        blank screen without this. Errors are delivered as an `error` event
+        rather than an HTTP status, since the 200 and headers are already gone
+        by the time generation starts.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        # This app is same-origin, but proxies buffer SSE by default and that
+        # would defeat the whole point.
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            router = get_router()
+            for kind, payload in router.route_stream(message, image=image_path, force_tier=tier):
+                self._sse(kind, payload if isinstance(payload, dict) else {"text": payload})
+        except Exception as exc:  # noqa: BLE001 -- the stream is the only channel left
+            try:
+                self._sse("error", {"error": f"{type(exc).__name__}: {exc}"})
+            except Exception:  # noqa: BLE001 -- client already gone
+                pass
+        finally:
+            if image_path is not None:
+                image_path.unlink(missing_ok=True)
+
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.split("?")[0] != "/api/chat":
+        if self.path.split("?")[0] not in ("/api/chat", "/api/chat/stream"):
             return self._json(404, {"error": "not found"})
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -149,9 +182,17 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(400, {"error": "tier must be 'local' or 'cloud'"})
 
         image_path: Path | None = None
-        try:
-            if payload.get("image"):
+        if payload.get("image"):
+            try:
                 image_path = decode_image(payload["image"])
+            except ValueError as exc:
+                return self._json(400, {"error": str(exc)})
+
+        if self.path.split("?")[0] == "/api/chat/stream":
+            # _chat_stream owns the temp file from here, including deleting it.
+            return self._chat_stream(message, tier, image_path)
+
+        try:
             router = get_router()
             decision = router.route(message, image=image_path, force_tier=tier)
         except ValueError as exc:
@@ -177,12 +218,21 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     port = int(os.environ.get("PORT", "8000"))
+    # Loopback by default. HOST=0.0.0.0 makes it reachable from the LAN, which
+    # is sometimes the only way in (a remote editor whose port forwarding is
+    # broken, say) -- but it also exposes /api/chat to everyone on that
+    # network, and every escalated request spends real cloud tokens. Opt in
+    # deliberately; do not make it the default.
+    host = os.environ.get("HOST", "127.0.0.1")
     if not ui_test_enabled():
         print("[server] UI_TEST is not 1 -- the local/cloud switch will NOT force a tier;")
         print("[server] the policy will decide. Start with UI_TEST=1 to make it authoritative.")
-    print(f"[server] http://127.0.0.1:{port}  (serving {UI_DIR})")
+    if host != "127.0.0.1":
+        print(f"[server] WARNING: bound to {host} -- anyone who can reach this host on")
+        print("[server] port {0} can use /api/chat, which spends real cloud tokens.".format(port))
+    print(f"[server] http://{host}:{port}  (serving {UI_DIR})")
     print("[server] brains build lazily on the first request; the first reply may be slow.")
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
