@@ -139,6 +139,8 @@ const state = {
   //: True while a reply is streaming; suppresses re-renders that
   //: would destroy the bubble being painted into.
   streaming: false,
+  //: AbortController for the in-flight stream, so it can be stopped.
+  abortController: null,
   searchQuery: "",
 };
 
@@ -607,11 +609,12 @@ async function askBackend(query, tier, imageDataUrl) {
  * JSON body with an optional base64 image. So this reads the fetch body as a
  * stream and parses the SSE frames directly.
  */
-async function askBackendStreaming(query, tier, imageDataUrl, onDelta) {
+async function askBackendStreaming(query, tier, imageDataUrl, onDelta, signal) {
   const res = await fetch("/api/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message: query, tier, image: imageDataUrl || undefined }),
+    signal,
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -784,7 +787,10 @@ async function handleSend(e) {
   };
   chat.messages.push(streamingMessage);
   state.streaming = true;
+  state.abortController = new AbortController();
+  updateSendState(); // swap Send -> Stop
   let lastPersistAt = 0;
+  let stopped = false;
 
   if (state.backend) {
     try {
@@ -812,6 +818,7 @@ async function handleSend(e) {
             saveChats();
           }
         },
+        state.abortController.signal,
       );
       answer = result.answer;
       // The server reports which brain actually answered. Under UI_TEST=0 the
@@ -825,9 +832,19 @@ async function handleSend(e) {
       metrics.routerNotes = result.notes || [];
       metrics.piiCount = result.pii_entities_masked ?? metrics.piiCount;
     } catch (err) {
-      answer = `The backend returned an error:
+      if (err.name === "AbortError") {
+        // Stopped on purpose. Keep whatever arrived rather than throwing it
+        // away -- a partial answer to a two-minute generation is still worth
+        // having -- and mark it so the transcript does not read as complete.
+        stopped = true;
+        answer = streamingMessage.content
+          ? `${streamingMessage.content}\n\n_[stopped]_`
+          : "_[stopped before any output]_";
+      } else {
+        answer = `The backend returned an error:
 
 ${err.message}`;
+      }
       metrics = computeMetrics(query, tier);
     }
   } else {
@@ -840,8 +857,11 @@ ${err.message}`;
   streamingMessage.content = answer;
   streamingMessage.tier = answeredTier;
   streamingMessage.metrics = metrics;
+  if (stopped) streamingMessage.stopped = true;
   delete streamingMessage.partial;
   state.streaming = false;
+  state.abortController = null;
+  updateSendState(); // Stop -> Send
   chat.updatedAt = Date.now();
   saveChats();
   renderMessages(chat);
@@ -855,10 +875,35 @@ function autoGrow() {
   els.composerInput.style.height = Math.min(els.composerInput.scrollHeight, 200) + "px";
 }
 
+const SEND_ICON =
+  '<svg viewBox="0 0 20 20" width="16" height="16" fill="none"><path d="M10 16V4M10 4l5 5M10 4l-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const STOP_ICON =
+  '<svg viewBox="0 0 20 20" width="16" height="16"><rect x="6" y="6" width="8" height="8" rx="1.5" fill="currentColor"/></svg>';
+
 function updateSendState() {
+  if (state.streaming) {
+    // Mid-generation the button becomes Stop, and must stay enabled -- it is
+    // the only way to interrupt a reply that can run for minutes.
+    els.sendBtn.disabled = false;
+    els.sendBtn.innerHTML = STOP_ICON;
+    els.sendBtn.setAttribute("aria-label", "Stop generating");
+    els.sendBtn.classList.add("stopping");
+    return;
+  }
+  els.sendBtn.innerHTML = SEND_ICON;
+  els.sendBtn.setAttribute("aria-label", "Send message");
+  els.sendBtn.classList.remove("stopping");
   // An image alone is a valid message; the VLM can be asked to describe it.
   els.sendBtn.disabled =
     els.composerInput.value.trim().length === 0 && !state.attachment;
+}
+
+/** Abort the in-flight generation. The partial reply is kept, not discarded. */
+function stopGenerating() {
+  if (state.abortController) {
+    state.abortController.abort();
+    state.abortController = null;
+  }
 }
 
 function setTier(tier) {
@@ -883,7 +928,22 @@ els.searchInput.addEventListener("input", (e) => {
   renderChatList();
 });
 
-els.composer.addEventListener("submit", handleSend);
+els.sendBtn.addEventListener("click", (e) => {
+  // While streaming this button is Stop, not Send. Intercept before the
+  // form submits so a click cannot start a second generation.
+  if (state.streaming) {
+    e.preventDefault();
+    stopGenerating();
+  }
+});
+
+els.composer.addEventListener("submit", (e) => {
+  if (state.streaming) {
+    e.preventDefault(); // Enter key while a reply is streaming
+    return;
+  }
+  handleSend(e);
+});
 els.composerInput.addEventListener("input", () => {
   autoGrow();
   updateSendState();

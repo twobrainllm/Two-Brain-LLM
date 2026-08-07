@@ -104,6 +104,19 @@ class Handler(SimpleHTTPRequestHandler):
         if "/api/" in (self.path or ""):
             sys.stderr.write(f"[server] {fmt % args}\n")
 
+    def handle_one_request(self) -> None:
+        """Treat a client hanging up as normal, because here it is.
+
+        Pressing Stop aborts the fetch mid-response, and the base handler then
+        raises ConnectionResetError trying to read the next request off the
+        socket. Left alone that prints a traceback for what is a routine user
+        action, which makes the log actively misleading.
+        """
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
+
     def _json(self, status: int, body: dict) -> None:
         raw = json.dumps(body).encode("utf-8")
         self.send_response(status)
@@ -152,16 +165,28 @@ class Handler(SimpleHTTPRequestHandler):
         # would defeat the whole point.
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
+        stream = None
         try:
             router = get_router()
-            for kind, payload in router.route_stream(message, image=image_path, force_tier=tier):
+            stream = router.route_stream(message, image=image_path, force_tier=tier)
+            for kind, payload in stream:
                 self._sse(kind, payload if isinstance(payload, dict) else {"text": payload})
+        except (BrokenPipeError, ConnectionResetError):
+            # The browser hit Stop, or navigated away. Not an error -- just
+            # stop generating. Closing the generator below propagates through
+            # to the upstream HTTP request, so the model stops too rather than
+            # running to completion for nobody.
+            pass
         except Exception as exc:  # noqa: BLE001 -- the stream is the only channel left
             try:
                 self._sse("error", {"error": f"{type(exc).__name__}: {exc}"})
             except Exception:  # noqa: BLE001 -- client already gone
                 pass
         finally:
+            # Closing the generator unwinds answer_stream's `with response:`,
+            # which drops the connection to llama-server / Cirrascale.
+            if stream is not None:
+                stream.close()
             if image_path is not None:
                 image_path.unlink(missing_ok=True)
 

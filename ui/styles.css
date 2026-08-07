@@ -882,3 +882,11 @@ button, input, textarea {
 .markdown hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
 .markdown a { color: var(--brain-local); text-decoration: underline; }
 .markdown strong { font-weight: 600; }
+
+/* Send button becomes Stop while a reply is generating. Red-tinted so it
+   reads as an interrupt rather than another send. */
+#send-btn.stopping {
+  background: #C0392B;
+  color: #fff;
+}
+#send-btn.stopping:hover { background: #A93226; }
