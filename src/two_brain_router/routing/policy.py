@@ -113,6 +113,30 @@ class RoutePolicy:
     """
 
     escalate_threshold: float = 0.55
+    #: The same OR-condition as `escalate_threshold`, but for a brain's own
+    #: self-reported confidence (Shape B/C) rather than the heuristic
+    #: keyword/length scorer (Shape A).
+    #:
+    #: **Deliberately a second number, not a reuse of `escalate_threshold`.**
+    #: That used to be "one threshold, not two" on purpose -- but the two
+    #: signals turned out not to share a scale in practice. Real Phi-3.5/Qwen
+    #: self-reports land in a narrow, over-confident band, 0.85-1.00 (see
+    #: data/npu_model/phi-3.5-mini-instruct/_real_inference_smoke_log.md,
+    #: Attempt 5's calibration finding), while the heuristic score is an
+    #: arbitrary 0-1 weighted-feature metric tuned separately. A difficulty
+    #: threshold of 0.55 (confidence <= 0.45) was calibrated for the heuristic
+    #: and essentially never fires against that narrow band -- which is the
+    #: observed "it never escalates" symptom this field exists to fix.
+    #: Reusing one number for both would force choosing between "the heuristic
+    #: barely escalates" and "confidence-based paths escalate on nearly every
+    #: answer that isn't perfect", and no single value resolves that.
+    #:
+    #: 0.10 means: escalate on confidence grounds whenever the brain reports
+    #: 0.90 or below; stay local only at 0.95 or above (difficulty <= 0.05,
+    #: comfortably under the 0.10 line even given float rounding on a `/100`
+    #: confidence value). Matches a real user request, verbatim: "only if the
+    #: model is 0.95 or 1 confident, then escalation is not required."
+    confidence_escalate_threshold: float = 0.10
     #: Local answer is preferred whenever it fits this budget at the tier's
     #: profiled per-token rate (data/profile_workload/<tier>.json).
     local_latency_budget_ms: float = 3000
@@ -162,6 +186,18 @@ class RoutePolicy:
             or local_latency_est_ms > self.local_latency_budget_ms
         )
 
+    def confidence_says_escalate(self, difficulty: float) -> bool:
+        """Whether a self-rating brain's own reported difficulty (1 - confidence)
+        is high enough to escalate on confidence grounds alone -- ignoring
+        latency and any named gap, both handled elsewhere.
+
+        Shape B's one and only escalation trigger (`_route_on_confidence`), and
+        one of the two `needs_gap_fill` ORs together for Shape C. Pure, so the
+        threshold's real effect can be checked directly against measured
+        confidence values without a brain in the loop.
+        """
+        return difficulty >= self.confidence_escalate_threshold
+
     def needs_gap_fill(self, difficulty: float, gap: str) -> bool:
         """Does this structured local answer need the deep brain at all?
 
@@ -173,8 +209,9 @@ class RoutePolicy:
           about the half it answered and still be missing the other half.
           Ignoring a stated gap because the overall number looked good would
           throw away the most specific signal in the system.
-        - **Low confidence**, via the same `escalate_threshold` every other path
-          uses. Still one threshold, not two.
+        - **Low confidence**, via `confidence_escalate_threshold` -- see
+          `confidence_says_escalate` and that field's docstring for why this is
+          not the same threshold the heuristic path uses.
 
         Deliberately no latency term, unlike `should_escalate`. By the time this
         is asked the local inference has already been paid for, and the budget
@@ -182,19 +219,29 @@ class RoutePolicy:
         Re-testing it here could only add the deep brain's latency on top of
         time already spent.
         """
-        return bool(gap.strip()) or difficulty >= self.escalate_threshold
+        return bool(gap.strip()) or self.confidence_says_escalate(difficulty)
 
-    def escalation_note(self, difficulty: float, local_latency_est_ms: float) -> str:
+    def escalation_note(
+        self, difficulty: float, local_latency_est_ms: float, threshold: float | None = None
+    ) -> str:
+        # `threshold=None` defaults to the heuristic threshold, matching every
+        # existing caller (Shape A). Confidence-based callers (Shape B/C) pass
+        # `confidence_escalate_threshold` explicitly, so the displayed number is
+        # always the one the decision was actually made against.
+        shown = self.escalate_threshold if threshold is None else threshold
         return (
-            f"escalating: difficulty={difficulty:.2f} (threshold {self.escalate_threshold}) "
+            f"escalating: difficulty={difficulty:.2f} (threshold {shown}) "
             f"or local_latency_est={local_latency_est_ms:.0f}ms > "
             f"budget {self.local_latency_budget_ms}ms"
         )
 
-    def local_note(self, difficulty: float, local_latency_est_ms: float) -> str:
+    def local_note(
+        self, difficulty: float, local_latency_est_ms: float, threshold: float | None = None
+    ) -> str:
+        shown = self.escalate_threshold if threshold is None else threshold
         return (
             f"answering locally: difficulty={difficulty:.2f} < "
-            f"threshold {self.escalate_threshold}, "
+            f"threshold {shown}, "
             f"local_latency_est={local_latency_est_ms:.0f}ms within budget"
         )
 

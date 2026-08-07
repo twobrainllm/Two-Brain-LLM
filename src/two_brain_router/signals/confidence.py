@@ -72,7 +72,22 @@ def confidence_to_difficulty(confidence: float) -> float:
 
     `signals/difficulty.py` scores 0.0 (easy) -> 1.0 (hard); a self-report is
     the opposite polarity. Inverting here -- rather than teaching the policy a
-    second scale -- is what keeps `routing/policy.py` untouched and keeps a
-    single escalation threshold in the system.
+    second scale -- is what keeps a single conversion point every threshold
+    comparison goes through.
+
+    **Rounded to 6 decimal places, and this is load-bearing, not cosmetic.**
+    `confidence` is always `n/100` for an integer `n` (see `parse_self_reported`
+    / `parse_structured`), so it looks decimal-exact -- but binary floats don't
+    represent most two-decimal-place values exactly, and `1.0 - x` on a value
+    like 0.9 measurably does not land on 0.1:
+
+        >>> 1.0 - 0.90
+        0.09999999999999998
+
+    A caller comparing that against a threshold of exactly `0.10` with `>=`
+    gets `False` -- confidence 0.90 silently fails to reach a 0.10 difficulty
+    threshold. Found for real: a threshold deliberately set so "confidence 0.90
+    or below escalates" let 0.90 itself through. Rounding removes the artifact
+    while keeping far more precision than a 2-decimal-place input ever carries.
     """
-    return 1.0 - min(max(confidence, 0.0), 1.0)
+    return round(1.0 - min(max(confidence, 0.0), 1.0), 6)

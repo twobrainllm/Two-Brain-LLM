@@ -432,6 +432,14 @@ function renderMessageEl(msg) {
     bubble.appendChild(badge);
   }
 
+  // The boundary-crossing disclosure is part of the message, not just the live
+  // row: this function rebuilds the whole transcript at the end of every turn
+  // (and on load), so anything only painted onto the in-flight row vanishes the
+  // moment the answer lands. It was doing exactly that before this.
+  if (msg.role === "assistant" && msg.crossing) {
+    renderCrossing(bubble, msg.crossing);
+  }
+
   // A user message can carry an image. Shown inline so the transcript records
   // what was actually asked -- and it never left this machine: `api.py` decodes
   // it to a temp file the local VLM reads, and only a masked *textual*
@@ -486,8 +494,13 @@ function renderMessageEl(msg) {
  * Inserted above whatever else the bubble holds so it stays visible as the
  * answer streams in beneath it.
  */
-function renderCrossing(bubble, payload) {
-  if (!bubble || !payload || bubble.crossingEl) return;
+function renderCrossing(container, payload) {
+  // Takes the `.bubble` element itself rather than the live-bubble state
+  // object, because `renderMessageEl` builds a bubble *before* attaching it to
+  // its row -- a row-based lookup finds nothing there and silently renders
+  // none of this.
+  if (!container || !payload) return;
+  if (container.querySelector && container.querySelector(".crossing")) return;
   const subs = payload.substitutions || [];
   const rows = subs
     .map((s) =>
@@ -499,11 +512,20 @@ function renderCrossing(bubble, payload) {
 
   const el = document.createElement("details");
   el.className = "crossing";
+  // The chevron is the only thing telling anyone this opens: the native
+  // <details> marker is hidden in CSS (it renders inconsistently across
+  // browsers and clashes with the lock), so without this the row is silently
+  // clickable -- which is the same as not being clickable at all. It rotates
+  // 180 degrees on open, so the icon also reports the current state.
   el.innerHTML =
     `<summary><span class="crossing-lock">&#128274;</span>` +
+    `<span class="crossing-summary-text">` +
     (subs.length
       ? `${subs.length} item${subs.length === 1 ? "" : "s"} masked before leaving this device`
       : `Sent to the cloud (no PII found)`) +
+    `</span>` +
+    `<svg class="crossing-chevron" viewBox="0 0 20 20" width="12" height="12" fill="none" aria-hidden="true">` +
+    `<path d="M5 8l5 5 5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
     `</summary>` +
     (rows ? `<div class="crossing-subs">${rows}</div>` : "") +
     `<div class="crossing-label">Sent off-device:</div>` +
@@ -513,12 +535,9 @@ function renderCrossing(bubble, payload) {
         `<pre class="crossing-text">${escapeHtml(payload.context)}</pre>`
       : "");
 
-  const container = bubble.row?.querySelector(".bubble");
-  if (!container) return;
-  const badge = container.querySelector(".tier-badge");
+  const badge = container.querySelector ? container.querySelector(".tier-badge") : null;
   if (badge && badge.nextSibling) container.insertBefore(el, badge.nextSibling);
   else container.appendChild(el);
-  bubble.crossingEl = el;
 }
 
 function setRowTier(row, tier) {
@@ -566,22 +585,38 @@ function finalizeAssistantRow(row, { tier, content }) {
 }
 
 /**
- * Marks a row as waiting on the cloud, optionally naming the gap being asked.
+ * The inner markup of a "waiting on the cloud" placeholder.
  *
- * `gap` is the interesting part when there is one: it says exactly what the
- * local model could not do, and therefore exactly what is crossing the
- * boundary. With no gap (`escalating`) the whole query is going, and the row
- * says that instead of implying a split that isn't happening.
+ * Shared by `renderCloudPending` (which owns a whole row) and the live
+ * streaming path (which writes into a bubble it is already holding a reference
+ * to, and so cannot use `replaceBubbleBody` without dropping that reference).
+ * One function so the two cannot drift into wording the same wait differently.
+ *
+ * Leads with "Thinking" in both branches, because that word is the part doing
+ * the work: this is shown the instant the router *decides* to cross, which can
+ * be many seconds before the cloud emits its first token. `gap` is the
+ * interesting detail when there is one -- it names exactly what the local model
+ * could not do, and therefore exactly what is crossing the boundary. With no
+ * gap the whole query is going, and this says that rather than implying a split
+ * that isn't happening.
  */
+function cloudPendingHtml(gap) {
+  return (
+    `<span class="cloud-pending-dots"><i></i><i></i><i></i></span>` +
+    `<span class="cloud-pending-text">` +
+    (gap
+      ? `Thinking… answering the rest: ${escapeHtml(gap)}`
+      : `Thinking… escalating the whole query to the cloud`) +
+    `</span>`
+  );
+}
+
+/** Marks a row as waiting on the cloud, optionally naming the gap being asked. */
 function renderCloudPending(row, gap) {
   setRowTier(row, "cloud");
   const pending = document.createElement("div");
   pending.className = "cloud-pending";
-  pending.innerHTML =
-    `<span class="cloud-pending-dots"><i></i><i></i><i></i></span>` +
-    (gap
-      ? `Answering the rest: ${escapeHtml(gap)}`
-      : `Escalating the whole query…`);
+  pending.innerHTML = cloudPendingHtml(gap);
   replaceBubbleBody(row, [pending]);
 }
 
@@ -1129,6 +1164,10 @@ async function handleSend(e) {
   // and the cloud's gap-fill in its own, filling in as the tokens land.
   const bubbles = new Map(); // tier -> {row, textEl, text}
   let pendingRow = thinkingRow; // whichever row is currently animating
+  // Kept for the turn, not just the live row: `renderMessages` rebuilds the
+  // transcript from `chat.messages` when the turn ends, so anything not
+  // persisted onto a message disappears the moment the answer lands.
+  let crossing = null;
 
   const bubbleFor = (tier) => {
     let b = bubbles.get(tier);
@@ -1166,19 +1205,23 @@ async function handleSend(e) {
           : escapeHtml(b.text).replace(/\n/g, "<br>");
       scrollToBottom();
     } else if (kind === "crossing") {
+      crossing = payload;
       // What actually left the device, shown *while* the cloud is working --
       // the point is to see it during the wait it bought, not as a footnote
       // afterwards. Collapsed by default: it is evidence, not content.
-      renderCrossing(bubbleFor("cloud"), payload);
-    } else if (kind === "tier" && payload.gap) {
-      // The cloud is about to start on a named gap. Its bubble opens with the
-      // gap visible, so the wait is explained rather than blank.
+      renderCrossing(bubbleFor("cloud").row.querySelector(".bubble"), payload);
+    } else if (kind === "tier" && payload.tier === "cloud") {
+      // The router has *decided* to cross -- masking, the boundary assert and
+      // the cloud call have not happened yet. Opening the bubble here rather
+      // than on the first cloud delta is the whole point: that delta can be 15s
+      // away, and until it lands the screen would otherwise show a finished
+      // local answer and no sign that anything else is coming.
+      //
+      // Fires with or without a gap. It used to require one, which meant the
+      // "escalating the whole query" case -- the slowest of the two, since the
+      // cloud is answering from scratch -- was the one with no indicator at all.
       const b = bubbleFor("cloud");
-      if (!b.text) {
-        b.textEl.innerHTML =
-          `<span class="cloud-pending"><span class="cloud-pending-dots"><i></i><i></i><i></i></span>` +
-          `Answering the rest: ${escapeHtml(payload.gap)}</span>`;
-      }
+      if (!b.text) b.textEl.innerHTML = `<span class="cloud-pending">${cloudPendingHtml(payload.gap)}</span>`;
     }
   };
 
@@ -1192,12 +1235,16 @@ async function handleSend(e) {
   );
 
   let tier, answer, metrics, live, splitAnswers = null;
+  // Fallback for the non-streaming path, where no `crossing` event is
+  // emitted but the finished decision carries the same payload.
+  let body_crossed = null;
   try {
     const body = await routed;
     await looping; // let the current beat finish instead of cutting it off
     tier = body.tier_answered;
     answer = body.answer;
     metrics = metricsFromRouteResponse(body);
+    body_crossed = body.crossed_to_cloud || null;
     live = true;
     if (tier === "hybrid") {
       // Two messages, not one: two models answered two different parts, and a
@@ -1234,7 +1281,12 @@ async function handleSend(e) {
     // the last assistant message carrying them for the profiler. Duplicating
     // them onto the local half would double-count the turn in that view.
     chat.messages.push({ role: "assistant", content: splitAnswers.local, tier: "local", live, timestamp: at });
-    chat.messages.push({ role: "assistant", content: splitAnswers.cloud, tier: "cloud", live, timestamp: at, metrics });
+    chat.messages.push({
+      role: "assistant", content: splitAnswers.cloud, tier: "cloud", live, timestamp: at, metrics,
+      // Rides on the cloud message so it survives the re-render at the end of
+      // the turn -- and a reload, since it is part of that turn's audit trail.
+      crossing: crossing || body_crossed,
+    });
   } else {
     // `live === false` means we fell into the catch: the request failed after
     // the local half had already streamed and been read, so it is kept rather
@@ -1247,7 +1299,10 @@ async function handleSend(e) {
     if (streamedLocal) {
       chat.messages.push({ role: "assistant", content: streamedLocal, tier: "local", live: true, timestamp: at });
     }
-    chat.messages.push({ role: "assistant", content: answer, tier, live, timestamp: at, metrics });
+    chat.messages.push({
+      role: "assistant", content: answer, tier, live, timestamp: at, metrics,
+      crossing: tier === "cloud" ? crossing || body_crossed : undefined,
+    });
   }
   chat.updatedAt = at;
   saveChats();

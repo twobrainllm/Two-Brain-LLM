@@ -814,3 +814,109 @@ def test_the_same_entity_in_query_and_history_counts_once():
 
     assert decision.pii_entities_detected == 1
     assert decision.pii_entities_masked == 1
+
+
+# --------------------------------------------------------------------------
+# 2f. Two thresholds, not one -- confidence_escalate_threshold
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("confidence", "expect_local"),
+    [
+        (1.00, True),
+        (0.96, True),
+        (0.95, True),   # the stated boundary: 0.95 must stay local
+        (0.94, True),   # difficulty 0.06 -- under the 0.10 line, still local
+        (0.91, True),   # difficulty 0.09 -- the closest value that must NOT escalate
+        (0.90, False),  # the stated boundary: 0.90 must escalate (difficulty exactly 0.10)
+        (0.85, False),
+        (0.50, False),
+    ],
+)
+def test_confidence_threshold_matches_the_stated_boundary(confidence, expect_local):
+    """Pins the exact request this threshold exists to satisfy: "only if the
+    model is 0.95 or 1 confident, then escalation is not required."
+
+    Every value here is a real decimal a self-reported confidence can actually
+    take (`n/100` for integer `n`), including both boundaries by name -- this
+    is also the regression test for the float-rounding bug `confidence_to_difficulty`
+    had at exactly this threshold (`1.0 - 0.90 == 0.09999999999999998`, not
+    `0.1`, which silently let 0.90 stay local before it was rounded).
+    """
+    brain = _ScriptedStructuredBrain("An answer.", confidence=confidence)
+    router, _deep = _router(brain)
+
+    decision = router.route("Some question.")
+
+    if expect_local:
+        assert decision.tier_answered == "local", f"confidence={confidence} should stay local"
+    else:
+        assert decision.tier_answered == "cloud", f"confidence={confidence} should escalate"
+
+
+def test_the_heuristic_threshold_is_untouched_by_the_confidence_one():
+    """Shape A (no self-rating brain) must still use `escalate_threshold`
+    (0.55), not `confidence_escalate_threshold` (0.10) -- they are read by
+    different code paths on purpose, and a query landing in between the two
+    default values is exactly what would expose them getting mixed up."""
+    from two_brain_router.routing import LocalFastBrain, RoutePolicy, TwoBrainRouter
+    from two_brain_router.signals.loader import TierSignals
+
+    router = TwoBrainRouter(tier="pc", policy=RoutePolicy())
+    router.fast_brain = LocalFastBrain("pc", TierSignals.load("pc_3b", "ai_pc"))
+
+    # A short, plain question scores low on the heuristic (well under 0.55);
+    # if the router were accidentally reading the 0.10 confidence threshold for
+    # this path, a query scoring anywhere in [0.10, 0.55) would flip to "cloud".
+    decision = router.route("What time zone is Tokyo in?")
+    assert decision.difficulty_score < 0.55
+    assert decision.tier_answered == "local"
+
+
+def test_confidence_escalate_threshold_is_configurable():
+    """The field is meant to be overridden, not just re-derived from a
+    hardcoded literal -- a caller building `RoutePolicy(confidence_escalate_threshold=...)`
+    must see it take effect."""
+    from two_brain_router.routing import RoutePolicy
+
+    brain = _ScriptedStructuredBrain("An answer.", confidence=0.80)
+    router, _deep = _router(brain, policy=RoutePolicy(confidence_escalate_threshold=0.5))
+
+    decision = router.route("Some question.")
+
+    # difficulty 0.20 < the overridden 0.5 threshold -> stays local, even
+    # though it would have escalated under the default 0.10.
+    assert decision.tier_answered == "local"
+
+
+# --------------------------------------------------------------------------
+# 2g. confidence_to_difficulty -- the float-precision fix, directly
+# --------------------------------------------------------------------------
+
+
+def test_confidence_to_difficulty_has_no_binary_float_artifacts_at_common_boundaries():
+    """The root-cause test, independent of the router or any threshold.
+
+    `1.0 - 0.90` in IEEE 754 is `0.09999999999999998`, not `0.1` -- confirmed
+    directly here rather than trusted from memory, since that is exactly the
+    kind of claim that silently stops being true if the implementation changes.
+    Every value a self-reported confidence can actually take is `n / 100` for
+    integer `n`; this checks all 101 of them land on an exact 2-decimal-place
+    difficulty, which a threshold comparison can then trust.
+    """
+    from two_brain_router.signals.confidence import confidence_to_difficulty
+
+    for n in range(101):
+        confidence = n / 100.0
+        difficulty = confidence_to_difficulty(confidence)
+        expected = round(1.0 - confidence, 2)
+        assert difficulty == expected, (
+            f"confidence={confidence} -> difficulty={difficulty!r}, "
+            f"expected {expected!r} (a binary-float artifact survived rounding)"
+        )
+        # The specific case that motivated this: 0.90 must land exactly on 0.10,
+        # not 0.09999999999999998, or `difficulty >= 0.10` silently fails.
+        if confidence == 0.90:
+            assert difficulty == 0.10
+            assert difficulty >= 0.10, "the exact bug: 0.90 must reach a 0.10 threshold"
