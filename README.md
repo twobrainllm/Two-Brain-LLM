@@ -30,14 +30,12 @@ escalation-only).
 
 ## Team
 
-Fill in — these are placeholders.
-
-| Name | Email | Area |
-|---|---|---|
+| Name | Email |
+|---|---|
 | Jaisurya | `jaisuryasundar2001@gmail.com` |
 | Thrisha Ambareesharaje Urs Urs | `thrishaaurs@gmail.com` |
 | Nikhita Neelakanta | `nikhita.neelakanta@gmail.com` |
-| Vishnu Teja Kunde| `kvishnutez@gmail.com` | 
+| Vishnu Teja Kunde | `kvishnutez@gmail.com` |
 
 ---
 
