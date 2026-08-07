@@ -35,9 +35,9 @@ Fill in — these are placeholders.
 | Name | Email | Area |
 |---|---|---|
 | Jaisurya | `jaisuryasundar2001@gmail.com` |
-| Thrisha | `tbd@example.com` |
+| Thrisha Ambareesharaje Urs Urs | `thrishaaurs@gmail.com` |
 | Nikhita Neelakanta | `nikhita.neelakanta@gmail.com` |
-| Visnu | `tbd@example.com` | 
+| Vishnu Teja Kunde| `kvishnutez@gmail.com` | 
 
 ---
 
