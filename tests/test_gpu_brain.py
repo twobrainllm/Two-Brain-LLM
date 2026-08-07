@@ -15,6 +15,7 @@ Run with:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -176,3 +177,95 @@ def test_for_vision_uses_the_eval_winning_defaults(tmp_path):
 def test_for_vision_rejects_an_unknown_preference():
     with pytest.raises(ValueError, match="quality.*speed"):
         GpuLocalBrain.for_vision("pc", TierSignals.load("pc_3b", "ai_pc"), prefer="cheapest")
+
+
+class _RecordingDeepBrain:
+    """Stands in for the cloud tier and records exactly what crossed.
+
+    Deliberately not the real endpoint: these assert the *boundary*, so they
+    must not need credentials, a network, or the service to be up.
+    """
+
+    def __init__(self):
+        self.seen: list[tuple[str, str]] = []
+
+    def answer(self, masked_query: str, context: str = "") -> BrainResponse:
+        self.seen.append((masked_query, context))
+        return BrainResponse(text="cloud answer", latency_ms=1.0, cost_usd=0.0)
+
+
+@pytest.mark.skipif(not _VLM_PRESENT, reason="VLM weights not present (gitignored)")
+def test_image_never_crosses_the_boundary_only_a_masked_description(tmp_path):
+    """The core guarantee for image routing.
+
+    The deep brain is a text-only LLM -- the service has no VLM at all -- so an
+    escalated image query must send a locally generated *description*, never
+    the image, and that description must be masked like any other text.
+    """
+    from two_brain_router.routing.router import TwoBrainRouter
+
+    image = Path("data/vlm_gpu_model/_eval/images/position.png").resolve()
+    router = TwoBrainRouter(tier="pc")
+    router.fast_brain = GpuLocalBrain.for_vision(
+        "pc", TierSignals.load("pc_3b", "ai_pc"), log_path=tmp_path / "srv.log"
+    )
+    recorder = _RecordingDeepBrain()
+    router.deep_brain = recorder
+    try:
+        decision = router.route(
+            "Using the arrangement shown, derive a complete step-by-step geometric "
+            "proof of the relative positions and justify every step rigorously.",
+            image=image,
+        )
+    finally:
+        router.fast_brain.close()
+
+    assert decision.tier_answered == "cloud", "this query should escalate"
+    assert recorder.seen, "deep brain was never called"
+    sent_query, sent_context = recorder.seen[0]
+
+    # No image, in any encoding, may appear in what crossed.
+    both = sent_query + sent_context
+    assert "data:image" not in both and "base64" not in both
+    assert str(image) not in both, "not even the image path may cross"
+    # A real description did cross.
+    assert len(sent_context) > 50, "expected a substantive local description"
+    assert any(n.startswith("image described on-device") for n in decision.notes)
+    assert any("cloud tier has no VLM" in n for n in decision.notes)
+
+
+@pytest.mark.skipif(not _VLM_PRESENT, reason="VLM weights not present (gitignored)")
+def test_image_question_is_answered_locally_when_easy(tmp_path):
+    """An easy visual question should never reach the cloud at all."""
+    from two_brain_router.routing.router import TwoBrainRouter
+
+    router = TwoBrainRouter(tier="pc")
+    router.fast_brain = GpuLocalBrain.for_vision(
+        "pc", TierSignals.load("pc_3b", "ai_pc"), log_path=tmp_path / "srv.log"
+    )
+    recorder = _RecordingDeepBrain()
+    router.deep_brain = recorder
+    try:
+        decision = router.route(
+            "What colour is the square?",
+            image=Path("data/vlm_gpu_model/_eval/images/position.png").resolve(),
+        )
+    finally:
+        router.fast_brain.close()
+
+    assert decision.tier_answered == "local"
+    assert not recorder.seen, "an easy image query must not reach the cloud"
+    assert "blue" in decision.answer.lower(), f"local VLM did not see the image: {decision.answer!r}"
+
+
+def test_image_without_a_vision_capable_brain_is_refused():
+    """Fail loudly rather than silently dropping the image.
+
+    Sending an image to a text-only model is the exact failure mode observed on
+    the cloud endpoint, which returns 200 and answers "I don't see an image".
+    """
+    from two_brain_router.routing.router import TwoBrainRouter
+
+    router = TwoBrainRouter(tier="pc")  # gates unset -> LocalFastBrain, no vision
+    with pytest.raises(ValueError, match="cannot see"):
+        router.route("What is this?", image=Path("data/vlm_gpu_model/_eval/images/position.png"))
