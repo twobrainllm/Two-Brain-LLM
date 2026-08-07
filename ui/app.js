@@ -31,8 +31,16 @@ const GROUP_ORDER = ["Today", "Yesterday", "Previous 7 Days", "Previous 30 Days"
 const API_BASE_URL = (() => {
   const override = new URLSearchParams(window.location.search).get("api");
   if (override) return override.replace(/\/$/, "");
+
   const { protocol, hostname } = window.location;
   if (protocol === "file:" || !hostname) return "http://127.0.0.1:8765";
+
+  // Served over HTTPS means ui/serve_https.py, which proxies /route and
+  // /health on its own origin. Use that origin: an HTTPS page is forbidden
+  // from fetching an http:// URL (mixed content), so reaching out to
+  // :8765 directly would be blocked by the browser regardless of ports.
+  if (protocol === "https:") return "";
+
   return `${protocol}//${hostname}:8765`;
 })();
 
@@ -69,8 +77,10 @@ const els = {
   sendBtn: document.getElementById("send-btn"),
   fileInput: document.getElementById("file-input"),
   imageInput: document.getElementById("image-input"),
+  videoInput: document.getElementById("video-input"),
   attachFileBtn: document.getElementById("attach-file-btn"),
   attachImageBtn: document.getElementById("attach-image-btn"),
+  attachVideoBtn: document.getElementById("attach-video-btn"),
   videoModeBtn: document.getElementById("video-mode-btn"),
   voiceModeBtn: document.getElementById("voice-mode-btn"),
   brainToggle: document.getElementById("brain-toggle"),
@@ -661,11 +671,16 @@ function attachmentChipEl(att, { removable }) {
   const chip = document.createElement("span");
   chip.className = "attachment-chip";
 
+  const ICONS = {
+    image:
+      '<svg viewBox="0 0 20 20" width="13" height="13" fill="none"><rect x="2.5" y="4" width="15" height="12" rx="2.5" stroke="currentColor" stroke-width="1.5"/><path d="M3 13.5l3.6-3.2a1.5 1.5 0 0 1 2 0L13 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+    video:
+      '<svg viewBox="0 0 20 20" width="13" height="13" fill="none"><rect x="2.5" y="5" width="10.5" height="10" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M13 9l3.4-2.4a.7.7 0 0 1 1.1.6v5.6a.7.7 0 0 1-1.1.6L13 11z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
+    file:
+      '<svg viewBox="0 0 20 20" width="13" height="13" fill="none"><path d="M11.5 2.5H6a1.5 1.5 0 0 0-1.5 1.5v12A1.5 1.5 0 0 0 6 17.5h8a1.5 1.5 0 0 0 1.5-1.5V6.5zM11.5 2.5v4h4" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
+  };
   const icon = document.createElement("span");
-  icon.innerHTML =
-    att.kind === "image"
-      ? '<svg viewBox="0 0 20 20" width="13" height="13" fill="none"><rect x="2.5" y="4" width="15" height="12" rx="2.5" stroke="currentColor" stroke-width="1.5"/><path d="M3 13.5l3.6-3.2a1.5 1.5 0 0 1 2 0L13 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
-      : '<svg viewBox="0 0 20 20" width="13" height="13" fill="none"><path d="M11.5 2.5H6a1.5 1.5 0 0 0-1.5 1.5v12A1.5 1.5 0 0 0 6 17.5h8a1.5 1.5 0 0 0 1.5-1.5V6.5zM11.5 2.5v4h4" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>';
+  icon.innerHTML = ICONS[att.kind] || ICONS.file;
   chip.appendChild(icon);
 
   const name = document.createElement("span");
@@ -1101,14 +1116,19 @@ function toggleVideoMode() {
 }
 
 function initVideoMode() {
-  if (!isMobileDevice()) {
+  // Enabled on every device now, not phone-only: a laptop webcam is a
+  // legitimate input for the AI PC tier's VLM, and gating it off meant the
+  // button looked broken on the machine most of the demo runs on.
+  if (!navigator.mediaDevices?.getUserMedia) {
     els.videoModeBtn.disabled = true;
-    els.videoModeBtn.title = "Video mode is mobile-only — open this page on a phone to use the camera.";
+    els.videoModeBtn.title = "This browser has no camera API.";
     return;
   }
-  if (!navigator.mediaDevices?.getUserMedia || !window.isSecureContext) {
+  if (!window.isSecureContext) {
     els.videoModeBtn.disabled = true;
-    els.videoModeBtn.title = "Camera needs a secure context — open this page over https.";
+    els.videoModeBtn.title =
+      "Camera needs a secure context. Serve this page over https " +
+      "(ui/serve_https.py) or open it on localhost.";
   }
 }
 
@@ -1247,9 +1267,11 @@ els.brainToggle.addEventListener("click", (e) => {
 
 els.attachFileBtn.addEventListener("click", () => els.fileInput.click());
 els.attachImageBtn.addEventListener("click", () => els.imageInput.click());
+els.attachVideoBtn.addEventListener("click", () => els.videoInput.click());
 
 els.fileInput.addEventListener("change", (e) => addAttachments(e.target.files, "file"));
 els.imageInput.addEventListener("change", (e) => addAttachments(e.target.files, "image"));
+els.videoInput.addEventListener("change", (e) => addAttachments(e.target.files, "video"));
 
 els.videoModeBtn.addEventListener("click", toggleVideoMode);
 els.voiceModeBtn.addEventListener("click", toggleVoice);
