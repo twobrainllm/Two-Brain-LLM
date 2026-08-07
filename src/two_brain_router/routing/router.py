@@ -30,6 +30,8 @@ from two_brain_router.routing.policy import RouteDecision, RoutePolicy
 from two_brain_router.signals import DifficultyEstimator, TierSignals
 
 Tier = Literal["mobile", "pc"]
+#: Which brain answered / may be forced to answer.
+Tier2 = Literal["local", "cloud"]
 
 #: Which data/ captures back each local tier.
 _TIER_FILES: dict[str, tuple[str, str]] = {
@@ -46,6 +48,18 @@ _TIER_FILES: dict[str, tuple[str, str]] = {
 _NPU_BRAIN_ENV_VAR = "TWO_BRAIN_NPU_BRAIN"
 _GPU_BRAIN_ENV_VAR = "TWO_BRAIN_GPU_BRAIN"
 _CLOUD_BRAIN_ENV_VAR = "TWO_BRAIN_CLOUD_BRAIN"
+
+#: Demo/UI-testing switch. `route(force_tier=...)` is honoured ONLY when this
+#: is "1". Unset or "0" -- which is every normal run, the test suite, and the
+#: CLI -- a forced tier is ignored and `policy.should_escalate` decides, so a
+#: demo affordance can never quietly become the routing behaviour in
+#: production. The flag gates the *override*, never the privacy ordering.
+_UI_TEST_ENV_VAR = "UI_TEST"
+
+
+def ui_test_enabled() -> bool:
+    """True only when UI_TEST=1, the one condition under which a tier may be forced."""
+    return os.environ.get(_UI_TEST_ENV_VAR, "0") == "1"
 
 
 def _build_fast_brain(tier: Tier, signals: TierSignals) -> Brain:
@@ -93,7 +107,27 @@ class TwoBrainRouter:
         self.fast_brain = _build_fast_brain(tier, self.local)
         self.deep_brain = _build_deep_brain(self.cloud)
 
-    def route(self, query: str, context: str = "", image: Path | None = None) -> RouteDecision:
+    def route(
+        self,
+        query: str,
+        context: str = "",
+        image: Path | None = None,
+        force_tier: Tier2 | None = None,
+    ) -> RouteDecision:
+        """Route one query.
+
+        `force_tier` pins which brain answers, for the chat UI's local/cloud
+        switch. **It is honoured only when `UI_TEST=1`.** Everywhere else --
+        every normal run, the test suite, the CLI -- it is ignored, a note says
+        so, and `policy.should_escalate` decides as usual. A demo affordance
+        should not be able to become the production routing behaviour by
+        accident.
+
+        Even when honoured it bypasses the difficulty heuristic and nothing
+        else: masking still happens first, the invariant still runs, and an
+        escalated image is still described on-device with the description
+        masked. Forcing a tier is never a way around the privacy guarantee.
+        """
         notes: list[str] = []
         guard = PIIGuard()
 
@@ -119,6 +153,27 @@ class TwoBrainRouter:
         # 3. Decide.
         difficulty = self.difficulty.score(query)
         local_latency_est = self.policy.estimate_local_latency_ms(self.local.profile, query)
+
+        if force_tier is not None:
+            would_be = "cloud" if self.policy.should_escalate(difficulty, local_latency_est) else "local"
+            if ui_test_enabled():
+                notes.append(
+                    f"tier forced to {force_tier} (UI_TEST=1; policy would have said {would_be})"
+                )
+                if force_tier == "cloud":
+                    return self._escalate(
+                        guard, masked_query_result, context, difficulty, notes, image
+                    )
+                return self._answer_locally(
+                    guard, masked_query_result, difficulty, notes, image
+                )
+            # Not a silent no-op: say plainly that the override was refused, so
+            # a caller who expected it to work finds out here rather than by
+            # misreading which brain answered.
+            notes.append(
+                f"ignored force_tier={force_tier}: UI_TEST is not enabled, "
+                "so the policy decides"
+            )
 
         if self.policy.should_escalate(difficulty, local_latency_est):
             notes.append(self.policy.escalation_note(difficulty, local_latency_est))

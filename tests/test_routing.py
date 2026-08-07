@@ -57,3 +57,52 @@ def test_policy_compresses_only_oversized_context():
     long, was_compressed = policy.compress_context("x" * 200)
     assert was_compressed
     assert len(long) <= 50
+
+
+def test_force_tier_is_ignored_unless_ui_test_is_enabled(monkeypatch):
+    """A demo affordance must not become production routing behaviour.
+
+    force_tier exists for the chat UI's local/cloud switch. Outside UI_TEST=1
+    it must be refused -- and refused *visibly*, so a caller who expected it to
+    work finds out from the notes rather than by misreading which brain
+    answered.
+    """
+    monkeypatch.delenv("UI_TEST", raising=False)
+    router = TwoBrainRouter(tier="pc")
+
+    decision = router.route("What is 2 + 2?", force_tier="cloud")
+
+    assert decision.tier_answered == "local", "policy should still decide"
+    assert any("ignored force_tier=cloud" in n for n in decision.notes)
+
+
+def test_force_tier_is_honoured_under_ui_test(monkeypatch):
+    monkeypatch.setenv("UI_TEST", "1")
+    router = TwoBrainRouter(tier="pc")
+
+    forced = router.route("What is 2 + 2?", force_tier="cloud")
+    assert forced.tier_answered == "cloud"
+    assert any("forced to cloud" in n and "UI_TEST=1" in n for n in forced.notes)
+
+    # ...and the other direction, on a query the policy would escalate.
+    hard = (
+        "Derive the closed-form solution for ridge regression from first principles, "
+        "then compare its bias-variance trade-off against ordinary least squares in depth."
+    )
+    assert router.route(hard).tier_answered == "cloud", "sanity: this should escalate"
+    assert router.route(hard, force_tier="local").tier_answered == "local"
+
+
+def test_forcing_a_tier_does_not_bypass_masking(monkeypatch):
+    """Forcing must skip the difficulty heuristic and nothing else."""
+    monkeypatch.setenv("UI_TEST", "1")
+    router = TwoBrainRouter(tier="pc")
+
+    decision = router.route(
+        "My email is jane.doe@example.com -- what is 2 + 2?", force_tier="cloud"
+    )
+
+    assert decision.pii_entities_masked >= 1
+    sent = next(n for n in decision.notes if n.startswith("sent off-device"))
+    assert "jane.doe@example.com" not in sent
+    assert "jane.doe@example.com" in decision.answer, "must still rehydrate on-device"
