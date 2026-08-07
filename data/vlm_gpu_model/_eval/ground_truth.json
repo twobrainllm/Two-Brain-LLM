@@ -1,0 +1,99 @@
+[
+  {
+    "image": "position.png",
+    "question": "Where is the blue square and where is the red circle? Answer using one of: top-left, top-right, bottom-left, bottom-right.",
+    "checks": [
+      {
+        "name": "square_top_left",
+        "any_of": [
+          "top left",
+          "top-left",
+          "upper left",
+          "upper-left"
+        ]
+      },
+      {
+        "name": "circle_bottom_right",
+        "any_of": [
+          "bottom right",
+          "bottom-right",
+          "lower right",
+          "lower-right"
+        ]
+      }
+    ]
+  },
+  {
+    "image": "count.png",
+    "question": "How many green circles are in this image? Reply with just the number.",
+    "checks": [
+      {
+        "name": "count_is_5",
+        "any_of": [
+          "5",
+          "five"
+        ]
+      }
+    ]
+  },
+  {
+    "image": "order.png",
+    "question": "List the colours of the three bars from left to right.",
+    "checks": [
+      {
+        "name": "order_rgb",
+        "ordered": [
+          "red",
+          "green",
+          "blue"
+        ]
+      }
+    ]
+  },
+  {
+    "image": "digits.png",
+    "question": "What number is shown in this image? Reply with just the number.",
+    "checks": [
+      {
+        "name": "number_is_47",
+        "any_of": [
+          "47",
+          "forty-seven",
+          "forty seven"
+        ]
+      }
+    ]
+  },
+  {
+    "image": "size.png",
+    "question": "Which purple circle is larger, the one on the left or the one on the right?",
+    "checks": [
+      {
+        "name": "left_is_larger",
+        "any_of": [
+          "left"
+        ],
+        "none_of": [
+          "right is larger",
+          "right one is larger"
+        ]
+      }
+    ]
+  },
+  {
+    "image": "relation.png",
+    "question": "Is the yellow triangle above or below the purple square?",
+    "checks": [
+      {
+        "name": "triangle_above",
+        "any_of": [
+          "above"
+        ],
+        "none_of": [
+          "below the purple",
+          "triangle is below"
+        ]
+      }
+    ]
+  }
+]
