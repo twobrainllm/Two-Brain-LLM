@@ -718,3 +718,113 @@ button, input, textarea {
   background: var(--bg-active);
   border-radius: 8px;
 }
+
+/* ── Composer: image attachment ──────────────────────────────────────────
+   The "+" mirrors Claude's composer. The preview above the input carries a
+   deliberate line of copy: the image never leaves the device, because the
+   cloud tier has no vision model at all. That is a real property of this
+   system, not reassurance — worth stating where the user attaches. */
+.composer-stack {
+  width: 100%;
+  max-width: 760px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.composer-stack .composer-inner {
+  max-width: none;
+  padding-left: 8px;
+}
+
+#attach-btn {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+#attach-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+#attach-btn.has-image { background: var(--brain-local); color: #fff; }
+#attach-btn:disabled { color: var(--text-tertiary); cursor: not-allowed; }
+#attach-btn:disabled:hover { background: transparent; color: var(--text-tertiary); }
+
+.attachment-preview {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--bg-composer);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+#attachment-thumb {
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 8px;
+  flex-shrink: 0;
+  background: var(--bg-hover);
+}
+
+.attachment-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+#attachment-name {
+  font-size: 13px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.attachment-hint { font-size: 11px; color: var(--text-tertiary); }
+
+#attachment-remove {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+#attachment-remove:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+/* Image shown on a sent user message. */
+.message-image {
+  max-width: 260px;
+  max-height: 220px;
+  border-radius: var(--radius-md);
+  margin-bottom: 8px;
+  display: block;
+  border: 1px solid var(--border);
+}
+
+/* Backend status chip in the sidebar footer. */
+.backend-status {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  padding: 6px 2px 0;
+  line-height: 1.4;
+}
+.backend-status .dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-right: 5px;
+  background: var(--text-tertiary);
+}
+.backend-status.live .dot { background: #2E9E5B; }
+.backend-status.mock .dot { background: #C08A00; }

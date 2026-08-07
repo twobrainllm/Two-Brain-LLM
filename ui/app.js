@@ -20,6 +20,12 @@ const els = {
   composerInput: document.getElementById("composer-input"),
   sendBtn: document.getElementById("send-btn"),
   brainToggle: document.getElementById("brain-toggle"),
+  attachBtn: document.getElementById("attach-btn"),
+  attachInput: document.getElementById("attach-input"),
+  attachmentPreview: document.getElementById("attachment-preview"),
+  attachmentThumb: document.getElementById("attachment-thumb"),
+  attachmentName: document.getElementById("attachment-name"),
+  attachmentRemove: document.getElementById("attachment-remove"),
   exprButtons: document.getElementById("expr-buttons"),
   robotTemplate: document.getElementById("robot-svg-template"),
   profiler: document.getElementById("profiler"),
@@ -124,6 +130,12 @@ const state = {
   chats: loadChats(),
   activeChatId: null,
   currentTier: "local",
+  //: {dataUrl, name} for the image staged on the composer, or null.
+  attachment: null,
+  //: null until /api/health answers. When the backend is absent we fall
+  //: back to mockRespond() rather than failing -- the UI was built to run
+  //: standalone and should keep doing so.
+  backend: null,
   searchQuery: "",
 };
 
@@ -297,6 +309,17 @@ function renderMessageEl(msg) {
   const bubble = document.createElement("div");
   bubble.className = "bubble";
 
+  // An attached image is shown on the message that carried it. It never
+  // left the device -- the cloud tier has no vision model -- so this is
+  // the only place it is ever displayed.
+  if (msg.image) {
+    const img = document.createElement("img");
+    img.className = "message-image";
+    img.src = msg.image;
+    img.alt = "Attached image";
+    bubble.appendChild(img);
+  }
+
   if (msg.role === "assistant") {
     const badge = document.createElement("div");
     badge.className = "tier-badge";
@@ -411,6 +434,108 @@ function toggleProfilerCard() {
  * whatever the sidebar toggle is set to, not a real routing decision -- see
  * README.md for the real contract this needs to match.
  */
+
+/* ── Backend bridge ───────────────────────────────────────────────────────
+   `ui/server.py` exposes the real TwoBrainRouter. When it is not running the
+   UI degrades to mockRespond() so the front-end still demos standalone --
+   that was true before this backend existed and stays true now.
+
+   The local/cloud switch is only authoritative when the server reports
+   ui_test:true (route(force_tier=...) is gated on UI_TEST=1). Otherwise the
+   policy decides and the toggle is a *preference*, which the status line
+   says out loud rather than pretending otherwise. */
+const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+
+async function probeBackend() {
+  try {
+    const res = await fetch("/api/health", { method: "GET" });
+    if (!res.ok) throw new Error(`health ${res.status}`);
+    state.backend = await res.json();
+  } catch {
+    state.backend = null;
+  }
+  renderBackendStatus();
+}
+
+function renderBackendStatus() {
+  let el = document.getElementById("backend-status");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "backend-status";
+    el.className = "backend-status";
+    document.querySelector(".sidebar-footer")?.prepend(el);
+  }
+  const b = state.backend;
+  if (!b) {
+    el.className = "backend-status mock";
+    el.innerHTML = '<span class="dot"></span>Mock mode — no backend. Run <code>ui/server.py</code>.';
+    els.attachBtn.disabled = true;
+    els.attachBtn.title = "Attaching needs the backend (ui/server.py)";
+    return;
+  }
+  el.className = "backend-status live";
+  const bits = [`${b.fast_brain} / ${b.deep_brain}`];
+  if (!b.vision) bits.push("no vision");
+  if (!b.ui_test) bits.push("UI_TEST off — policy decides, switch is a preference");
+  el.innerHTML = `<span class="dot"></span>Live — ${bits.join(" · ")}`;
+  els.attachBtn.disabled = !b.vision;
+  els.attachBtn.title = b.vision
+    ? "Attach an image (stays on-device)"
+    : "The local brain has no vision model loaded";
+}
+
+async function askBackend(query, tier, imageDataUrl) {
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message: query, tier, image: imageDataUrl || undefined }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `backend returned ${res.status}`);
+  return body;
+}
+
+/* ── Image attachment ─────────────────────────────────────────────────── */
+function clearAttachment() {
+  state.attachment = null;
+  els.attachInput.value = "";
+  els.attachmentPreview.hidden = true;
+  els.attachBtn.classList.remove("has-image");
+  updateSendState();
+}
+
+function setAttachment(file) {
+  if (!file) return;
+  if (file.size > MAX_IMAGE_BYTES) {
+    alert(`That image is ${(file.size / 1e6).toFixed(1)} MB; the limit is 12 MB.`);
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    state.attachment = { dataUrl: String(reader.result), name: file.name };
+    els.attachmentThumb.src = state.attachment.dataUrl;
+    els.attachmentName.textContent = file.name;
+    els.attachmentPreview.hidden = false;
+    els.attachBtn.classList.add("has-image");
+    updateSendState();
+  };
+  reader.readAsDataURL(file);
+}
+
+els.attachBtn.addEventListener("click", () => els.attachInput.click());
+els.attachInput.addEventListener("change", (e) => setAttachment(e.target.files?.[0]));
+els.attachmentRemove.addEventListener("click", clearAttachment);
+
+// Paste an image straight into the composer, as Claude does.
+els.composerInput.addEventListener("paste", (e) => {
+  if (els.attachBtn.disabled) return;
+  const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith("image/"));
+  if (item) {
+    e.preventDefault();
+    setAttachment(item.getAsFile());
+  }
+});
+
 function mockRespond(query, tier) {
   const tierLabel = tier === "cloud" ? "Cloud AI 100 (simulated)" : "local fast brain (simulated)";
   return (
@@ -428,13 +553,20 @@ async function handleSend(e) {
   let chat = state.chats.find((c) => c.id === state.activeChatId);
   if (!chat) chat = createChat(query);
 
-  chat.messages.push({ role: "user", content: query, timestamp: Date.now() });
+  const attachment = state.attachment;
+  chat.messages.push({
+    role: "user",
+    content: query,
+    image: attachment?.dataUrl || null,
+    timestamp: Date.now(),
+  });
   chat.updatedAt = Date.now();
   saveChats();
   renderMessages(chat);
   renderChatList();
 
   els.composerInput.value = "";
+  clearAttachment();
   autoGrow();
   updateSendState();
 
@@ -460,16 +592,48 @@ async function handleSend(e) {
   playExpression(thinkingAvatar, "happy", HAPPY_LEAD_MS);
   await sleep(HAPPY_LEAD_MS);
 
-  const answer = mockRespond(query, tier);
-  const metrics = computeMetrics(query, tier);
+  // Real backend when it is up; the canned reply only when it is not.
+  let answer;
+  let answeredTier = tier;
+  let metrics;
+  if (state.backend) {
+    try {
+      const result = await askBackend(query, tier, attachment?.dataUrl);
+      answer = result.answer;
+      // The server reports which brain actually answered. Under UI_TEST=0 the
+      // policy may well have overruled the toggle, so trust the response
+      // rather than the switch.
+      answeredTier = result.tier_answered || tier;
+      metrics = computeMetrics(query, answeredTier);
+      metrics.difficulty = result.difficulty_score ?? metrics.difficulty;
+      metrics.estLatencyMs = result.est_latency_ms ?? metrics.estLatencyMs;
+      metrics.estCostUsd = result.est_cost_usd ?? metrics.estCostUsd;
+      metrics.routerNotes = result.notes || [];
+      metrics.piiCount = result.pii_entities_masked ?? metrics.piiCount;
+    } catch (err) {
+      answer = `The backend returned an error:
+
+${err.message}`;
+      metrics = computeMetrics(query, tier);
+    }
+  } else {
+    answer = mockRespond(query, tier);
+    metrics = computeMetrics(query, tier);
+  }
   metrics.actualLatencyMs = performance.now() - thinkingStartedAt;
-  chat.messages.push({ role: "assistant", content: answer, tier, timestamp: Date.now(), metrics });
+  chat.messages.push({
+    role: "assistant",
+    content: answer,
+    tier: answeredTier,
+    timestamp: Date.now(),
+    metrics,
+  });
   chat.updatedAt = Date.now();
   saveChats();
   renderMessages(chat);
   renderChatList();
   playExpression(els.messages.querySelector(".message.assistant:last-child .robot-avatar"), "happy");
-  renderProfiler(metrics, tier);
+  renderProfiler(metrics, answeredTier);
 }
 
 function autoGrow() {
@@ -478,7 +642,9 @@ function autoGrow() {
 }
 
 function updateSendState() {
-  els.sendBtn.disabled = els.composerInput.value.trim().length === 0;
+  // An image alone is a valid message; the VLM can be asked to describe it.
+  els.sendBtn.disabled =
+    els.composerInput.value.trim().length === 0 && !state.attachment;
 }
 
 function setTier(tier) {
@@ -539,3 +705,6 @@ document.addEventListener("keydown", (e) => {
 renderChatList();
 showEmptyState();
 updateSendState();
+// Decides live-vs-mock, whether the tier switch is authoritative, and
+// whether the attach button is usable.
+probeBackend();

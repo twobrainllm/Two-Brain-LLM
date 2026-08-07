@@ -147,11 +147,27 @@
     </section>
 
     <form class="composer" id="composer">
-      <div class="composer-inner">
-        <textarea id="composer-input" placeholder="Message Two-Brain..." rows="1"></textarea>
-        <button type="submit" id="send-btn" disabled aria-label="Send message">
-          <svg viewBox="0 0 20 20" width="16" height="16" fill="none"><path d="M10 16V4M10 4l5 5M10 4l-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
+      <div class="composer-stack">
+        <div class="attachment-preview" id="attachment-preview" hidden>
+          <img id="attachment-thumb" alt="Attached image preview">
+          <div class="attachment-meta">
+            <span id="attachment-name">image</span>
+            <span class="attachment-hint">stays on this device — the cloud tier has no vision model</span>
+          </div>
+          <button type="button" id="attachment-remove" aria-label="Remove attached image">
+            <svg viewBox="0 0 20 20" width="14" height="14" fill="none"><path d="M6 6l8 8M14 6l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+        <div class="composer-inner">
+          <input type="file" id="attach-input" accept="image/png,image/jpeg,image/webp" hidden>
+          <button type="button" id="attach-btn" aria-label="Attach an image" title="Attach an image (stays on-device)">
+            <svg viewBox="0 0 20 20" width="17" height="17" fill="none"><path d="M10 4.5v11M4.5 10h11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
+          <textarea id="composer-input" placeholder="Message Two-Brain..." rows="1"></textarea>
+          <button type="submit" id="send-btn" disabled aria-label="Send message">
+            <svg viewBox="0 0 20 20" width="16" height="16" fill="none"><path d="M10 16V4M10 4l5 5M10 4l-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
       </div>
     </form>
   </main>

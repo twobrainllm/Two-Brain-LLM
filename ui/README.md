@@ -11,34 +11,62 @@ this merges cleanly regardless of what lands on `main` in the meantime.
 
 ## Running it
 
+**Live** — the chat talks to the real `TwoBrainRouter`:
+
 ```
-cd ui
-python -m http.server 8000
+UI_TEST=1 TWO_BRAIN_GPU_BRAIN=1 TWO_BRAIN_CLOUD_BRAIN=1 python ui/server.py
 ```
 
-Then open `http://localhost:8000`. (Opening `index.html` directly by
-double-clicking also works in most browsers — the app only uses
-`localStorage`, no `fetch` calls yet.)
+Open `http://localhost:8000`. Brains build lazily on the first request, so the
+first reply is slow — a `llama-server` child has to start.
+
+Each flag does something distinct:
+
+| Flag | Effect if unset |
+|---|---|
+| `UI_TEST=1` | the local/cloud switch stops being authoritative. `route()` honours a forced tier only under this flag, so the policy decides and the switch becomes a preference — the sidebar says so rather than pretending otherwise. |
+| `TWO_BRAIN_GPU_BRAIN=1` | the fast brain stays a stub and **image attachment is disabled**, since no vision model is loaded |
+| `TWO_BRAIN_CLOUD_BRAIN=1` | the deep brain stays a labelled stub instead of reaching Cirrascale |
+
+**Standalone** — front-end only, no backend:
+
+```
+cd ui && python -m http.server 8000
+```
+
+`/api/health` fails, the UI falls back to `mockRespond()`, and the sidebar
+shows "Mock mode". This still works on purpose: the front-end was built to demo
+without the X-Elite box, and that has not been taken away.
+
+## Images
+
+The `+` beside the composer attaches a PNG/JPEG/WebP (12 MB cap); pasting an
+image into the input works too.
+
+**The image never leaves the device.** That is not a policy choice but a
+property of the deployment — the cloud tier is a text-only LLM and the service
+has no vision model at all. So an image-bearing query is either answered
+locally by the VLM, or, if it escalates, the local VLM first converts the image
+to *words*; that description is masked like any other text and only the
+description crosses. A physics diagram becomes "block on an incline, angle …",
+which the text-only 70B can then reason over.
 
 ## Real vs. mocked
 
-**Real:** the entire UI shell — sidebar, date-grouped chat history (Today /
-Yesterday / Previous 7 Days / Previous 30 Days / Older), live search over
-titles and message text, per-chat delete, the composer, and the robot
-avatar's color/animation logic.
+**Real:** the whole UI shell — sidebar, date-grouped history, search, delete,
+composer, image attachment, avatar colour/animation. And now the reply itself:
+`ui/server.py` runs the same `TwoBrainRouter` the CLI uses, with the same
+masking order, so answers come from the real GPU fast brain or the real
+Cirrascale deep brain.
 
-**Mocked:** the reply itself. `mockRespond()` in `app.js` returns a canned
-string; no model runs and no query leaves the browser tab. Which color the
-next reply's avatar gets is **not** a routing decision — it's whatever the
-"Simulated brain" toggle in the sidebar footer is set to. This was a
-deliberate call, not a placeholder we forgot to wire up: this UI was built
-in an environment that can't reach the X-Elite box's NPU runtime, so there
-was nothing real to call. The toggle exists to let you preview the color
-swap without a backend.
+**Mocked:** only `mockRespond()`, and only when the backend is unreachable.
 
-Each message stores its own `tier` at send time, so switching the toggle
-later doesn't repaint history — old messages keep the color of whatever
-tier "answered" them, same as the real router would.
+Which colour a reply gets is now a *real* routing outcome. The server returns
+`tier_answered` and the UI paints that, not whatever the switch was set to —
+so with `UI_TEST=0` you will see the policy overrule the switch.
+
+Each message stores its own `tier` at send time, so switching later does not
+repaint history.
 
 ## Query profiler
 
@@ -68,46 +96,27 @@ Each assistant message stores its own `metrics` snapshot (same pattern as
 `tier`), so the profiler always reflects whichever message last answered —
 switching chats or tiers later doesn't recompute history.
 
-## Wiring it to the real router
+## Wiring it to the real router — done
 
-`TwoBrainRouter.route(query, context)`
-(`src/two_brain_router/routing/router.py`) already returns exactly the
-signal this UI needs: a `RouteDecision` with `tier_answered: "local" |
-"cloud"` and `answer`. Nothing about the routing/masking logic needs to
-change for this UI — it's a pure consumer.
+This section used to be a plan. It is now history, kept because the plan's
+last two items are still open.
 
-To wire it up on the target device:
-
-1. **Add a thin API server** (new file, e.g. `ui/server.py` or
-   `src/two_brain_router/api.py` — a new module either way, not an edit to
-   an existing one). A single `FastAPI`/`Flask` endpoint is enough:
-
-   ```python
-   router = TwoBrainRouter(tier="pc")  # set TWO_BRAIN_NPU_BRAIN=1 for the real NPU brain
-
-   @app.post("/route")
-   def route(body: dict):
-       decision = router.route(body["query"], body.get("context", ""))
-       return {"tier": decision.tier_answered, "answer": decision.answer}
-   ```
-
-2. **Replace `mockRespond()`** in `app.js` with a `fetch("/route", ...)`
-   call, and use the response's `tier` field instead of
-   `state.currentTier`.
-3. **Remove the sidebar toggle** once tier is a real routing decision
-   instead of a manual override — at that point it's dead UI, not a
-   feature.
-4. Keep the per-message `tier_badge`/dot — it's useful even once real,
-   since color alone isn't an accessible signal.
-5. **Retire `profiler.js`'s ported formulas** in favor of the real
-   `RouteDecision` fields the same `/route` response already carries
-   (`difficulty_score`, `est_latency_ms`, `est_cost_usd`,
-   `pii_entities_masked`, `notes`) — at that point the JS port becomes a
-   second, divergence-prone source of truth instead of a stand-in for one.
-
-Until step 1 exists on a machine that can actually run it, this stays
-labeled mock, per this repo's own rule: nothing gets to look real without
-a receipt.
+- **Done:** `ui/server.py` is the API server (stdlib `http.server`, no
+  FastAPI/Flask — the base package is stdlib-only and this stays consistent
+  with it). `mockRespond()` is now a fallback rather than the path.
+- **Done differently:** the plan said *remove the sidebar toggle once tier is
+  a real routing decision*. Instead the toggle became real, gated behind
+  `UI_TEST=1` — being able to force either brain is genuinely useful for
+  demonstrating the two tiers side by side. Outside that flag it is inert and
+  the policy decides, so it cannot masquerade as routing behaviour.
+- **Still open:** `profiler.js` keeps its own ported copies of the difficulty
+  and latency formulas. The `/api/chat` response already carries the real
+  `difficulty_score`, `est_latency_ms`, `est_cost_usd`, `pii_entities_masked`
+  and `notes`, and the UI now prefers those when the backend is live — but the
+  JS formulas remain as the mock-mode fallback, so there are still two sources
+  of truth. Retiring them is worthwhile.
+- **Still true:** keep the per-message tier badge/dot. Colour alone is not an
+  accessible signal.
 
 ## Persistence
 
