@@ -794,6 +794,22 @@ function currentLevel() {
   return Math.min(rms * WAVE_GAIN, 1);
 }
 
+/**
+ * Mobile's stand-in for the amplitude meter: a travelling wave, so the panel
+ * reads as "listening" without pretending to show the microphone signal.
+ * See startDictation for why the real meter cannot run here.
+ */
+function pulseFrame(now) {
+  dictation.rafId = requestAnimationFrame(pulseFrame);
+  if (now - dictation.lastTickAt < WAVE_TICK_MS) return;
+  dictation.lastTickAt = now;
+  const t = now / 260;
+  for (let i = 0; i < WAVE_BARS; i++) {
+    dictation.levels[i] = 0.18 + 0.32 * (Math.sin(t - i / 5) + 1) / 2;
+  }
+  paintWave();
+}
+
 function waveFrame(now) {
   dictation.rafId = requestAnimationFrame(waveFrame);
   if (now - dictation.lastTickAt < WAVE_TICK_MS) return;
@@ -820,7 +836,11 @@ function renderTranscript() {
     els.dictationTranscript.appendChild(interim);
   }
   els.dictationTranscript.scrollTop = els.dictationTranscript.scrollHeight;
-  els.dictationConfirm.disabled = !dictation.finalText && !dictation.interimText;
+  // Never disabled. It was, when there was no transcript yet -- which made the
+  // button unpressable in exactly the case where the user most needs a way
+  // out, and read as "the tick is broken" rather than "nothing was heard".
+  // Confirming with an empty transcript simply closes the panel.
+  els.dictationConfirm.disabled = false;
 }
 
 function showDictationError(message) {
@@ -853,18 +873,29 @@ async function startDictation() {
     els.dictationTime.textContent = formatElapsed(performance.now() - dictation.startedAt);
   }, 200);
 
-  // Waveform. A failure here is non-fatal -- transcription still works, the
-  // bars just stay flat, so it must not abort the dictation session.
-  try {
-    dictation.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    dictation.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    dictation.analyser = dictation.audioCtx.createAnalyser();
-    dictation.analyser.fftSize = 1024;
-    dictation.sampleBuf = new Uint8Array(dictation.analyser.fftSize);
-    dictation.audioCtx.createMediaStreamSource(dictation.stream).connect(dictation.analyser);
-    dictation.rafId = requestAnimationFrame(waveFrame);
-  } catch {
-    /* No mic for the meter; SpeechRecognition below may still be granted. */
+  // The waveform is amplitude-driven on desktop, but NOT on mobile, and that
+  // is deliberate rather than a shortcut.
+  //
+  // On Android, holding a getUserMedia stream open starves SpeechRecognition
+  // of the microphone: the bars animate beautifully and the transcript stays
+  // empty forever. Two APIs, one mic, and recognition loses. Since the
+  // transcript is the entire point of dictation and the waveform is only
+  // feedback, the waveform is what gives way -- mobile gets an activity
+  // animation that is explicitly not claiming to show your voice.
+  if (isMobileDevice()) {
+    dictation.rafId = requestAnimationFrame(pulseFrame);
+  } else {
+    try {
+      dictation.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      dictation.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      dictation.analyser = dictation.audioCtx.createAnalyser();
+      dictation.analyser.fftSize = 1024;
+      dictation.sampleBuf = new Uint8Array(dictation.analyser.fftSize);
+      dictation.audioCtx.createMediaStreamSource(dictation.stream).connect(dictation.analyser);
+      dictation.rafId = requestAnimationFrame(waveFrame);
+    } catch {
+      /* No mic for the meter; SpeechRecognition below may still be granted. */
+    }
   }
 
   dictation.recognition = new SpeechRecognitionCtor();
