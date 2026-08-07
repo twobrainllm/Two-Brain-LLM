@@ -28,6 +28,7 @@ not a sign anything is wrong.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import socket
@@ -48,9 +49,13 @@ KEY_FILE = CERT_DIR / "key.pem"
 #: missing here is not a 404, it is the HTTPS page silently failing to reach a
 #: backend that is running, which is a much more confusing symptom.
 #:
-#: /route/stream and /route/sse are proxied too, but note the proxy buffers the
-#: whole response before replying, so they arrive as one chunk rather than
-#: incrementally. The UI still renders correctly; it just does not animate.
+#: /route/stream and /route/sse are proxied incrementally -- see `_relay_stream`
+#: and `STREAMING_TYPES`. That is not cosmetic: the UI opens the cloud's bubble
+#: with a "Thinking..." placeholder on the `tier` frame, which the router emits
+#: the moment it *decides* to escalate and up to 15s before the first cloud
+#: token. Buffering the response (which this proxy originally did) delivers that
+#: frame at the same instant as the answer it was meant to precede, so the phone
+#: shows a finished local answer and no sign anything else is coming.
 PROXY_PATHS = (
     "/route",
     "/route/stream",
@@ -59,6 +64,11 @@ PROXY_PATHS = (
     "/models",
 )
 MAX_BODY_BYTES = 8 * 1024 * 1024
+
+#: Content types the proxy must forward incrementally instead of buffering.
+#: Matches what `api.py` sends for `/route/sse` and `/route/stream`; anything
+#: else is a complete document and is relayed in one piece.
+STREAMING_TYPES = frozenset({"text/event-stream", "application/x-ndjson"})
 
 
 def lan_ip() -> str:
@@ -106,6 +116,45 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(UI_DIR), **kwargs)
 
+    def _send_buffered(self, status: int, content_type: str, payload: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _relay_stream(self, resp, content_type: str) -> None:
+        """Forward an incremental response as it arrives, not once it ends.
+
+        Deliberately sends **no Content-Length**: the length is unknowable
+        until the router finishes, and declaring one would mean buffering,
+        which is the entire bug this exists to avoid. `protocol_version` is
+        HTTP/1.0 here, so the client reads until the connection closes and no
+        chunked framing is needed.
+
+        `read1` rather than `read(n)`: `read(n)` blocks until it has n bytes or
+        the stream ends, which would re-introduce buffering at a smaller
+        granularity. `read1` returns whatever one underlying read produced --
+        for SSE that is a frame as soon as `api.py` flushes it.
+
+        Each write is flushed, for the same reason `api.py` flushes: without
+        it the frames sit in this process's buffer instead of the previous one.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            while True:
+                chunk = resp.read1(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the phone navigated away mid-answer; not an error
+
     def _proxy(self, method: str) -> None:
         body = None
         if method == "POST":
@@ -126,21 +175,30 @@ class Handler(SimpleHTTPRequestHandler):
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=300) as resp:
-                payload, status = resp.read(), resp.status
+            resp = urllib.request.urlopen(request, timeout=300)
         except urllib.error.HTTPError as exc:
-            payload, status = exc.read(), exc.code
+            # An error body is small and complete, so buffering it is correct.
+            self._send_buffered(exc.code, "application/json", exc.read())
+            return
         except urllib.error.URLError as exc:
             # The router being down is an expected state, not a stack trace.
             # The UI already handles a failed /route as "offline preview".
-            payload = f'{{"error": "router unreachable: {exc.reason}"}}'.encode()
-            status = 502
+            self._send_buffered(
+                502, "application/json",
+                json.dumps({"error": f"router unreachable: {exc.reason}"}).encode(),
+            )
+            return
 
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        # The upstream Content-Type is forwarded rather than hardcoded to JSON.
+        # It is what says "this one is incremental" -- api.py sends
+        # `text/event-stream` for /route/sse and `application/x-ndjson` for
+        # /route/stream, and neither carries a Content-Length.
+        with resp:
+            content_type = resp.headers.get("Content-Type", "application/json")
+            if content_type.split(";")[0].strip() in STREAMING_TYPES:
+                self._relay_stream(resp, content_type)
+            else:
+                self._send_buffered(resp.status, content_type, resp.read())
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path.split("?")[0] in PROXY_PATHS:
