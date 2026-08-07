@@ -883,10 +883,13 @@ button, input, textarea {
 .markdown a { color: var(--brain-local); text-decoration: underline; }
 .markdown strong { font-weight: 600; }
 
-/* Send button becomes Stop while a reply is generating. Red-tinted so it
-   reads as an interrupt rather than another send. */
+/* Send button becomes Stop while a reply is generating. Uses the theme's own
+   greys rather than a red: the square icon already reads as "interrupt", and a
+   saturated red was the only such colour in a palette that is otherwise warm
+   neutrals plus the two brain-tier accents. Muted against the send state, so
+   the two are distinguishable without introducing a new hue. */
 #send-btn.stopping {
-  background: #C0392B;
-  color: #fff;
+  background: var(--text-secondary);
+  color: var(--bg-composer);
 }
-#send-btn.stopping:hover { background: #A93226; }
+#send-btn.stopping:hover { background: var(--text-primary); }

@@ -559,6 +559,17 @@ function renderBackendStatus() {
   }
   const hint = document.getElementById("empty-state-hint");
   const toggleLabel = document.getElementById("brain-toggle-label");
+  // Both are demo controls. With UI_TEST off the tier switch cannot force
+  // anything and the expression buttons only preview animations, so they
+  // are hidden rather than left present-but-inert -- a control that looks
+  // live and does nothing is worse than no control.
+  const demoPanels = [
+    document.getElementById("brain-toggle-wrap"),
+    document.getElementById("expression-preview-wrap"),
+  ];
+  const showDemoPanels = (show) => {
+    for (const el of demoPanels) if (el) el.hidden = !show;
+  };
   const b = state.backend;
   if (!b) {
     el.className = "backend-status mock";
@@ -566,6 +577,7 @@ function renderBackendStatus() {
     if (hint) hint.textContent =
       "Replies are simulated — no backend is running. Start ui/server.py for real answers.";
     if (toggleLabel) toggleLabel.textContent = "Simulated brain";
+    showDemoPanels(true); // no backend: the toggle is all there is to show
     els.attachBtn.disabled = true;
     els.attachBtn.title = "Attaching needs the backend (ui/server.py)";
     return;
@@ -580,7 +592,8 @@ function renderBackendStatus() {
       ? `Answers are real. The ${b.vision ? "local VLM" : "local brain"} and the cloud deep brain are both live — pick one in the sidebar.`
       : "Answers are real. The router decides which brain replies; the sidebar switch is only a preference (UI_TEST is off).";
   }
-  if (toggleLabel) toggleLabel.textContent = b.ui_test ? "Answering brain" : "Preferred brain (policy decides)";
+  if (toggleLabel) toggleLabel.textContent = "Answering brain";
+  showDemoPanels(Boolean(b.ui_test));
   els.attachBtn.disabled = !b.vision;
   els.attachBtn.title = b.vision
     ? "Attach an image (stays on-device)"
@@ -651,9 +664,17 @@ async function askBackendStreaming(query, tier, imageDataUrl, onDelta, signal) {
       }
 
       if (event === "delta") {
-        result.answer += payload.text || "";
-        onDelta(result.answer);
+        const text = payload.text || "";
+        // Every delta carries the tier that produced it, so a hybrid answer is
+        // attributed from the data rather than inferred from ordering.
+        const deltaTier = payload.tier || result.tier_answered || "local";
+        result.answer += text;
+        onDelta({ text, tier: deltaTier });
       } else if (event === "meta") {
+        Object.assign(result, payload);
+      } else if (event === "tier") {
+        // Shape C upgrading itself: the local half already streamed, and a gap
+        // turned out to need filling. Later cloud deltas open their own bubble.
         Object.assign(result, payload);
       } else if (event === "done") {
         Object.assign(result, payload, { answer: result.answer });
@@ -756,19 +777,21 @@ async function handleSend(e) {
   els.messages.appendChild(thinkingRow);
   scrollToBottom();
 
-  const isLongQuery = query.length > LONG_QUERY_CHARS;
-  const surpriseMs = isLongQuery ? EXPRESSION_HOLD_MS.surprised : 0;
-  if (isLongQuery) {
-    playExpression(thinkingAvatar, "surprised");
-    await sleep(surpriseMs);
-  }
+  if (query.length > LONG_QUERY_CHARS) playExpression(thinkingAvatar, "surprised");
 
-  const thinkMs = THINK_MS_BY_TIER[tier] ?? THINK_MS_BY_TIER.local;
-  const lookBudgetMs = Math.max(thinkMs - surpriseMs, 0);
-  await playThinkingLooks(thinkingAvatar, lookBudgetMs, THINK_RHYTHM_MS);
-
-  playExpression(thinkingAvatar, "happy", HAPPY_LEAD_MS);
-  await sleep(HAPPY_LEAD_MS);
+  // The look choreography runs *while* the model is working, not before it.
+  // It used to be an awaited fixed-length sequence that finished in under a
+  // second and then left the avatar idle for the rest of a generation that can
+  // take minutes -- fine for the old mock reply with its fake delay, wrong the
+  // moment a real backend arrived. `thinking` stays true until the first token.
+  const thinking = { active: true };
+  (async () => {
+    const order = shuffled(LOOK_EXPRESSIONS); // flat / shrunk / expanded, mixed
+    for (let i = 0; thinking.active; i++) {
+      playExpression(thinkingAvatar, order[i % order.length], THINK_RHYTHM_MS);
+      await sleep(THINK_RHYTHM_MS);
+    }
+  })();
 
   // Real backend when it is up; the canned reply only when it is not.
   let answer;
@@ -778,14 +801,43 @@ async function handleSend(e) {
   // as tokens arrive, so a reload part-way through keeps what was received. A
   // local reply can run for minutes; losing all of it to an accidental refresh
   // would be its own bug.
-  const streamingMessage = {
-    role: "assistant",
-    content: "",
-    tier,
-    timestamp: Date.now(),
-    partial: true,
+  // One bubble per tier that actually speaks. A hybrid answer therefore shows
+  // the on-device partial in the local colour and the cloud's gap-fill in its
+  // own, rather than merging two brains' words into one anonymous blob.
+  const bubbles = new Map(); // tier -> {message, textEl, avatar}
+  const streamingMessages = [];
+  const bubbleFor = (bubbleTier) => {
+    let b = bubbles.get(bubbleTier);
+    if (b) return b;
+    if (bubbles.size === 0) {
+      // Reuse the placeholder that is already on screen and animating.
+      thinkingRow.querySelector(".robot-avatar")?.setAttribute("data-tier", bubbleTier);
+      const badge = thinkingRow.querySelector(".tier-badge");
+      if (badge) {
+        badge.innerHTML =
+          `<span class="tier-dot" data-tier="${bubbleTier}"></span>` +
+          (bubbleTier === "local" ? "Local brain" : "Cloud brain");
+      }
+      b = {
+        message: { role: "assistant", content: "", tier: bubbleTier, timestamp: Date.now(), partial: true },
+        textEl: thinkingRow.querySelector(".bubble > div:last-child"),
+        avatar: thinkingAvatar,
+      };
+    } else {
+      const row = renderMessageEl({ role: "assistant", content: "", tier: bubbleTier });
+      els.messages.appendChild(row);
+      b = {
+        message: { role: "assistant", content: "", tier: bubbleTier, timestamp: Date.now(), partial: true },
+        textEl: row.querySelector(".bubble > div:last-child"),
+        avatar: row.querySelector(".robot-avatar"),
+      };
+    }
+    chat.messages.push(b.message);
+    streamingMessages.push(b.message);
+    bubbles.set(bubbleTier, b);
+    return b;
   };
-  chat.messages.push(streamingMessage);
+
   state.streaming = true;
   state.abortController = new AbortController();
   updateSendState(); // swap Send -> Stop
@@ -796,17 +848,22 @@ async function handleSend(e) {
     try {
       // Paint into the placeholder bubble as tokens arrive, so a long local
       // reply shows progress instead of a blank wait.
-      const liveText = thinkingRow.querySelector(".bubble > div:last-child");
       const result = await askBackendStreaming(
         query,
         tier,
         attachment?.dataUrl,
-        (soFar) => {
-          streamingMessage.content = soFar;
-          if (liveText) {
+        ({ text, tier: deltaTier }) => {
+          // First token: the model is answering, so stop looking around.
+          if (thinking.active) {
+            thinking.active = false;
             thinkingAvatar?.classList.remove("thinking");
-            liveText.className = "markdown";
-            liveText.innerHTML = renderMarkdown(soFar);
+          }
+          const b = bubbleFor(deltaTier);
+          b.message.content += text;
+          if (b.textEl) {
+            b.avatar?.classList.remove("thinking");
+            b.textEl.className = "markdown";
+            b.textEl.innerHTML = renderMarkdown(b.message.content);
             scrollToBottom();
           }
           // Persist at most once a second: saving every token would serialise
@@ -837,9 +894,11 @@ async function handleSend(e) {
         // away -- a partial answer to a two-minute generation is still worth
         // having -- and mark it so the transcript does not read as complete.
         stopped = true;
-        answer = streamingMessage.content
-          ? `${streamingMessage.content}\n\n_[stopped]_`
-          : "_[stopped before any output]_";
+        // Mark the bubble that was mid-flight; the earlier ones are complete
+        // and should not be labelled as interrupted.
+        const last = streamingMessages[streamingMessages.length - 1];
+        if (last) last.content += "\n\n_[stopped]_";
+        else answer = "_[stopped before any output]_";
       } else {
         answer = `The backend returned an error:
 
@@ -852,13 +911,23 @@ ${err.message}`;
     metrics = computeMetrics(query, tier);
   }
   metrics.actualLatencyMs = performance.now() - thinkingStartedAt;
-  // Finalise the message that was streamed into, rather than pushing a second
-  // one -- it is already in chat.messages.
-  streamingMessage.content = answer;
-  streamingMessage.tier = answeredTier;
-  streamingMessage.metrics = metrics;
-  if (stopped) streamingMessage.stopped = true;
-  delete streamingMessage.partial;
+
+  if (streamingMessages.length === 0) {
+    // Nothing streamed -- mock mode, an error, or a stop before the first
+    // token. One bubble carrying whatever text we ended up with.
+    const b = bubbleFor(answeredTier);
+    b.message.content = answer || "";
+  }
+  // Metrics belong on the last bubble: it is the one the profiler describes,
+  // and attaching them to every bubble would double-count a hybrid answer.
+  const finalMessage = streamingMessages[streamingMessages.length - 1];
+  if (finalMessage) {
+    finalMessage.tier = bubbles.size > 1 ? finalMessage.tier : answeredTier;
+    finalMessage.metrics = metrics;
+    if (stopped) finalMessage.stopped = true;
+  }
+  for (const m of streamingMessages) delete m.partial;
+  thinking.active = false;
   state.streaming = false;
   state.abortController = null;
   updateSendState(); // Stop -> Send

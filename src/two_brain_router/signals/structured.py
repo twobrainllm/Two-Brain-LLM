@@ -293,3 +293,90 @@ def parse_structured(text: str) -> StructuredAnswer:
         model_masked_output=_coerce_text(_first_key(obj, _MASKED_KEYS)),
         source="json",
     )
+
+
+class SolutionStreamFilter:
+    """Emit the `solution` field's text from a structured reply, as it arrives.
+
+    Shape C's local half is JSON, so streaming it raw would show the user
+    `{"solution": "` and the escaping around their answer. Buffering instead
+    means the blue bubble appears all at once after several seconds, which
+    throws away the point of streaming for the half that is usually slower.
+
+    This pulls the one field out mid-flight: feed it raw chunks, get back only
+    the characters that belong inside `solution`, unescaped. Everything else --
+    the opening brace, the key, the later `confidence` and `unknown` fields --
+    is swallowed.
+
+    Deliberately a small hand-rolled scanner rather than an incremental JSON
+    parser: it only has to find one string value and stop, and it must tolerate
+    output that never becomes valid JSON at all. `feed` returns "" forever in
+    that case rather than raising, and `parse_structured` still runs on the
+    complete text afterwards, so the authoritative parse is unchanged. This is
+    a display optimisation and is never the source of truth.
+
+    Accepts the same key aliases as `parse_structured`, since a model that
+    writes `answer` instead of `solution` should still stream.
+    """
+
+    def __init__(self, keys: tuple[str, ...] = _SOLUTION_KEYS) -> None:
+        self._keys = keys
+        self._buf = ""
+        self._state = "seek"  # seek -> in_string -> done
+        self._escape = False
+
+    def feed(self, chunk: str) -> str:
+        if self._state == "done":
+            return ""
+        self._buf += chunk
+        if self._state == "seek":
+            start = self._find_value_start()
+            if start is None:
+                # Keep only a tail long enough to still match a split key.
+                if len(self._buf) > 200:
+                    self._buf = self._buf[-200:]
+                return ""
+            self._state = "in_string"
+            self._buf = self._buf[start:]
+        return self._drain()
+
+    def _find_value_start(self) -> int | None:
+        """Index just past the opening quote of the first matching key's value."""
+        best: int | None = None
+        for key in self._keys:
+            for quote in ('"', "'"):
+                marker = f"{quote}{key}{quote}"
+                at = self._buf.find(marker)
+                if at == -1:
+                    continue
+                rest = self._buf[at + len(marker):]
+                stripped = rest.lstrip()
+                if not stripped.startswith(":"):
+                    continue
+                after_colon = rest[rest.index(":") + 1:]
+                value = after_colon.lstrip()
+                if not value.startswith('"'):
+                    continue  # value not started yet, or not a string
+                index = at + len(marker) + rest.index(":") + 1 + (len(after_colon) - len(value)) + 1
+                if best is None or index < best:
+                    best = index
+        return best
+
+    def _drain(self) -> str:
+        out: list[str] = []
+        consumed = 0
+        for ch in self._buf:
+            consumed += 1
+            if self._escape:
+                out.append({"n": "\n", "t": "\t", "r": "\r"}.get(ch, ch))
+                self._escape = False
+                continue
+            if ch == "\\":
+                self._escape = True
+                continue
+            if ch == '"':
+                self._state = "done"
+                break
+            out.append(ch)
+        self._buf = self._buf[consumed:]
+        return "".join(out)

@@ -170,6 +170,11 @@ class Handler(SimpleHTTPRequestHandler):
             router = get_router()
             stream = router.route_stream(message, image=image_path, force_tier=tier)
             for kind, payload in stream:
+                # Every event is a dict now, including deltas -- they carry the
+                # tier that produced them so the UI can attribute a hybrid
+                # answer without inferring it from ordering. The isinstance
+                # guard stays for the plain-string form, which older callers
+                # of route_stream may still yield.
                 self._sse(kind, payload if isinstance(payload, dict) else {"text": payload})
         except (BrokenPipeError, ConnectionResetError):
             # The browser hit Stop, or navigated away. Not an error -- just

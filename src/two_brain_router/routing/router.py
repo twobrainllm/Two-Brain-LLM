@@ -69,6 +69,7 @@ from two_brain_router.routing.brains import (
 from two_brain_router.routing.policy import RouteDecision, RoutePolicy
 from two_brain_router.signals import DifficultyEstimator, TierSignals
 from two_brain_router.signals.confidence import confidence_to_difficulty
+from two_brain_router.signals.structured import SolutionStreamFilter, parse_structured
 from two_brain_router.trace import Tracer, trace_enabled
 
 Tier = Literal["mobile", "pc"]
@@ -856,11 +857,21 @@ class TwoBrainRouter:
         incremental, and this keeps the same boundary discipline as `_escalate`:
         what crosses is masked from the raw query at the point of crossing.
 
-        Deliberately does not implement the structured or confidence shapes.
-        Those ask the brain first and route on what comes back, which cannot be
-        streamed without either showing an answer that may be discarded or
-        buffering the whole thing and defeating the point. They fall through to
-        the heuristic path here; `route()` remains the full implementation.
+        Shape C (structured) **is** implemented, because it is the shape that
+        makes the two-brain split visible: the local partial answer is emitted
+        complete as a `("local", ...)` event, and only the deep brain's gap-fill
+        streams after it. A caller can render those as two attributed bubbles.
+        The local half is not streamed token-by-token because it arrives as
+        JSON -- streaming it would show the user the scaffolding.
+
+        Shape B (confidence-only, currently `PhoneFastBrain`) is *not*
+        implemented here: it discards the local answer when it routes away, so
+        streaming it would mean showing text that is about to be retracted.
+        Those brains fall through to the heuristic path; `route()` remains the
+        full implementation for them.
+
+        Every `("delta", ...)` carries the tier that produced it, so a caller
+        never has to infer attribution from ordering.
         """
         notes: list[str] = []
         guard = PIIGuard()
@@ -884,8 +895,17 @@ class TwoBrainRouter:
             image=image,
         )
 
-        difficulty = self.difficulty.score(query)
         local_latency_est = self.policy.estimate_local_latency_ms(self.local.profile, query)
+
+        # Shape C, when the brain supports it and no tier is being forced.
+        # Forcing exists to demonstrate one brain or the other, which is exactly
+        # what a split answer is not.
+        forcing = force_tier is not None and ui_test_enabled()
+        if not forcing and image is None and getattr(self.fast_brain, "reports_gaps", False):
+            yield from self._stream_structured(request, local_latency_est)
+            return
+
+        difficulty = self.difficulty.score(query)
         would_be = "cloud" if self.policy.should_escalate(difficulty, local_latency_est) else "local"
 
         if force_tier is not None and ui_test_enabled():
@@ -950,13 +970,219 @@ class TwoBrainRouter:
         for piece in stream:
             out = rehydrator.feed(piece)
             if out:
-                yield ("delta", out)
+                yield ("delta", {"text": out, "tier": tier})
         tail = rehydrator.flush()
         if tail:
-            yield ("delta", tail)
+            yield ("delta", {"text": tail, "tier": tier})
 
         yield ("done", {
             "tier_answered": tier,
+            "est_latency_ms": (time.perf_counter() - started) * 1000,
+            "est_cost_usd": 0.0,
+        })
+
+    @staticmethod
+    def _parse_streamed_local(raw: str, latency_ms: float) -> BrainResponse:
+        """Rebuild the structured response from text that was streamed.
+
+        The streaming path cannot call `brain.answer()`, so it re-runs the same
+        `parse_structured` the brain would have used. Same parser, same
+        fallbacks -- the display filter above never becomes a second, divergent
+        interpretation of what the model said.
+        """
+        parsed = parse_structured(raw)
+        return BrainResponse(
+            text=parsed.solution if parsed else raw.strip(),
+            latency_ms=latency_ms,
+            cost_usd=0.0,
+            confidence=parsed.confidence if parsed else None,
+            unknown=parsed.unknown if parsed else "",
+            model_masked_output=parsed.model_masked_output if parsed else "",
+        )
+
+    def _stream_structured(self, request: _Request, local_latency_est: float):
+        """Shape C, streamed: local partial complete, then the gap-fill token by token.
+
+        Mirrors `_route_on_structured_answer` / `_answer_hybrid` decision for
+        decision. Kept as a separate method rather than sharing their bodies
+        because those return a `RouteDecision` while this yields events, and
+        trying to serve both from one function is how the two would drift.
+
+        The masking is identical and for the identical reason: `gap` and the
+        local partial were written by a model that saw the **raw** query, so
+        they can contain a real address verbatim. They are masked here, at the
+        boundary, and nowhere earlier.
+        """
+        notes = request.notes
+
+        if local_latency_est > self.policy.local_partial_budget_ms:
+            notes.append(
+                f"skipped the fast brain: its profiled latency estimate "
+                f"({local_latency_est:.0f}ms) exceeds even the "
+                f"{self.policy.local_partial_budget_ms:.0f}ms ceiling for keeping a "
+                f"partial answer"
+            )
+            yield from self._stream_cloud_only(request, difficulty=1.0)
+            return
+
+        # The local half streams too. Its raw output is JSON, so the filter
+        # emits only what is inside `solution` -- the user sees prose arriving,
+        # never the scaffolding around it. The authoritative parse still runs on
+        # the complete text below; this is display only, and returns nothing at
+        # all if the model never produces valid JSON.
+        #
+        # The tier is announced before the first token, which means it is
+        # announced before the gap is known. "local" is the honest provisional
+        # answer -- everything emitted here was produced on-device -- and a
+        # `("tier", {"tier_answered": "hybrid"})` event follows if it turns out
+        # a gap needs filling. Claiming "hybrid" up front would be a guess, and
+        # would mislabel every query the local brain turns out to finish alone.
+        yield ("meta", {
+            "tier_answered": "local",
+            "difficulty_score": None,
+            "pii_entities_masked": 0,
+            "notes": notes,
+        })
+
+        solution = SolutionStreamFilter()
+        streamed_any = False
+        raw_parts: list[str] = []
+        started_local = time.perf_counter()
+        for piece in self.fast_brain.answer_stream(request.view.text):
+            raw_parts.append(piece)
+            shown = solution.feed(piece)
+            if shown:
+                streamed_any = True
+                # Rehydrate per chunk for an untrusted brain; a no-op vault for
+                # a trusted one makes this a pass-through.
+                yield ("delta", {
+                    "text": request.guard.rehydrate(shown, request.view.vault),
+                    "tier": "local",
+                })
+        local_latency_ms = (time.perf_counter() - started_local) * 1000
+
+        local = self._parse_streamed_local("".join(raw_parts), local_latency_ms)
+        difficulty = self._difficulty_from(local, notes)
+        gap = local.unknown.strip()
+        if gap:
+            notes.append(f"fast brain named what it could not answer: {gap!r}")
+
+        local_text = request.guard.rehydrate(local.text, request.view.vault)
+        if not streamed_any and local_text:
+            # The filter found no JSON string to stream (the model wrote prose,
+            # or malformed JSON). The parser's fallback still recovered
+            # something, so show that rather than an empty bubble.
+            yield ("delta", {"text": local_text, "tier": "local"})
+
+        if not self.policy.needs_gap_fill(difficulty, gap):
+            notes.append(self.policy.local_note(difficulty, local.latency_ms))
+            yield ("done", {"tier_answered": "local", "difficulty_score": difficulty,
+                            "est_latency_ms": local.latency_ms, "est_cost_usd": 0.0,
+                            "notes": notes})
+            return
+
+        if not local_text.strip():
+            # A gap but no usable partial: an ordinary escalation, reported as
+            # one. Splitting needs two halves.
+            notes.append("fast brain produced no usable partial answer; escalating whole")
+            yield from self._stream_cloud_only(request, difficulty)
+            return
+
+        # 3. The boundary. Everything below is masked from raw text.
+        masked_query = request.mask_for_boundary(request.query)
+        masked_gap = request.mask_for_boundary(gap)
+        vault = dict(masked_query.vault)
+        vault.update(masked_gap.vault)
+
+        parts: list[str] = []
+        if request.context:
+            masked_context = request.mask_for_boundary(request.context)
+            vault.update(masked_context.vault)
+            parts.append(masked_context.masked_text)
+        if self.policy.send_partial_to_cloud:
+            masked_partial = request.mask_for_boundary(local.text)
+            vault.update(masked_partial.vault)
+            parts.append(
+                "A smaller on-device model has already answered part of this "
+                f"question: {masked_partial.masked_text}"
+            )
+        # Last, so it survives compression -- compress_context keeps the tail,
+        # and the gap is the entire reason this call is being made.
+        parts.append(f"Answer only the remaining part it could not: {masked_gap.masked_text}")
+
+        compressed, was_compressed = self.policy.compress_context("\n\n".join(parts))
+        if was_compressed:
+            notes.append(f"compressed the escalated gap context to {len(compressed)} chars")
+        if masked_query.vault:
+            notes.append(f"sent off-device (masked): {masked_query.masked_text!r}")
+        notes.append(
+            "splitting the query: keeping the on-device answer and asking the "
+            "deep brain only about the gap"
+            + ("" if self.policy.send_partial_to_cloud else " (partial answer withheld)")
+        )
+
+        # The local half has already streamed. This upgrades the tier now that
+        # a gap is confirmed, so the caller can close the blue bubble and open a
+        # gold one for what follows.
+        yield ("tier", {
+            "tier_answered": "hybrid",
+            "difficulty_score": difficulty,
+            "pii_entities_masked": len(vault),
+            "gap": gap,
+            "notes": notes,
+        })
+
+        rehydrator = _IncrementalRehydrator(request.guard, vault)
+        started = time.perf_counter()
+        for piece in self.deep_brain.answer_stream(masked_query.masked_text, compressed):
+            out = rehydrator.feed(piece)
+            if out:
+                yield ("delta", {"text": out, "tier": "cloud"})
+        tail = rehydrator.flush()
+        if tail:
+            yield ("delta", {"text": tail, "tier": "cloud"})
+        self.tracer.rehydrated(vault)
+
+        yield ("done", {
+            "tier_answered": "hybrid",
+            "est_latency_ms": local.latency_ms + (time.perf_counter() - started) * 1000,
+            "est_cost_usd": 0.0,
+        })
+
+    def _stream_cloud_only(self, request: _Request, difficulty: float):
+        """Escalate the whole query, streamed. Used when a split is not possible."""
+        masked_query = request.mask_for_boundary(request.query)
+        vault = dict(masked_query.vault)
+        masked_context = (
+            request.mask_for_boundary(request.context)
+            if request.context
+            else MaskResult(masked_text="", vault={})
+        )
+        vault.update(masked_context.vault)
+        compressed, was_compressed = self.policy.compress_context(masked_context.masked_text)
+        if was_compressed:
+            request.notes.append(f"compressed escalated context to {len(compressed)} chars")
+        if masked_query.vault:
+            request.notes.append(f"sent off-device (masked): {masked_query.masked_text!r}")
+
+        yield ("meta", {
+            "tier_answered": "cloud",
+            "difficulty_score": difficulty,
+            "pii_entities_masked": len(vault),
+            "notes": request.notes,
+        })
+        rehydrator = _IncrementalRehydrator(request.guard, vault)
+        started = time.perf_counter()
+        for piece in self.deep_brain.answer_stream(masked_query.masked_text, compressed):
+            out = rehydrator.feed(piece)
+            if out:
+                yield ("delta", {"text": out, "tier": "cloud"})
+        tail = rehydrator.flush()
+        if tail:
+            yield ("delta", {"text": tail, "tier": "cloud"})
+        self.tracer.rehydrated(vault)
+        yield ("done", {
+            "tier_answered": "cloud",
             "est_latency_ms": (time.perf_counter() - started) * 1000,
             "est_cost_usd": 0.0,
         })
