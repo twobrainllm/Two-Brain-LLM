@@ -825,17 +825,14 @@ function formatElapsed(ms) {
 }
 
 function renderTranscript() {
+  // The transcript is deliberately NOT shown while recording -- ChatGPT's
+  // dictation shows only the waveform and the timer, and the text appears in
+  // the composer when you confirm. Watching words rewrite themselves as the
+  // recogniser revises its guess is distracting, and it invites reading
+  // instead of speaking. It is still accumulated in `dictation`; this only
+  // decides what is painted. showDictationError() still writes here, because
+  // an error is the one thing worth interrupting for.
   els.dictationTranscript.innerHTML = "";
-  if (dictation.finalText) {
-    els.dictationTranscript.appendChild(document.createTextNode(dictation.finalText));
-  }
-  if (dictation.interimText) {
-    const interim = document.createElement("span");
-    interim.className = "interim";
-    interim.textContent = (dictation.finalText ? " " : "") + dictation.interimText;
-    els.dictationTranscript.appendChild(interim);
-  }
-  els.dictationTranscript.scrollTop = els.dictationTranscript.scrollHeight;
   // Never disabled. It was, when there was no transcript yet -- which made the
   // button unpressable in exactly the case where the user most needs a way
   // out, and read as "the tick is broken" rather than "nothing was heard".
