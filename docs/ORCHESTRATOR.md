@@ -118,6 +118,209 @@ Two implementation notes worth keeping:
 on-device without seeing it was there. It goes to stdout, never to a file, and
 `api.py` says so at startup rather than letting someone find out mid-screenshare.
 
+### Showing the local half first: `/route/stream`
+
+A split has two very differently-priced halves. Measured on real hardware with
+the real Cirrascale endpoint, on one query:
+
+```
+[  9.80s] PROGRESS  local : "Pride and Prejudice is a novel set in the English countryside..."
+                    gap   : "the exact ISBN of the 1813 first edition"
+[ 21.00s] RESULT    tier=hybrid  cost=$0.000275
+```
+
+The local answer was finished and displayable at 9.8s; plain `POST /route`
+holds it until 21.0s and shows nothing for the intervening 11 seconds. So
+there is a second endpoint that hands it over as soon as it exists:
+
+| | `POST /route` | `POST /route/stream` |
+|---|---|---|
+| Response | one JSON object | NDJSON, one object per line |
+| Local half arrives | with everything else | as soon as the local model finishes |
+| Final result | — | last line, **byte-identical** to `/route`'s body |
+
+Lines are `{"type": "progress"|"result"|"error", ...}`. There is at most one
+`progress` line, and only when something is about to cross the boundary:
+
+- `phase: "local_answer"` — a usable partial exists and the deep brain is
+  about to be asked about the named gap. Carries `local_answer` (rehydrated,
+  display-ready) and `gap`.
+- `phase: "escalating"` — nothing usable came back locally, so the whole query
+  is going to the cloud. `local_answer` and `gap` are `null` — *"there is no
+  partial"* and *"the partial was blank"* are different states and the UI says
+  different things for them. Emitted anyway, because "escalating, nothing
+  usable locally" is a much better thing to show for 15s than a bare spinner.
+
+A locally-answered query emits **no** progress line at all: nothing is being
+waited for, so there is nothing to announce.
+
+Underneath, `route()` takes an optional `on_progress` callback and calls it
+once, at the moment the local half is settled and rehydrated but before the
+deep brain is asked. Four properties are pinned by tests because each is a way
+this could be quietly wrong:
+
+- **Ordering is the whole feature**, so it is asserted on ordering, not on the
+  callback merely firing — `test_the_local_half_is_handed_out_before_the_cloud_is_called`
+  checks the deep brain's call log is still empty *inside* the callback, and
+  `test_stream_hands_out_the_local_half_before_the_cloud_call_finishes` uses a
+  deliberately slow fake cloud so "arrived early" is measured rather than
+  inferred. A version that emitted both lines at the end would pass every
+  other test.
+- **`local_answer` is rehydrated**, so a UI can paint it directly without a
+  `[PII_EMAIL_1]` reaching the screen. Safe to do early because that text came
+  from a brain given `request.view`, whose vault is complete before the cloud
+  call and does not depend on anything the cloud returns.
+- **The final line equals `/route`'s body.** Streaming changes *when* you learn
+  things, never *what* — if those diverge, the UI is showing something the
+  audit trail doesn't.
+- **A callback that raises cannot break the request.** The realistic cause is a
+  client disconnecting mid-stream; that must not turn a working answer into a
+  500 or abandon a cloud call already paid for. Exceptions are swallowed: a
+  dead listener is not a routing failure.
+
+`ui/app.js` uses this by default and falls back to `/route` on a 404, so a UI
+newer than its server degrades to *slower* rather than to the offline preview
+(which would wrongly claim nothing ran). The partial is painted into the live
+DOM row only — never into `chat.messages` — so a reload can't restore a
+half-finished answer as if it were real.
+
+### Conversation history
+
+`route(query, context)` has always had a `context` argument, but it only ever
+fed the *cloud* — every `_ask(self.fast_brain, …)` call omitted it. So the local
+model received a follow-up like "explain in more detail" as a standalone
+sentence with no referent, and answered something unrelated. It now gets the
+history too.
+
+**The router stays stateless, deliberately.** `api.py` builds one
+`TwoBrainRouter` and shares it across every request and every browser tab (the
+NPU's Genie session is far too expensive to rebuild per request), so history
+held there would leak between unrelated chats. The client owns it — `ui/app.js`
+assembles recent turns from `chat.messages` and sends them as `context` on each
+request.
+
+Where it goes follows the same trust rule as everything else:
+
+| | Gets history |
+|---|---|
+| On-device fast brain (`trusted_with_raw_pii`) | **raw**, via `_Request.context_view` |
+| Off-device fast brain (`PhoneFastBrain`) | masked, same guard as the query |
+| Cloud, on an escalation | masked and compressed into `context`; the gap is the `query` and is never truncated |
+
+Bounded in `ui/app.js` (6 messages / 300 chars each / 1200 total, newest-first)
+because an unbounded history costs three ways: the local model's prompt grows
+against a finite compiled context length, its 4–12s latency grows with it, and
+every extra turn is more text eligible to leave the device. `compress_context`
+caps the cloud side at 800 chars regardless.
+
+Two bugs this turned up, both fixed and both regression-tested:
+
+- **A placeholder minted from the history didn't rehydrate.** An answer can echo
+  `[PII_EMAIL_1]` that came from the *context* rather than the query, so
+  rehydration now merges both vaults (`_Request.local_vault`). Safe to merge
+  because one `PIIGuard` masked both and maps a repeated value to one
+  placeholder.
+- **The audit trail undercounted.** `pii_entities_detected` and
+  `pii_entities_masked` were computed from the query alone, so a request whose
+  PII lived only in the history reported *"0 detected / 0 masked"* while the
+  trace plainly showed an address being masked at the boundary. The masking was
+  correct; the reporting wasn't — and on a privacy demo the profiler saying "No
+  PII detected" about a request that shipped a masked address is the worse
+  failure. Both counts now cover query + context, de-duplicated by value so an
+  address written in both places reads as one entity rather than as
+  "2 detected, 1 masked".
+
+**Not yet verified:** whether Phi-3.5-mini actually *uses* the history it is now
+given. The prompt plumbing is confirmed (the rendered prompt contains the prior
+turns), but the model's use of it needs a run on the real NPU.
+
+### Token-level streaming: `/route/sse`
+
+`/route/stream` hands over the local half when it is *complete*. `/route/sse`
+hands over each token as it is generated, so a bubble fills in like a chat
+app rather than appearing all at once. Measured on the real NPU:
+
+```
+first visible text at  0.83s
+stream ended at        4.15s
+```
+
+A 3.3-second head start on a 4-second answer, and proportionally larger on the
+long ones — this model has taken 11s+ on a single reply.
+
+**The hard part is that the local model does not generate prose.** It generates
+`{"solution": "...", "confidence": 90, "unknown": "..."}`, one token at a time.
+The first raw token off the real NPU is literally `` {" ``. Forwarding that
+would show a brace, a quoted key and a colon before any answer, then routing
+metadata after it. `signals/structured.SolutionStreamer` walks the growing
+buffer and releases **only the decoded contents of `solution`**, while keeping
+the raw text intact for the real parse at the end.
+
+> The `(hollowbyte)-feat/chat_app` branch declined to stream the local half for
+> exactly this reason — *"it arrives as JSON — streaming it would show the user
+> the scaffolding."* Solving it is what makes token streaming usable on the
+> tier where it matters most, since the on-device model is the slow one.
+
+Three cases the streamer has to survive, all pinned in
+`tests/test_solution_streaming.py`:
+
+- **Chunk boundaries fall anywhere.** `"solu` / `tion": "Par` / `is"` is normal,
+  so nothing can be matched against a single chunk; the whole buffer is
+  rescanned each feed.
+- **A `\uXXXX` escape split in half is withheld**, not guessed at. There is no
+  edit in a stream, only append — a broken character can never be taken back.
+- **A model that emits no JSON at all streams verbatim.** `parse_structured`
+  already degrades to prose; the stream degrades the same way, so a
+  badly-behaved model produces a badly-formatted answer rather than a blank
+  screen.
+
+Frames are SSE, named rather than type-tagged:
+
+| Event | When | Payload |
+|---|---|---|
+| `meta` | once, before any text | `{tier, streaming}` |
+| `delta` | repeatedly | `{text, tier}` — **tier-attributed**, so a split renders as two bubbles from the data rather than from ordering |
+| `tier` | a split opening the cloud's bubble | `{tier, gap}` |
+| `done` | once | the full `RouteDecision` plus `/route`'s display extras |
+| `error` | in-band | the status line is long sent, so a failure cannot be an HTTP code |
+
+`EventSource` is unusable here — it is GET-only and this request carries a JSON
+body with an optional image — so `ui/app.js` reads the `fetch` body as a stream
+and parses frames itself.
+
+**Streaming changes nothing about the privacy ordering.** Detection, the local
+view, and (for an escalated image) describing it on-device and masking that
+description all happen before the first delta; only *generation* is
+incremental. `_answer_hybrid` and `_answer_hybrid_streaming` share one
+`_prepare_gap_escalation`, so the masking cannot differ between them — two
+copies of privacy-critical code is how one ends up a fix behind. Deltas are
+rehydrated per-frame so a `[PII_EMAIL_1]` never reaches the screen.
+
+A brain that cannot stream (`streams_tokens`), or a shape this does not
+implement (Shape B, which discards its local answer when it routes away — so
+streaming it would mean showing text about to be retracted), falls back to one
+`answer()` call emitted as a single delta. The client renders both identically.
+
+### Image attachment
+
+`POST /route` and `/route/sse` accept `image` as a `data:image/...;base64,...`
+URL. `api.py` decodes it to a temp file, hands the `Path` to `route()`, and
+deletes it in a `finally` that covers every exit — including the
+invariant-violation path, which returns early. An image is the most sensitive
+thing a user can hand this system; a copy left in the temp directory after an
+error is exactly the quiet residue this project exists to avoid.
+
+Capped at `MAX_IMAGE_CHARS` (~3.4 MB of image bytes) and checked client-side
+too, so an oversized file is refused before it is base64'd and pushed over the
+wire. An unbounded body is a trivial memory-exhaustion lever on a loopback
+server that deliberately has no other auth.
+
+The image itself **never leaves the machine** — that is not a policy choice,
+it is forced: the cloud tier has no vision model at all
+(`data/cloud_ai100/_real_endpoint_log.md`). An image-bearing query that
+escalates is described on-device first, and only that masked description
+crosses.
+
 ### Detected ≠ masked
 
 `RouteDecision` carries both counts, and it has to. A PII-heavy query answered
@@ -274,7 +477,19 @@ Four things here are load-bearing:
    difficulty 0.05, far below the 0.55 threshold. Under Shape B it stays local
    and answers "Paris", silently dropping half the question. The model knew the
    other half was missing all along; there was nowhere to say so.
-2. **The gap and the partial are masked before they cross — the sharpest edge
+2. **The gap is the question asked, not a note attached to one.** The deep
+   brain's `query` is the masked gap; the original query, history and partial
+   answer are background in `context`. This is a regression-tested fix for a
+   real refusal — with the whole query as the ask and the gap merely mentioned
+   in context, a live Cirrascale call answered the *entire* placeholder-laden
+   request and declined it:
+
+   > "I cannot provide you with a reply that includes your personal information."
+
+   …when all that was needed was an ISBN. Asking narrowly also makes the gap
+   structurally immune to `compress_context`, which only ever trims `context`.
+
+3. **The gap and the partial are masked before they cross — the sharpest edge
    here.** Both are *newly generated* text the guard has never seen, written by
    a model that was handed the **raw** query, so they can quote a real address
    verbatim. Query-level masking cannot help: these strings did not exist when
@@ -283,10 +498,10 @@ Four things here are load-bearing:
    `tests/test_structured_routing.py::test_the_raw_partial_answer_is_masked_before_it_crosses`
    and `…::test_pii_the_local_model_invented_in_the_gap_is_masked_before_it_crosses`
    are the regression tests.
-3. **A split needs two halves.** No usable `solution` (empty, or the brain
+4. **A split needs two halves.** No usable `solution` (empty, or the brain
    errored) means this is an ordinary escalation and is reported as
    `tier_answered="cloud"`, not as a split with one side missing.
-4. **The latency ceiling is a different number here** — see below.
+5. **The latency ceiling is a different number here** — see below.
 
 #### Why Shape C has its own latency ceiling
 
@@ -496,14 +711,50 @@ main risk going in, since Genie's C API exposes no grammar hook the way
 `llama-server`'s `response_format` does. It did not materialise on this
 artifact; the degradation ladder exists in case it does on another.
 
-One real defect was found and fixed in the process, and it is worth knowing
-about because it is a prompt-shaped bug rather than a code-shaped one: the model
-initially used `unknown` for a **disclaimer** about an answer it had given
-("This response assumes the user's authority…"), which `needs_gap_fill` cannot
-distinguish from a real gap — so a fully-answered PII query got split and its
-masked PII went to the cloud for nothing. Fixed by banning caveats in
-`STRUCTURED_SUFFIX` explicitly. Whether that ban also suppresses *real* gaps is
-**unmeasured**; it is the first thing to check if splits start looking too rare.
+Three real defects were found and fixed in the process, all prompt-shaped
+rather than code-shaped — `unknown` is a place a small model can put the wrong
+thing in three distinct ways, and each needed its own line in
+`STRUCTURED_SUFFIX`:
+
+1. **A caveat, not a gap.** The model used `unknown` for a disclaimer about an
+   answer it had already given ("This response assumes the user's
+   authority…"), which split a fully-answered PII query and sent masked PII to
+   the cloud for nothing.
+2. **An invented follow-up, not a gap.** For "explain about stable diffusion"
+   the model answered fully, then put *"How does stable diffusion specifically
+   apply to environmental science or economic models?"* in `unknown` — neither
+   field was in the query. It widened the question rather than reporting a
+   hole in its own answer, triggering a real ~15.6s Cirrascale call for a
+   question nobody asked.
+3. **A guess dressed as a complete answer — this one was self-inflicted.** The
+   first fix for #2 ("only a literal part of the question") over-corrected: on
+   the very next real run, the population half of the France/population query
+   — a genuine gap this feature was originally validated against — came back
+   as `{"solution": "Paris, France's population on 3 March 2019", "confidence":
+   100, "unknown": ""}`. The model echoed the question phrase back as the
+   "answer" instead of naming the gap, at claimed full confidence. Worse than
+   #2: a silently wrong "complete" answer instead of an honest split.
+
+Fixed by checking both directions together rather than one at a time: the ban
+on inventing gaps (#2), plus an explicit instruction that not-knowing a fact
+must be *named* in `unknown`, never guessed or echoed (#3). Validated on real
+hardware across four categories — the original disclaimer/scope-creep/PII
+cases (still fixed), a genuinely unknowable control fact (still named as a
+gap, so the fix isn't just suppressing everything), and the France/population
+query, which now answers `"Paris, 2,148,000"` with no gap. That number matches
+the real INSEE 2019 estimate (2,148,271) closely enough to be genuine recall
+rather than the #3 bug recurring — a correct avoided cloud call, not a
+regression, but it means that query stopped being a reliable *test probe* even
+though nothing about the behaviour is wrong (the test suite moved to the ISBN
+query instead, which has no real answer to recall). Full account, including
+the reverted attempt, in
+`data/npu_model/phi-3.5-mini-instruct/_real_structured_inference_log.md`,
+Run 4.
+
+Whether the model's line between "I know this" and "I should say I don't" is
+reliable in general is still **unmeasured** — one accurate recall is
+reassuring, not a calibration. Check both directions again before the next
+prompt edit, not just the one that motivates it.
 
 Getting the prompt to behave was itself measured, not guessed. Left alone the
 model emits the answer, the `CONFIDENCE:` line, and then paragraphs of

@@ -25,22 +25,27 @@
     <nav class="chat-list" id="chat-list" aria-label="Chat history"></nav>
 
     <div class="sidebar-footer">
-      <div
-        id="backend-status"
-        class="backend-status"
-        data-live="false"
-        title="Checked against /health on load and after every send. See ui/README.md."
-      >Checking backend…</div>
+      <!-- Which on-device model answers. Populated from GET /models, which
+           lists only what is actually installed. Hidden entirely when the
+           backend is offline or has nothing to choose between. -->
+      <div class="model-picker" id="model-picker" hidden>
+        <span class="brain-toggle-label">Local model</span>
+        <select id="model-select"></select>
+        <span class="model-detail" id="model-detail"></span>
+      </div>
 
-      <div class="brain-toggle" title="Only used if the API is unreachable — see ui/README.md.">
-        <span class="brain-toggle-label">Preview tier (if offline)</span>
+      <!-- The backend-status box that used to live here is gone: connection
+           state now shows in the empty-state hint, where it is read once at the
+           start of a session rather than sitting in the corner permanently. -->
+      <div class="brain-toggle" id="brain-toggle-wrap" title="Only used if the API is unreachable — see ui/README.md.">
+        <span class="brain-toggle-label" id="brain-toggle-label">Preview tier (if offline)</span>
         <div class="segmented" id="brain-toggle" role="radiogroup" aria-label="Offline preview tier">
           <button class="segment active" data-tier="local" role="radio" aria-checked="true" type="button">Local</button>
           <button class="segment" data-tier="cloud" role="radio" aria-checked="false" type="button">Cloud</button>
         </div>
       </div>
 
-      <div class="expression-preview" title="Demo control — triggers a one-off expression, see ui/README.md">
+      <div class="expression-preview" id="expression-preview-wrap" title="Demo control — triggers a one-off expression, see ui/README.md">
         <span class="brain-toggle-label">Preview expression</span>
         <div id="expr-buttons">
           <div class="expr-row">
@@ -148,17 +153,33 @@
           </svg>
         </div>
         <h1>How can I help you today?</h1>
-        <p class="empty-state-hint">Connected to the two-brain router over <code>/route</code>. If the API isn't running, replies fall back to an offline preview instead.</p>
+        <p class="empty-state-hint" id="empty-state-hint">Connecting to the router…</p>
       </div>
       <div class="messages" id="messages"></div>
     </section>
 
     <form class="composer" id="composer">
-      <div class="composer-inner">
-        <textarea id="composer-input" placeholder="Message Two-Brain..." rows="1"></textarea>
-        <button type="submit" id="send-btn" disabled aria-label="Send message">
-          <svg viewBox="0 0 20 20" width="16" height="16" fill="none"><path d="M10 16V4M10 4l5 5M10 4l-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
+      <div class="composer-stack">
+        <div class="attachment-preview" id="attachment-preview" hidden>
+          <img id="attachment-thumb" alt="Attached image preview">
+          <div class="attachment-meta">
+            <span id="attachment-name">image</span>
+            <span class="attachment-hint">stays on this device — the cloud tier has no vision model</span>
+          </div>
+          <button type="button" id="attachment-remove" aria-label="Remove attached image">
+            <svg viewBox="0 0 20 20" width="14" height="14" fill="none"><path d="M6 6l8 8M14 6l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+        <div class="composer-inner">
+          <input type="file" id="attach-input" accept="image/png,image/jpeg,image/webp" hidden>
+          <button type="button" id="attach-btn" aria-label="Attach an image" title="Attach an image (it stays on-device)">
+            <svg viewBox="0 0 20 20" width="17" height="17" fill="none"><path d="M10 4.5v11M4.5 10h11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
+          <textarea id="composer-input" placeholder="Message Two-Brain..." rows="1"></textarea>
+          <button type="submit" id="send-btn" disabled aria-label="Send message">
+            <svg viewBox="0 0 20 20" width="16" height="16" fill="none"><path d="M10 16V4M10 4l5 5M10 4l-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
       </div>
     </form>
   </main>
@@ -177,6 +198,7 @@
   </svg>
 </template>
 
+<script src="markdown.js"></script>
 <script src="profiler.js"></script>
 <script src="app.js"></script>
 </body>
