@@ -242,12 +242,37 @@ def test_phone_brain_reports_confidence_and_returns_a_clean_answer():
 
 
 def test_phone_brain_asks_the_model_to_self_rate():
-    with _PhoneServer("ok\nCONFIDENCE: 80") as server:
-        _phone_brain(server).answer("hello")
-        sent = server.prompts()[0]
+    """The instruction rides in the *system* turn, and asks for the rating
+    first.
 
-    assert sent.startswith("hello")
-    assert "CONFIDENCE:" in sent
+    It moved there from a suffix on the user turn after both were measured
+    against a real Llama-3.2-3B on an S25: the suffix was followed
+    inconsistently, and asking for the rating last meant a long answer that
+    hit the token cap lost it to truncation -- so the better the local answer,
+    the more likely it was discarded. See PhoneFastBrain._SELF_RATE_SYSTEM.
+    """
+    with _PhoneServer("CONFIDENCE: 80\nok") as server:
+        _phone_brain(server).answer("hello")
+        body = server.received[0]
+
+    system, user = body["messages"][0], body["messages"][-1]
+    assert system["role"] == "system"
+    assert "CONFIDENCE:" in system["content"]
+    # Asked for first, so a truncated answer still carries a usable rating.
+    assert "begin your reply" in system["content"].lower()
+    # The user turn is the query alone -- no contradictory "rate it last".
+    assert user["content"] == "hello"
+
+
+def test_phone_brain_parses_a_leading_confidence_line():
+    """A rating on the first line must work as well as a trailing one -- that
+    is the whole point of moving it."""
+    with _PhoneServer("CONFIDENCE: 91\nTokyo is UTC+9.") as server:
+        response = _phone_brain(server).answer("What time zone is Tokyo in?")
+
+    assert response.confidence == pytest.approx(0.91)
+    assert response.text == "Tokyo is UTC+9."
+    assert "CONFIDENCE" not in response.text
 
 
 def test_phone_brain_treats_a_failed_call_as_an_escalate_signal():

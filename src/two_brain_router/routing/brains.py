@@ -1296,28 +1296,38 @@ class PhoneFastBrain:
     _MAX_TOKENS = 256
     _TEMPERATURE = 0.2
 
-    #: The self-rating instruction, repeated as a system message.
+    #: The self-rating instruction, as a system message, asking for the rating
+    #: **first**.
     #:
-    #: SELF_REPORT_SUFFIX alone (appended to the user turn) is not reliable on
-    #: the real Llama-3.2-3B: measured on an S25, it complies on factual
-    #: questions and ignores the instruction on conversational ones -- "Hi"
-    #: came back as a bare greeting with no CONFIDENCE line, so a perfectly
-    #: good local answer was discarded and escalated. Instruction-tuned chat
-    #: models weight the system turn far more heavily for persistent
-    #: formatting rules, which is exactly what this is.
+    #: Two things were measured on a real S25 running Llama-3.2-3B, and both
+    #: point the same way.
     #:
-    #: The suffix is kept as well rather than replaced: it stays byte-identical
-    #: to confidence_estimator.py's, so the mock path and the estimator's own
-    #: verification are unchanged. This only adds a second, stronger channel
-    #: for the same instruction.
+    #: 1. SELF_REPORT_SUFFIX on the user turn is followed inconsistently: fine
+    #:    on factual questions, ignored on conversational ones ("Hi" came back
+    #:    as a bare greeting). Instruction-tuned models weight the system turn
+    #:    far more heavily for persistent formatting rules.
+    #:
+    #: 2. **Trailing rating + a token cap is a broken combination.** A long
+    #:    answer ("what is the history of the Roman Empire") hits _MAX_TOKENS
+    #:    and is truncated mid-sentence, so a rating asked for at the end is
+    #:    simply never generated. The router then reads "no parseable
+    #:    confidence" as "not confident" and escalates -- meaning the *longer*
+    #:    and more expensive the local answer, the more likely it is thrown
+    #:    away. Exactly backwards.
+    #:
+    #: Asking first makes the rating survive truncation, and costs nothing:
+    #: parse_self_reported() uses a regex search and strips the line wherever
+    #: it appears, so position is irrelevant to everything downstream. Raising
+    #: the cap instead would only move the cliff, at ~16 tok/s on-device.
     _SELF_RATE_SYSTEM = (
-        "You are a helpful assistant. Answer the user's message, then always "
-        "finish your reply with a final line of exactly this form, with no "
-        "text after it:\n"
+        "You are a helpful assistant.\n"
+        "ALWAYS begin your reply with a single line of exactly this form:\n"
         "CONFIDENCE: <a number from 0 to 100>\n"
-        "The number is how confident you are that your answer is correct and "
-        "complete. Include this line every time, even for greetings, "
-        "small talk, or when you are unsure."
+        "The number is how confident you are that you can answer the user's "
+        "message correctly and completely. Then, on the following lines, give "
+        "your answer.\n"
+        "Include the CONFIDENCE line every single time -- for greetings, small "
+        "talk, questions you are unsure about, everything."
     )
     _TIMEOUT_S = 120.0
 
@@ -1401,7 +1411,11 @@ class PhoneFastBrain:
         prompt = f"{context}\n\n{query}" if context else query
         start = time.perf_counter()
         try:
-            body = self._post_chat_completion(prompt + SELF_REPORT_SUFFIX)
+            # No SELF_REPORT_SUFFIX here: it asks for the rating *after* the
+            # answer, and _SELF_RATE_SYSTEM asks for it first. Sending both
+            # gives the model contradictory instructions. See the system
+            # message for why first wins.
+            body = self._post_chat_completion(prompt)
             raw_text = body["choices"][0]["message"]["content"]
         except Exception as exc:  # noqa: BLE001 -- any failure is an escalate signal
             return BrainResponse(
