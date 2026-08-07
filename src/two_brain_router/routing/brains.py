@@ -1547,8 +1547,58 @@ class PhoneFastBrain:
 
     #: Matches confidence_estimator.py's request shape exactly -- the L
     #: contract pins these four fields.
-    _MAX_TOKENS = 256
+    #: Generation cap for one on-device answer.
+    #:
+    #: 256 was too low against the real model: "tell me about ancient
+    #: civilizations" was cut off mid-sentence, which reads as a broken answer
+    #: rather than a budget. 512 is the compromise -- at the ~16 tok/s measured
+    #: on an S25 that is roughly 30s worst case, and most answers finish well
+    #: before it.
+    #:
+    #: Raising this can no longer lose the confidence rating, because the model
+    #: is asked for it on the first line (see _SELF_RATE_SYSTEM). Before that
+    #: change, a higher cap would have made truncation *more* likely to eat the
+    #: rating on exactly the long answers worth keeping.
+    #:
+    #: Overridable per-run without a code change, since the right value depends
+    #: on the device and the demo: a phone that is thermally throttled wants
+    #: less, a benchmark wants more.
+    _MAX_TOKENS = int(os.environ.get("TWO_BRAIN_PHONE_MAX_TOKENS") or 512)
     _TEMPERATURE = 0.2
+
+    #: The self-rating instruction, as a system message, asking for the rating
+    #: **first**.
+    #:
+    #: Two things were measured on a real S25 running Llama-3.2-3B, and both
+    #: point the same way.
+    #:
+    #: 1. SELF_REPORT_SUFFIX on the user turn is followed inconsistently: fine
+    #:    on factual questions, ignored on conversational ones ("Hi" came back
+    #:    as a bare greeting). Instruction-tuned models weight the system turn
+    #:    far more heavily for persistent formatting rules.
+    #:
+    #: 2. **Trailing rating + a token cap is a broken combination.** A long
+    #:    answer ("what is the history of the Roman Empire") hits _MAX_TOKENS
+    #:    and is truncated mid-sentence, so a rating asked for at the end is
+    #:    simply never generated. The router then reads "no parseable
+    #:    confidence" as "not confident" and escalates -- meaning the *longer*
+    #:    and more expensive the local answer, the more likely it is thrown
+    #:    away. Exactly backwards.
+    #:
+    #: Asking first makes the rating survive truncation, and costs nothing:
+    #: parse_self_reported() uses a regex search and strips the line wherever
+    #: it appears, so position is irrelevant to everything downstream. Raising
+    #: the cap instead would only move the cliff, at ~16 tok/s on-device.
+    _SELF_RATE_SYSTEM = (
+        "You are a helpful assistant.\n"
+        "ALWAYS begin your reply with a single line of exactly this form:\n"
+        "CONFIDENCE: <a number from 0 to 100>\n"
+        "The number is how confident you are that you can answer the user's "
+        "message correctly and completely. Then, on the following lines, give "
+        "your answer.\n"
+        "Include the CONFIDENCE line every single time -- for greetings, small "
+        "talk, questions you are unsure about, everything."
+    )
     _TIMEOUT_S = 120.0
 
     def __init__(
@@ -1603,7 +1653,10 @@ class PhoneFastBrain:
 
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": self._SELF_RATE_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
             "max_tokens": self._MAX_TOKENS,
             "temperature": self._TEMPERATURE,
         }
@@ -1628,7 +1681,11 @@ class PhoneFastBrain:
         prompt = f"{context}\n\n{query}" if context else query
         start = time.perf_counter()
         try:
-            body = self._post_chat_completion(prompt + SELF_REPORT_SUFFIX)
+            # No SELF_REPORT_SUFFIX here: it asks for the rating *after* the
+            # answer, and _SELF_RATE_SYSTEM asks for it first. Sending both
+            # gives the model contradictory instructions. See the system
+            # message for why first wins.
+            body = self._post_chat_completion(prompt)
             raw_text = body["choices"][0]["message"]["content"]
         except Exception as exc:  # noqa: BLE001 -- any failure is an escalate signal
             return BrainResponse(

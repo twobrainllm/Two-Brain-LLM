@@ -44,8 +44,26 @@ const HISTORY_MAX_CHARS_TOTAL = 1200;
  * loopback address `api.py` binds by default, so the common case needs no
  * query string at all.
  */
-const API_BASE_URL =
-  new URLSearchParams(location.search).get("api") || "http://127.0.0.1:8765";
+const API_BASE_URL = (() => {
+  const override = new URLSearchParams(location.search).get("api");
+  if (override) return override.replace(/\/$/, "");
+
+  const { protocol, hostname } = location;
+
+  // Opened off the filesystem: no host to borrow, so the loopback default.
+  if (protocol === "file:" || !hostname) return "http://127.0.0.1:8765";
+
+  // Served over HTTPS means ui/serve_https.py, which proxies the API on its
+  // own origin. Use that origin: an HTTPS page may not fetch an http:// URL
+  // at all (mixed content), so naming :8765 directly would be blocked by the
+  // browser no matter which host it pointed at.
+  if (protocol === "https:") return "";
+
+  // Plain HTTP from another device -- a phone on the LAN. 127.0.0.1 would
+  // mean *the phone*, which is not running the router, so borrow the host
+  // this page came from and keep api.py's port.
+  return `${protocol}//${hostname}:8765`;
+})();
 
 // data/hardware_detect/{ai_pc,mobile}.json -- real quad-client detect /
 // adb shell captures, matching profiler.js's own DEVICE_CONTEXT convention.

@@ -59,3 +59,6 @@ secrets.txt
 .llama-cpp-opencl/
 data/vlm_gpu_model/**/raw/
 data/vlm_gpu_model/**/*.gguf
+
+# self-signed certs for ui/serve_https.py -- generated locally, never shared
+ui/.certs/
