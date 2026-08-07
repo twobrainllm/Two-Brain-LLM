@@ -344,6 +344,47 @@ a split. Masking them there is not defence-in-depth; it is the only thing
 standing between the user and a leak, because query-level masking never saw
 them.
 
+### Two thresholds, not one
+
+`RoutePolicy` carries two OR-triggers that both read as "the query is too hard,
+escalate" and are **not interchangeable**:
+
+| | `escalate_threshold` | `confidence_escalate_threshold` |
+|---|---|---|
+| Feeds | `signals/difficulty.py`'s heuristic (Shape A) | a brain's own self-report (Shape B/C) |
+| Scale | arbitrary 0–1, weighted keyword/length features | `1 - confidence`, direct from the model |
+| Default | 0.55 | 0.10 |
+| In words | escalate below ~45% heuristic confidence | escalate at 90% reported confidence or below |
+
+They used to be one field, deliberately (`needs_gap_fill`'s original docstring:
+*"the same `escalate_threshold` every other path uses. Still one threshold, not
+two."*). That held until real numbers showed the two signals don't share a
+scale: Phi-3.5/Qwen self-reports measured in a narrow, over-confident band,
+0.85–1.00 (see "Confidence is weak on this tier" below), so 0.55 as a
+*difficulty* threshold — confidence ≤ 0.45 — essentially never fires against
+that band. The symptom was "it never escalates to the cloud." Lowering the
+**shared** field to fix that would have also made the heuristic path (image
+queries, the stub-only default demo, the pinned README transcript) escalate on
+almost everything — a difficulty scale tuned separately has no reason to share
+a boundary with a confidence scale.
+
+So `confidence_escalate_threshold` is its own field, read only by
+`confidence_says_escalate`, `needs_gap_fill`, and `_route_on_confidence` — the
+Shape A heuristic path in `route()` still reads `escalate_threshold` alone,
+unchanged, which is why the README's pinned `--tier pc` transcript (stub
+brains, Shape A) stayed byte-identical across this change.
+
+**A real bug found getting here, worth keeping in mind for any future
+threshold:** `confidence_to_difficulty` used to return `1.0 - confidence`
+un-rounded. `1.0 - 0.90` in IEEE 754 is `0.09999999999999998`, not `0.1` — so a
+threshold set to exactly `0.10` to mean *"confidence 0.90 or below escalates"*
+let `0.90` itself silently through, because `0.09999999999999998 >= 0.10` is
+`False`. `confidence_to_difficulty` now rounds to 6 decimal places, which
+removes the binary-float artifact while keeping far more precision than a
+2-decimal-place self-report (`n/100` for integer `n`) ever carries. Any
+threshold landing on a round confidence value is exposed to this; round at the
+conversion, not per comparison site, or the next threshold rediscovers it.
+
 ### Shape A — brain does not self-rate (`reports_confidence = False`)
 
 Used by the stubs, `LocalFastBrain` and `CloudDeepBrain` -- i.e. the default
@@ -403,13 +444,13 @@ Three details in Shape B are load-bearing:
    on a "not confident" decision includes the time spent on the local answer
    that lost, and a note says so. Speculation is not free and the audit trail
    shouldn't pretend it is.
-3. **One threshold, not two.** `confidence_estimator.py` carries its own
-   `confidence_threshold=0.5` and a `should_escalate` field; O ignores both.
-   Confidence is inverted to a difficulty (`signals/confidence.py`) and the
-   existing `RoutePolicy.escalate_threshold` decides. This is what keeps the
-   contract's "O owns the decision every time" true in code, and it is why
-   `routing/policy.py` needed no changes at all — not for Shape B originally,
-   and not for the escalation brain either (below).
+3. **One *owner*, not two — `L_INTERFACE_CONTRACT.md`'s claim, still true.**
+   `confidence_estimator.py` carries its own `confidence_threshold=0.5` and a
+   `should_escalate` field; O ignores both entirely and decides for itself.
+   This is what keeps the contract's "O owns the decision every time" true in
+   code. (Not the same claim as "one *number*" — see "Two thresholds, not one"
+   further down, where O's own decision later grew a second number for a
+   second kind of signal. O still never defers to L's opinion of itself.)
 
 ### `confidence = None` is not `confidence = 0.0` — and neither gets a heuristic
 
@@ -688,8 +729,14 @@ Two honest caveats, both measured rather than assumed (receipts:
   separate easy from hard. This is the calibration risk `WALKTHROUGH.md`
   next-step #4(b) flagged, now confirmed on real hardware instead of predicted.
 
-The threshold was deliberately **not** retuned to compensate. Moving it to fit
-seven samples of a weak signal would hide the finding rather than fix it.
+The threshold was deliberately **not** retuned to compensate — moving *the
+heuristic's* threshold to fit seven samples of an unrelated signal would have
+hidden the finding rather than fixed it. What changed instead, later, is that
+confidence-based routing (Shape B/C) got its **own** threshold,
+`RoutePolicy.confidence_escalate_threshold` (0.10, i.e. escalate at confidence
+≤ 0.90, stay local only at ≥ 0.95) — see "Two thresholds, not one" below. That
+is not the retune this paragraph declined to do: it is a second number for a
+second signal, not a new value for the same one.
 
 **Shape C is what actually addressed it** — not by improving the number, but by
 asking for something else alongside it. Across ten real structured calls

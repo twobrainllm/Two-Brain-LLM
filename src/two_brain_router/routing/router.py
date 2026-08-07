@@ -639,6 +639,17 @@ class TwoBrainRouter:
             # have escalated the *whole* query, which cannot reuse the text
             # already streamed. Fall back so the audit trail stays truthful.
             if self.policy.needs_gap_fill(difficulty, gap):
+                # Announced *before* the blocking re-route, not after it. The
+                # call below runs a second local inference and then the full
+                # cloud leg -- measured at 15s+ -- and every frame it emits
+                # arrives only once all of that is finished. Without this the
+                # user watches a completed local answer sit there with no sign
+                # anything else is coming, which is exactly how a working
+                # escalation reads as a hung one.
+                #
+                # `gap or None` because this branch is reached precisely when
+                # there is no usable gap to name: the whole query is going.
+                yield ("tier", {"tier": "cloud", "gap": gap or None})
                 decision = self.route(query, context, image)
                 yield ("meta", {"tier": decision.tier_answered, "restarted": True})
                 if decision.crossed_to_cloud:
@@ -774,7 +785,11 @@ class TwoBrainRouter:
                 f"{self.policy.local_latency_budget_ms:.0f}ms budget, so a local "
                 f"answer would have been discarded anyway"
             )
-            request.notes.append(self.policy.escalation_note(difficulty, local_latency_est))
+            request.notes.append(
+                self.policy.escalation_note(
+                    difficulty, local_latency_est, threshold=self.policy.confidence_escalate_threshold
+                )
+            )
             return self._route_away_from_fast_brain(request, difficulty)
 
         local = self._ask(
@@ -783,19 +798,23 @@ class TwoBrainRouter:
         )
         difficulty = self._difficulty_from(local, request.notes)
 
-        if self.policy.should_escalate(difficulty, _BUDGET_ALREADY_CHECKED):
+        if self.policy.confidence_says_escalate(difficulty):
             # Not `policy.escalation_note`: that one describes both terms of the
             # OR, and quoting a latency-vs-budget comparison here would be
             # misleading -- the budget was settled before the call and cannot be
             # what fired.
             request.notes.append(
                 f"escalating: difficulty={difficulty:.2f} >= threshold "
-                f"{self.policy.escalate_threshold} "
+                f"{self.policy.confidence_escalate_threshold} "
                 f"(the local answer took {local.latency_ms:.0f}ms and was not used)"
             )
             return self._route_away_from_fast_brain(request, difficulty, discarded=local)
 
-        request.notes.append(self.policy.local_note(difficulty, local.latency_ms))
+        request.notes.append(
+            self.policy.local_note(
+                difficulty, local.latency_ms, threshold=self.policy.confidence_escalate_threshold
+            )
+        )
         return self._answer_locally(request, difficulty, response=local)
 
     def _route_on_structured_answer(self, request: _Request, local_latency_est: float) -> RouteDecision:
@@ -841,7 +860,11 @@ class TwoBrainRouter:
                 f"{self.policy.local_partial_budget_ms:.0f}ms ceiling for keeping a "
                 f"partial answer"
             )
-            request.notes.append(self.policy.escalation_note(difficulty, local_latency_est))
+            request.notes.append(
+                self.policy.escalation_note(
+                    difficulty, local_latency_est, threshold=self.policy.confidence_escalate_threshold
+                )
+            )
             return self._route_away_from_fast_brain(request, difficulty)
 
         if local_latency_est > self.policy.local_latency_budget_ms:
@@ -874,7 +897,11 @@ class TwoBrainRouter:
             )
 
         if not self.policy.needs_gap_fill(difficulty, gap):
-            request.notes.append(self.policy.local_note(difficulty, local.latency_ms))
+            request.notes.append(
+                self.policy.local_note(
+                    difficulty, local.latency_ms, threshold=self.policy.confidence_escalate_threshold
+                )
+            )
             return self._answer_locally(request, difficulty, response=local)
 
         if not gap:

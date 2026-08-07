@@ -106,8 +106,10 @@ const EXPORTS = [
   "sendToRouterStreaming",
   "finalizeAssistantRow",
   "renderCloudPending",
+  "cloudPendingHtml",
   "setRowTier",
   "renderCrossing",
+  "renderMessageEl",
   "metricsFromRouteResponse",
   "formatPrivacy",
   "tierLabel",
@@ -347,8 +349,21 @@ await test("split: escalating repaints the same row as the cloud's, no partial",
   const text = row.allText;
   assertEqual(row.querySelector(".robot-avatar").dataset.tier, "cloud",
     "an escalating turn is the cloud's answer, so the row should turn amber");
-  assert(/Escalating the whole query/.test(text), `should say the whole query is going; got: ${text}`);
+  assert(/escalating the whole query/i.test(text), `should say the whole query is going; got: ${text}`);
   assert(!text.includes("null"), "a null gap must not render as the string 'null'");
+});
+
+// The placeholder exists to cover the window between the router deciding to
+// cross and the cloud's first token -- measured at 15s+. Whatever else it says,
+// it has to read as work in progress in *both* branches; the no-gap branch is
+// the slower of the two (the cloud answers from scratch) and used to render no
+// indicator at all, because the UI only opened this bubble when a gap was named.
+await test("split: the pending placeholder says it is thinking, gap or no gap", () => {
+  for (const gap of ["the exact ISBN", null]) {
+    const html = app.cloudPendingHtml(gap);
+    assert(/Thinking/.test(html), `no thinking indicator for gap=${gap}: ${html}`);
+    assert(html.includes("cloud-pending-dots"), `no animated dots for gap=${gap}`);
+  }
 });
 
 await test("split: HTML from the model is escaped in both roles", () => {
@@ -515,8 +530,7 @@ await test("persist: a failure after the local half streamed keeps both", () => 
 
 await test("crossing: shows each substitution as typed -> placeholder", () => {
   const row = rowWithBubble("cloud");
-  const bubble = { row, textEl: new El("div"), text: "" };
-  app.renderCrossing(bubble, {
+  app.renderCrossing(row.querySelector(".bubble"), {
     query: "My email is [PII_EMAIL_1]. Give me the ISBN.",
     context: "",
     substitutions: [
@@ -535,7 +549,7 @@ await test("crossing: shows each substitution as typed -> placeholder", () => {
 
 await test("crossing: the sent text shown is the MASKED one", () => {
   const row = rowWithBubble("cloud");
-  app.renderCrossing({ row, textEl: new El("div"), text: "" }, {
+  app.renderCrossing(row.querySelector(".bubble"), {
     query: "My email is [PII_EMAIL_1].",
     context: "",
     substitutions: [{ type: "EMAIL", value: "jane.doe@example.com", placeholder: "[PII_EMAIL_1]" }],
@@ -551,18 +565,17 @@ await test("crossing: the sent text shown is the MASKED one", () => {
 
 await test("crossing: rendered once even if the event repeats", () => {
   const row = rowWithBubble("cloud");
-  const bubble = { row, textEl: new El("div"), text: "" };
-  const payload = { query: "q", context: "", substitutions: [] };
-  app.renderCrossing(bubble, payload);
-  app.renderCrossing(bubble, payload);
   const container = row.querySelector(".bubble");
+  const payload = { query: "q", context: "", substitutions: [] };
+  app.renderCrossing(container, payload);
+  app.renderCrossing(container, payload);
   const found = container.children.filter((c) => c._classes.has("crossing"));
   assertEqual(found.length, 1, "the disclosure was rendered twice");
 });
 
 await test("crossing: HTML in a masked payload cannot inject", () => {
   const row = rowWithBubble("cloud");
-  app.renderCrossing({ row, textEl: new El("div"), text: "" }, {
+  app.renderCrossing(row.querySelector(".bubble"), {
     query: "<img src=x onerror=alert(1)>",
     context: "",
     substitutions: [{ type: "X", value: "<script>bad()</script>", placeholder: "[P]" }],
@@ -570,6 +583,63 @@ await test("crossing: HTML in a masked payload cannot inject", () => {
   const text = row.allText;
   assert(!text.includes("<img src=x"), "query reached the DOM unescaped");
   assert(!text.includes("<script>"), "substitution value reached the DOM unescaped");
+});
+
+
+await test("crossing: survives the re-render at the end of a turn", () => {
+  // The bug this guards: the disclosure was painted onto the in-flight row
+  // only, and `renderMessages` rebuilds the whole transcript from
+  // `chat.messages` once the answer lands -- so it appeared while the cloud
+  // was thinking and vanished the instant it replied. It has to live on the
+  // *message* to survive that, and a reload.
+  const msg = {
+    role: "assistant",
+    tier: "cloud",
+    content: "No ISBN existed in 1813.",
+    crossing: {
+      query: "the exact ISBN of the 1813 first edition",
+      context: "",
+      substitutions: [
+        { type: "EMAIL", value: "jane.doe@example.com", placeholder: "[PII_EMAIL_1]" },
+      ],
+    },
+  };
+  const row = app.renderMessageEl(msg);
+  const text = row.allText;
+  assert(text.includes("No ISBN existed in 1813."), "the answer itself is missing");
+  assert(text.includes("[PII_EMAIL_1]"), "the disclosure did not survive the rebuild");
+  assert(text.includes("jane.doe@example.com"), "the substitution pair is incomplete");
+});
+
+await test("crossing: a local-only message has no disclosure to show", () => {
+  const row = app.renderMessageEl({ role: "assistant", tier: "local", content: "Answered here." });
+  assert(!row.allText.includes("masked before leaving"),
+    "a locally-answered turn must not claim anything crossed");
+});
+
+
+await test("crossing: has a visible expand affordance", () => {
+  // Without this the row is silently clickable, which is the same as not being
+  // clickable: the native <details> marker is hidden in CSS, so the chevron is
+  // the only thing indicating it opens.
+  const row = rowWithBubble("cloud");
+  app.renderCrossing(row.querySelector(".bubble"), {
+    query: "q", context: "", substitutions: [],
+  });
+  const html = row.allText;
+  assert(html.includes("crossing-chevron"), "no chevron rendered");
+  assert(html.includes("<summary"), "the summary is what makes it clickable");
+});
+
+await test("crossing: starts collapsed", () => {
+  const row = rowWithBubble("cloud");
+  app.renderCrossing(row.querySelector(".bubble"), {
+    query: "q", context: "", substitutions: [],
+  });
+  const el = row.querySelector(".crossing");
+  assert(el, "no disclosure element");
+  // `<details>` is closed unless the `open` attribute is set; never set here.
+  assert(!el.allText.includes(" open"), "the disclosure should start collapsed");
 });
 
 // --------------------------------------------------------------------------
