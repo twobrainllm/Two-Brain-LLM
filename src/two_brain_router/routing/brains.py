@@ -1295,6 +1295,30 @@ class PhoneFastBrain:
     #: contract pins these four fields.
     _MAX_TOKENS = 256
     _TEMPERATURE = 0.2
+
+    #: The self-rating instruction, repeated as a system message.
+    #:
+    #: SELF_REPORT_SUFFIX alone (appended to the user turn) is not reliable on
+    #: the real Llama-3.2-3B: measured on an S25, it complies on factual
+    #: questions and ignores the instruction on conversational ones -- "Hi"
+    #: came back as a bare greeting with no CONFIDENCE line, so a perfectly
+    #: good local answer was discarded and escalated. Instruction-tuned chat
+    #: models weight the system turn far more heavily for persistent
+    #: formatting rules, which is exactly what this is.
+    #:
+    #: The suffix is kept as well rather than replaced: it stays byte-identical
+    #: to confidence_estimator.py's, so the mock path and the estimator's own
+    #: verification are unchanged. This only adds a second, stronger channel
+    #: for the same instruction.
+    _SELF_RATE_SYSTEM = (
+        "You are a helpful assistant. Answer the user's message, then always "
+        "finish your reply with a final line of exactly this form, with no "
+        "text after it:\n"
+        "CONFIDENCE: <a number from 0 to 100>\n"
+        "The number is how confident you are that your answer is correct and "
+        "complete. Include this line every time, even for greetings, "
+        "small talk, or when you are unsure."
+    )
     _TIMEOUT_S = 120.0
 
     def __init__(
@@ -1349,7 +1373,10 @@ class PhoneFastBrain:
 
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": self._SELF_RATE_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
             "max_tokens": self._MAX_TOKENS,
             "temperature": self._TEMPERATURE,
         }
